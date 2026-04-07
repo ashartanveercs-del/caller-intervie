@@ -3,9 +3,12 @@ const { app, BrowserWindow, globalShortcut, ipcMain, desktopCapturer, screen, na
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
 const { createGroqService } = require('./groq-service');
+const { createDeepgramService } = require('./deepgram-service');
 const { loadState, saveState } = require('./state');
 const fs = require('fs');
 const os = require('os');
+
+console.log('Debug: Main Process Booted');
 
 // Prevent any unhandled errors (like AssemblyAI connection drops) from crashing the stealth app
 process.on('uncaughtException', (err) => {
@@ -28,6 +31,10 @@ let chatHistory = [];
 // Transcription state
 let isStreamingMic = false;
 let isStreamingSystem = false;
+let dgMic = null;
+let dgSystem = null;
+
+const DEEPGRAM_KEY = 'df8ecfe42f5ed24ac84a473b3f30e032ab439a76';
 
 function sendToRenderer(channel, data) {
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -111,29 +118,33 @@ function createWindow() {
 }
 
 // ─── TRANSCRIPTION ───────────────────────────────────────────────────
-async function transcribeAudio(base64, source) {
-  if (!groqService) return { success: false, error: 'Groq API key not set. Open Settings.' };
-  if (!base64) return { success: false, error: 'No audio data' };
-
-  try {
-    const tempDir = os.tmpdir();
-    const tempPath = path.join(tempDir, `ghost_audio_${source}_${Date.now()}.webm`);
-    
-    // Convert base64 to Node.js Buffer
-    fs.writeFileSync(tempPath, Buffer.from(base64, 'base64'));
-
-    const result = await groqService.transcribe(tempPath);
-    
-    // Clean up
-    try { fs.unlinkSync(tempPath); } catch (e) { /* ignore */ }
-
-    if (result.success && result.text && result.text.trim()) {
-      sendToRenderer('stt-final', { source, text: result.text.trim() });
+async function initDeepgram(source) {
+  const onTranscript = (res) => {
+    if (res.isFinal) {
+      console.log(`STT [${source}][FINAL]: ${res.text}`);
+      sendToRenderer('stt-final', { 
+        source, 
+        text: res.text, 
+        isQuestion: res.isQuestion,
+        speechFinal: res.speechFinal
+      });
+    } else {
+      console.log(`STT [${source}][Partial]: ${res.text}...`);
+      sendToRenderer('stt-partial', { source, text: res.text });
     }
-    return result;
-  } catch (err) {
-    console.error('Transcription error:', err.message);
-    return { success: false, error: err.message };
+  };
+
+  const onError = (errorMsg) => {
+    console.error(`Deepgram [${source}] fatal: ${errorMsg}`);
+    sendToRenderer('stt-error', { source, error: errorMsg });
+  };
+
+  if (source === 'mic') {
+    if (!dgMic) dgMic = createDeepgramService(DEEPGRAM_KEY, onTranscript, onError);
+    await dgMic.connect();
+  } else {
+    if (!dgSystem) dgSystem = createDeepgramService(DEEPGRAM_KEY, onTranscript, onError);
+    await dgSystem.connect();
   }
 }
 
@@ -188,14 +199,21 @@ function registerIPC() {
 
   ipcMain.handle('clear-screenshots', () => { screenshots = []; return { success: true }; });
 
-  ipcMain.handle('start-stt', (_, { source }) => {
+  ipcMain.handle('start-stt', async (_, { source }) => {
     if (source === 'system') isStreamingSystem = true; else isStreamingMic = true;
+    await initDeepgram(source);
     sendToRenderer('stt-status', { source, status: 'listening' });
     return { success: true };
   });
 
   ipcMain.handle('stop-stt', (_, { source }) => {
-    if (source === 'system') isStreamingSystem = false; else isStreamingMic = false;
+    if (source === 'system') {
+      isStreamingSystem = false;
+      if (dgSystem) { dgSystem.disconnect(); dgSystem = null; }
+    } else {
+      isStreamingMic = false;
+      if (dgMic) { dgMic.disconnect(); dgMic = null; }
+    }
     sendToRenderer('stt-stopped', { source });
     return { success: true };
   });
@@ -203,9 +221,11 @@ function registerIPC() {
   ipcMain.on('transcribe-audio', (event, jsonPayload) => {
     try {
       const { base64, source } = JSON.parse(jsonPayload);
-      transcribeAudio(base64, source).catch(e => console.error(e));
+      const buffer = Buffer.from(base64, 'base64');
+      if (source === 'mic' && dgMic) dgMic.sendAudio(buffer);
+      else if (source === 'system' && dgSystem) dgSystem.sendAudio(buffer);
     } catch (err) {
-      console.error('JSON Parse error in STT:', err.message);
+      console.error('Deepgram IPC error:', err.message);
     }
   });
 

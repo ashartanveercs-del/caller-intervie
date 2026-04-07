@@ -23,12 +23,10 @@ function arrayBufferToBase64(buffer) {
   return window.btoa(binary);
 }
 
-// Helper to send blob to main
-async function sendAudioBlob(blob, source) {
-  if (blob.size < 100) return;
-  const buffer = await blob.arrayBuffer();
-  const base64 = arrayBufferToBase64(buffer);
-  // Using JSON.stringify here is the 100% stable way to pass large strings via contextBridge
+// Helper to send audio buffer to main
+function sendAudioBuffer(arrayBuffer, source) {
+  if (arrayBuffer.byteLength < 50) return;
+  const base64 = arrayBufferToBase64(arrayBuffer);
   const payload = JSON.stringify({ base64, source });
   window.ghostAPI.transcribeAudio(payload);
 }
@@ -36,8 +34,8 @@ async function sendAudioBlob(blob, source) {
 const chatArea = document.getElementById('chat-area');
 const welcomeMsg = document.getElementById('welcome-msg');
 const sttPartialText = document.getElementById('stt-partial-text');
-const sttMicDot = document.getElementById('stt-mic-dot');
-const sttHostDot = document.getElementById('stt-host-dot');
+const sttMicDot = document.getElementById('stt-dot-mic');
+const sttHostDot = document.getElementById('stt-dot-host');
 const ssStrip = document.getElementById('screenshot-strip');
 const ssThumbs = document.getElementById('ss-thumbs');
 const ssCount = document.getElementById('ss-count');
@@ -339,7 +337,7 @@ async function toggleTranscription() {
 async function startTranscription() {
   isTranscribing = true;
   document.getElementById('btn-transcribe').classList.add('active');
-  addChatMessage('system-msg', '🎙️ Transcription started (Groq Whisper Stable)');
+  addChatMessage('system-msg', '🎙️ Transcription started (Low-latency Raw PCM)');
 
   // Start mic
   try {
@@ -347,108 +345,108 @@ async function startTranscription() {
       audio: { 
         deviceId: selectedMicId !== 'default' ? { exact: selectedMicId } : undefined,
         channelCount: 1, 
-        sampleRate: 16000, 
+        sampleRate: 48000, 
         echoCancellation: true, 
         noiseSuppression: true 
       }
     });
 
+    // Wait for Deepgram WebSocket to be ready BEFORE processing audio
+    console.log('Waiting for Deepgram mic connection...');
+    await window.ghostAPI.startSTT('mic');
+    console.log('Deepgram mic connection ready, starting audio processing');
+
     // VU Meter logic
-    micVuContext = new AudioContext();
-    const sourceNode = micVuContext.createMediaStreamSource(micStream);
-    micAnalyser = micVuContext.createAnalyser();
+    const micContext = new AudioContext({ sampleRate: 48000 });
+    await micContext.resume(); // Mandatory for Chrome/Electron
+    const sourceNode = micContext.createMediaStreamSource(micStream);
+    micAnalyser = micContext.createAnalyser();
     micAnalyser.fftSize = 256;
     sourceNode.connect(micAnalyser);
 
     const vuBar = document.getElementById('vu-bar');
     const updateVU = () => {
-      if (!isTranscribing || !micAnalyser) {
-        vuBar.style.width = '0%';
-        return;
-      }
+      if (!isTranscribing || !micAnalyser) { return; }
       const data = new Uint8Array(micAnalyser.frequencyBinCount);
       micAnalyser.getByteFrequencyData(data);
       let sum = 0;
       for (const v of data) sum += v;
-      const average = sum / data.length;
-      const volume = Math.min(100, Math.floor((average / 128) * 100));
-      vuBar.style.width = volume + '%';
+      const vol = Math.min(100, Math.floor((sum / data.length / 128) * 100));
+      vuBar.style.width = vol + '%';
       requestAnimationFrame(updateVU);
     };
     updateVU();
-    
-    // Cyclic recording: Whisper requires a fresh file header for every chunk
-    const recordMic = () => {
-      if (!isTranscribing) return;
-      const r = new MediaRecorder(micStream, { mimeType: 'audio/webm' });
-      r.ondataavailable = (e) => sendAudioBlob(e.data, 'mic');
-      r.onstop = () => { if (isTranscribing) setTimeout(recordMic, 100); };
-      r.start();
-      setTimeout(() => { if (r.state === 'recording') r.stop(); }, 4000);
-      micRecorder = r;
-    };
-    recordMic();
 
-    window.ghostAPI.startSTT('mic');
+    // Raw PCM Streaming (48k downsample to 16k)
+    const processor = micContext.createScriptProcessor(4096, 1, 1);
+    sourceNode.connect(processor);
+    processor.connect(micContext.destination);
+
+    processor.onaudioprocess = (e) => {
+      if (!isTranscribing) return;
+      const floatData = e.inputBuffer.getChannelData(0);
+      
+      // Downsample 48kHz -> 16kHz (take every 3rd sample)
+      const downsampled = new Int16Array(Math.floor(floatData.length / 3));
+      for (let i = 0, j = 0; i < floatData.length; i += 3) {
+        const s = Math.max(-1, Math.min(1, floatData[i]));
+        downsampled[j++] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }
+      sendAudioBuffer(downsampled.buffer, 'mic');
+    };
   } catch (err) {
     addChatMessage('error-msg', 'Mic access failed: ' + err.message);
   }
 
-  // System Audio for capturing the Interviewer
+  // System Audio
   try {
     const sources = await window.ghostAPI.getDesktopSources();
     if (sources.length > 0) {
-      // Pick first screen with audio
-      const sysStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          mandatory: {
-            chromeMediaSource: 'desktop',
-            chromeMediaSourceId: sources[0].id
-          }
-        },
-        video: {
-          mandatory: {
-            chromeMediaSource: 'desktop',
-            chromeMediaSourceId: sources[0].id
-          }
-        }
+      const sysStreamRaw = await navigator.mediaDevices.getUserMedia({
+        audio: { mandatory: { chromeMediaSource: 'desktop', chromeMediaSourceId: sources[0].id } },
+        video: { mandatory: { chromeMediaSource: 'desktop', chromeMediaSourceId: sources[0].id } }
       });
-      // We only need the audio track
-      systemStream = new MediaStream(sysStream.getAudioTracks());
+      systemStream = new MediaStream(sysStreamRaw.getAudioTracks());
       
-      const sysSource = new AudioContext().createMediaStreamSource(systemStream);
-      systemAnalyser = sysSource.context.createAnalyser();
+      // Wait for Deepgram WebSocket to be ready BEFORE processing system audio
+      console.log('Waiting for Deepgram system connection...');
+      await window.ghostAPI.startSTT('system');
+      console.log('Deepgram system connection ready, starting system audio processing');
+
+      const sysContext = new AudioContext({ sampleRate: 48000 });
+      await sysContext.resume();
+      const sysSourceNode = sysContext.createMediaStreamSource(systemStream);
+      systemAnalyser = sysContext.createAnalyser();
       systemAnalyser.fftSize = 256;
-      sysSource.connect(systemAnalyser);
+      sysSourceNode.connect(systemAnalyser);
 
       const vuBarHost = document.getElementById('vu-bar-host');
-      const updateSystemVU = () => {
-        if (!isTranscribing || !systemAnalyser) {
-          vuBarHost.style.width = '0%';
-          return;
-        }
+      const updateHostVU = () => {
+        if (!isTranscribing || !systemAnalyser) { return; }
         const data = new Uint8Array(systemAnalyser.frequencyBinCount);
         systemAnalyser.getByteFrequencyData(data);
         let sum = 0;
         for (const v of data) sum += v;
-        const volume = Math.min(100, Math.floor((sum / data.length / 128) * 100));
-        vuBarHost.style.width = volume + '%';
-        requestAnimationFrame(updateSystemVU);
+        const vol = Math.min(100, Math.floor((sum / data.length / 128) * 100));
+        vuBarHost.style.width = vol + '%';
+        requestAnimationFrame(updateHostVU);
       };
-      updateSystemVU();
+      updateHostVU();
 
-      const recordSystem = () => {
+      const sysProcessor = sysContext.createScriptProcessor(4096, 1, 1);
+      sysSourceNode.connect(sysProcessor);
+      sysProcessor.connect(sysContext.destination);
+
+      sysProcessor.onaudioprocess = (e) => {
         if (!isTranscribing) return;
-        const r = new MediaRecorder(systemStream, { mimeType: 'audio/webm' });
-        r.ondataavailable = (e) => sendAudioBlob(e.data, 'system');
-        r.onstop = () => { if (isTranscribing) setTimeout(recordSystem, 100); };
-        r.start();
-        setTimeout(() => { if (r.state === 'recording') r.stop(); }, 4000);
-        systemRecorder = r;
+        const floatData = e.inputBuffer.getChannelData(0);
+        const downsampled = new Int16Array(Math.floor(floatData.length / 3));
+        for (let i = 0, j = 0; i < floatData.length; i += 3) {
+          const s = Math.max(-1, Math.min(1, floatData[i]));
+          downsampled[j++] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        sendAudioBuffer(downsampled.buffer, 'system');
       };
-      recordSystem();
-
-      window.ghostAPI.startSTT('system');
     }
   } catch (err) {
     console.log('System audio not available:', err.message);
@@ -498,13 +496,21 @@ window.ghostAPI.onSttStatus(({ source, status }) => {
 });
 
 window.ghostAPI.onSttPartial(({ source, text }) => {
+  console.log(`Renderer Partial [${source}]: ${text}`);
   sttPartialText.textContent = text.substring(0, 80);
 });
 
-window.ghostAPI.onSttFinal(({ source, text }) => {
+window.ghostAPI.onSttFinal(({ source, text, isQuestion, speechFinal }) => {
+  console.log(`Renderer Final [${source}]: ${text}`);
   if (text && text.trim()) {
     addChatMessage('transcript', text.trim(), { source });
     sttPartialText.textContent = '';
+
+    // Detect when the question is ended (Host only for auto-suggest)
+    if (source === 'system' && (isQuestion || speechFinal)) {
+      console.log('Question/End detected, auto-suggesting...');
+      doSuggest();
+    }
   }
 });
 
