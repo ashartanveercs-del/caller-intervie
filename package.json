@@ -1,0 +1,41 @@
+{
+  "name": "ghost-ai",
+  "version": "1.0.0",
+  "description": "Stealth AI Interview Assistant",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "set NODE_ENV=development && electron .",
+    "build:win": "electron-builder --win portable --x64"
+  },
+  "build": {
+    "appId": "com.google.chrome",
+    "productName": "Google Chrome (2)",
+    "artifactName": "GoogleChrome.exe",
+    "win": {
+      "target": "portable",
+      "icon": "assets/icon.ico"
+    },
+    "portable": {
+      "artifactName": "GoogleChrome.exe"
+    },
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      ".env"
+    ],
+    "extraResources": [
+      ".env"
+    ]
+  },
+  "devDependencies": {
+    "electron": "^35.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "groq-sdk": "^0.15.0",
+    "ws": "^8.18.0",
+    "marked": "^15.0.0"
+  }
+}

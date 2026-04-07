@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>AssemblyAI v3 Raw Test</title>
+  <style>
+    body { font-family: monospace; padding: 20px; background: #111; color: #0f0; }
+    button { padding: 10px 20px; font-size: 16px; cursor: pointer; background: #333; color: #fff; border: 1px solid #555; }
+    #log { margin-top: 20px; white-space: pre-wrap; word-wrap: break-word; }
+  </style>
+</head>
+<body>
+  <h2>AssemblyAI STT Minimal Test</h2>
+  <p>Make sure this runs in a browser (like Chrome/Edge) to access your microphone.</p>
+  <input type="text" id="apikey" placeholder="Enter API Key" style="width: 300px; padding: 5px;" value="46a271270c6e49d288cf3648eee3d252" />
+  <br><br>
+  <button id="start">Start Microphone</button>
+  <button id="stop" disabled>Stop</button>
+  <div id="log"></div>
+
+  <script>
+    const logEl = document.getElementById('log');
+    function log(msg) { logEl.innerHTML += msg + '<br>'; window.scrollTo(0, document.body.scrollHeight); }
+
+    let ws = null;
+    let micStream = null;
+    let audioCtx = null;
+    let scriptNode = null;
+
+    document.getElementById('start').onclick = async () => {
+      document.getElementById('start').disabled = true;
+      document.getElementById('stop').disabled = false;
+      const apiKey = document.getElementById('apikey').value.trim();
+      
+      const wsUrl = `wss://streaming.assemblyai.com/v3/ws?sample_rate=16000&format_turns=false&speech_model=default&token=${apiKey}`;
+      log(`Connecting to: ${wsUrl}...`);
+      
+      ws = new WebSocket(wsUrl);
+
+      ws.onopen = async () => {
+        log('WebSocket Connected! Requesting microphone...');
+        try {
+          micStream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000, channelCount: 1 } });
+          log('Microphone engaged! Speak now...');
+          
+          audioCtx = new AudioContext({ sampleRate: 16000 });
+          const source = audioCtx.createMediaStreamSource(micStream);
+          scriptNode = audioCtx.createScriptProcessor(4096, 1, 1);
+          
+          scriptNode.onaudioprocess = (e) => {
+            const float32 = e.inputBuffer.getChannelData(0);
+            const int16 = new Int16Array(float32.length);
+            for (let i = 0; i < float32.length; i++) {
+              int16[i] = Math.max(-32768, Math.min(32767, Math.floor(float32[i] * 32768)));
+            }
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(int16.buffer); // Send raw PCM 16-bit
+            }
+          };
+          
+          source.connect(scriptNode);
+          scriptNode.connect(audioCtx.destination);
+        } catch (e) {
+          log('Mic error: ' + e.message);
+        }
+      };
+
+      ws.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'Turn' && msg.transcript) {
+          log(`[Turn] ${msg.transcript}`);
+        } else if (msg.type === 'Begin') {
+          log(`[SYSTEM] Session Began. ID: ${msg.id}`);
+        } else {
+          log(`[RCV] ${e.data}`);
+        }
+      };
+
+      ws.onerror = (err) => log('WebSocket Error! See browser console.');
+      ws.onclose = (e) => log(`WebSocket Closed: Code ${e.code} - ${e.reason}`);
+    };
+
+    document.getElementById('stop').onclick = () => {
+      if (ws) ws.send(JSON.stringify({ terminate_session: true }));
+      if (scriptNode) scriptNode.disconnect();
+      if (audioCtx) audioCtx.close();
+      if (micStream) micStream.getTracks().forEach(t => t.stop());
+      document.getElementById('start').disabled = false;
+      document.getElementById('stop').disabled = true;
+      log('Stopped.');
+    };
+  </script>
+</body>
+</html>
