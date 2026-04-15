@@ -1,7 +1,8 @@
 node_modules/
 dist/
 .env
-cache/app-state.json
+cache/
 *.log
 *.webm
+*.txt
 tmp/

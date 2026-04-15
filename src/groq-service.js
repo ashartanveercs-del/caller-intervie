@@ -249,17 +249,7 @@ If a section has nothing, write "None noted."`;
     return await callGroq(system, userMsg);
   }
 
-  function transcribe(filePath) {
-    return client.audio.transcriptions.create({
-      file: require('fs').createReadStream(filePath),
-      model: 'whisper-large-v3',
-      response_format: 'json',
-      language: 'en'
-    }).then(res => ({ success: true, text: res.text }))
-      .catch(err => ({ success: false, error: err.message }));
-  }
-
-  return { askAI, screenAI, suggest, notes, transcribe, clearHistory, addToHistory };
+  return { askAI, screenAI, suggest, notes, clearHistory, addToHistory };
 }
 
 module.exports = { createGroqService };

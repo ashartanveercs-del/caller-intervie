@@ -29,11 +29,35 @@ contextBridge.exposeInMainWorld('ghostAPI', {
   toggleVisibility: () => ipcRenderer.invoke('toggle-visibility'),
   setOpacity: (v) => ipcRenderer.invoke('set-opacity', v),
 
-  // Events from main
-  onSttStatus: (cb) => ipcRenderer.on('stt-status', (_, d) => cb(d)),
-  onSttPartial: (cb) => ipcRenderer.on('stt-partial', (_, d) => cb(d)),
-  onSttFinal: (cb) => ipcRenderer.on('stt-final', (_, d) => cb(d)),
-  onSttStopped: (cb) => ipcRenderer.on('stt-stopped', (_, d) => cb(d)),
-  onSttError: (cb) => ipcRenderer.on('stt-error', (_, d) => cb(d)),
-  onShortcut: (cb) => ipcRenderer.on('shortcut', (_, action) => cb(action))
+  // Events from main (with cleanup support)
+  onSttStatus: (cb) => {
+    const handler = (_, d) => cb(d);
+    ipcRenderer.on('stt-status', handler);
+    return () => ipcRenderer.removeListener('stt-status', handler);
+  },
+  onSttPartial: (cb) => {
+    const handler = (_, d) => cb(d);
+    ipcRenderer.on('stt-partial', handler);
+    return () => ipcRenderer.removeListener('stt-partial', handler);
+  },
+  onSttFinal: (cb) => {
+    const handler = (_, d) => cb(d);
+    ipcRenderer.on('stt-final', handler);
+    return () => ipcRenderer.removeListener('stt-final', handler);
+  },
+  onSttStopped: (cb) => {
+    const handler = (_, d) => cb(d);
+    ipcRenderer.on('stt-stopped', handler);
+    return () => ipcRenderer.removeListener('stt-stopped', handler);
+  },
+  onSttError: (cb) => {
+    const handler = (_, d) => cb(d);
+    ipcRenderer.on('stt-error', handler);
+    return () => ipcRenderer.removeListener('stt-error', handler);
+  },
+  onShortcut: (cb) => {
+    const handler = (_, action) => cb(action);
+    ipcRenderer.on('shortcut', handler);
+    return () => ipcRenderer.removeListener('shortcut', handler);
+  }
 });

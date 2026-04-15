@@ -4,10 +4,10 @@ let messages = [];
 let isTranscribing = false;
 
 let micStream = null;
-let micRecorder = null;
+let micContext = null;
 let micAnalyser = null;
 let systemStream = null;
-let systemRecorder = null;
+let sysContext = null;
 let systemAnalyser = null;
 
 let selectedScreenshots = new Set();
@@ -44,7 +44,6 @@ const ssCount = document.getElementById('ss-count');
 async function init() {
   const state = await window.ghostAPI.getState();
   if (state.groqApiKey) document.getElementById('input-groq-key').value = state.groqApiKey;
-  if (state.assemblyAiKey) document.getElementById('input-assembly-key').value = state.assemblyAiKey;
   if (state.language) document.getElementById('select-language').value = state.language;
   if (state.selectedMicId) selectedMicId = state.selectedMicId;
 
@@ -86,30 +85,17 @@ async function updateMicList() {
 
 init();
 
-// ─── SIMPLE MARKDOWN RENDERER ──────────────────────────────────────
+// ─── MARKDOWN RENDERER (using marked library) ─────────────────────
 function renderMarkdown(text) {
-  let html = text
-    // Code blocks
-    .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code class="lang-$1">$2</code></pre>')
-    // Bold
-    .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-    // Inline code
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    // Headers
-    .replace(/^### (.*$)/gm, '<h3>$1</h3>')
-    .replace(/^## (.*$)/gm, '<h2>$1</h2>')
-    .replace(/^# (.*$)/gm, '<h1>$1</h1>')
-    // Unordered lists
-    .replace(/^- \[ \] (.*$)/gm, '<li>☐ $1</li>')
-    .replace(/^- \[x\] (.*$)/gm, '<li>☑ $1</li>')
-    .replace(/^[-*] (.*$)/gm, '<li>$1</li>')
-    // Paragraphs / line breaks
-    .replace(/\n\n/g, '</p><p>')
-    .replace(/\n/g, '<br>');
-
-  // Wrap consecutive <li> in <ul>
-  html = html.replace(/((?:<li>.*<\/li>\s*)+)/g, '<ul>$1</ul>');
-  return `<p>${html}</p>`;
+  if (typeof marked !== 'undefined' && marked.parse) {
+    const raw = marked.parse(text);
+    // Sanitize: strip script tags and event handlers
+    return raw.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+              .replace(/\bon\w+\s*=\s*"[^"]*"/gi, '')
+              .replace(/\bon\w+\s*=\s*'[^']*'/gi, '');
+  }
+  // Fallback: escape HTML entirely
+  return '<p>' + escapeHtml(text) + '</p>';
 }
 
 // ─── CHAT HELPERS ──────────────────────────────────────────────────
@@ -357,7 +343,7 @@ async function startTranscription() {
     console.log('Deepgram mic connection ready, starting audio processing');
 
     // VU Meter logic
-    const micContext = new AudioContext({ sampleRate: 48000 });
+    micContext = new AudioContext({ sampleRate: 48000 });
     await micContext.resume(); // Mandatory for Chrome/Electron
     const sourceNode = micContext.createMediaStreamSource(micStream);
     micAnalyser = micContext.createAnalyser();
@@ -413,7 +399,7 @@ async function startTranscription() {
       await window.ghostAPI.startSTT('system');
       console.log('Deepgram system connection ready, starting system audio processing');
 
-      const sysContext = new AudioContext({ sampleRate: 48000 });
+      sysContext = new AudioContext({ sampleRate: 48000 });
       await sysContext.resume();
       const sysSourceNode = sysContext.createMediaStreamSource(systemStream);
       systemAnalyser = sysContext.createAnalyser();
@@ -457,19 +443,19 @@ function stopTranscription() {
   isTranscribing = false;
   document.getElementById('btn-transcribe').classList.remove('active');
 
-  if (micRecorder && micRecorder.state !== 'inactive') micRecorder.stop();
+  if (micContext) { micContext.close().catch(() => {}); micContext = null; }
   if (micStream) micStream.getTracks().forEach(t => t.stop());
-  micRecorder = null;
   micStream = null;
+  micAnalyser = null;
 
-  if (systemRecorder && systemRecorder.state !== 'inactive') systemRecorder.stop();
+  if (sysContext) { sysContext.close().catch(() => {}); sysContext = null; }
   if (systemStream) systemStream.getTracks().forEach(t => t.stop());
-  systemRecorder = null;
   systemStream = null;
+  systemAnalyser = null;
 
   window.ghostAPI.stopSTT('mic');
   window.ghostAPI.stopSTT('system');
-  addChatMessage('system-msg', '⏹️ Transcription stopped');
+  addChatMessage('system-msg', 'Transcription stopped');
 }
 
 async function doClear() {
@@ -506,9 +492,9 @@ window.ghostAPI.onSttFinal(({ source, text, isQuestion, speechFinal }) => {
     addChatMessage('transcript', text.trim(), { source });
     sttPartialText.textContent = '';
 
-    // Detect when the question is ended (Host only for auto-suggest)
-    if (source === 'system' && (isQuestion || speechFinal)) {
-      console.log('Question/End detected, auto-suggesting...');
+    // Auto-suggest only when host asks a question (not every sentence)
+    if (source === 'system' && isQuestion && speechFinal) {
+      console.log('Question detected from host, auto-suggesting...');
       doSuggest();
     }
   }

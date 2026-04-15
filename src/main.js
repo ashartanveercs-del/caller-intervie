@@ -34,7 +34,7 @@ let isStreamingSystem = false;
 let dgMic = null;
 let dgSystem = null;
 
-const DEEPGRAM_KEY = 'df8ecfe42f5ed24ac84a473b3f30e032ab439a76';
+const DEEPGRAM_KEY = process.env.DEEPGRAM_API_KEY || '';
 
 function sendToRenderer(channel, data) {
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -43,7 +43,7 @@ function sendToRenderer(channel, data) {
 }
 
 function initGroqService() {
-  const apiKey = appState.groqApiKey;
+  const apiKey = appState.groqApiKey || process.env.GROQ_API_KEY || '';
   if (!apiKey) return;
   groqService = createGroqService(apiKey);
 }
@@ -65,7 +65,7 @@ function createWindow() {
       contextIsolation: true,
       preload: path.join(__dirname, 'preload.js'),
       backgroundThrottling: false,
-      sandbox: false
+      sandbox: true
     },
     frame: false,
     transparent: true,
@@ -185,7 +185,13 @@ function registerIPC() {
   ipcMain.handle('get-state', () => appState);
 
   ipcMain.handle('save-settings', (_, settings) => {
-    appState = { ...appState, ...settings };
+    if (!settings || typeof settings !== 'object') return { success: false, error: 'Invalid settings' };
+    const allowed = ['groqApiKey', 'selectedMicId', 'language'];
+    const filtered = {};
+    for (const key of allowed) {
+      if (settings[key] !== undefined) filtered[key] = String(settings[key]);
+    }
+    appState = { ...appState, ...filtered };
     saveState(appState);
     initGroqService();
     return { success: true };
@@ -274,7 +280,9 @@ function registerIPC() {
   });
 
   ipcMain.handle('set-opacity', (_, opacity) => {
-    mainWindow.setOpacity(Math.max(0.1, Math.min(1, opacity)));
+    const val = parseFloat(opacity);
+    if (isNaN(val)) return;
+    mainWindow.setOpacity(Math.max(0.1, Math.min(1, val)));
   });
 }
 
