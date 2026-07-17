@@ -312,29 +312,52 @@ async def async_main() -> None:
     logger.info("  Alt+Space       → toggle overlay")
     logger.info("  Ctrl+Shift+L    → toggle listening")
 
-    # Header shows "warming up" until the knowledge base is ready
-    ui_app.signals.assistant_state.emit("loading")
+    # Audio is live now, so the assistant is already listening. The knowledge
+    # base (RAG) loads separately in the background and reports via doc status.
+    ui_app.signals.assistant_state.emit("listening")
+    if ui_app.overlay is not None:
+        ui_app.overlay.update_doc_status("Loading knowledge base…")
+        # Capture the interviewer's audio too (WASAPI loopback on the default
+        # output — headphones or speakers, whichever is active). Toggling the
+        # switch cascades through the normal signal wiring.
+        ui_app.overlay._sys_switch.setChecked(True)
 
-    async def _load_rag_background() -> None:
+    import threading
+
+    def _load_rag_worker() -> None:
         try:
-            retriever = await asyncio.to_thread(_build_rag)
+            retriever_holder["r"] = _build_rag()
         except Exception:
             logger.exception("Background RAG load failed — running without documents")
-            ui_app.signals.assistant_state.emit("listening")
-            return
-        retriever_holder["r"] = retriever
-        orchestrator.set_retriever(retriever)
-        size = retriever.vector_store.size
-        if ui_app.overlay is not None:
-            ui_app.overlay.update_doc_status(
-                f"Knowledge base ready · {size} chunks"
-                if size else "Drop PDF · DOCX · TXT · MD onto the window"
-            )
-        ui_app.signals.rag_ready.emit(True)
-        ui_app.signals.assistant_state.emit("listening")
-        logger.info("RAG ready (%d chunks)", size)
+            retriever_holder["error"] = True
 
-    rag_task = asyncio.create_task(_load_rag_background())
+    threading.Thread(target=_load_rag_worker, daemon=True).start()
+
+    # Poll from the GUI thread so retriever attach + label updates are thread-safe.
+    from PySide6.QtCore import QTimer
+
+    def _check_rag() -> None:
+        if "r" in retriever_holder:
+            retriever = retriever_holder["r"]
+            orchestrator.set_retriever(retriever)
+            size = retriever.vector_store.size
+            if ui_app.overlay is not None:
+                ui_app.overlay.update_doc_status(
+                    f"Knowledge base ready · {size} chunks"
+                    if size else "Drop PDF · DOCX · TXT · MD onto the window"
+                )
+            ui_app.signals.rag_ready.emit(True)
+            logger.info("RAG ready (%d chunks)", size)
+            _rag_timer.stop()
+        elif retriever_holder.get("error"):
+            if ui_app.overlay is not None:
+                ui_app.overlay.update_doc_status("Running without documents")
+            _rag_timer.stop()
+
+    _rag_timer = QTimer()
+    _rag_timer.setInterval(500)
+    _rag_timer.timeout.connect(_check_rag)
+    _rag_timer.start()
 
     # Start audio pump as background task
     pump_task = asyncio.create_task(audio_pump(mic, transcriber, ui_app.signals))
@@ -344,7 +367,7 @@ async def async_main() -> None:
         await asyncio.Event().wait()
     finally:
         pump_task.cancel()
-        rag_task.cancel()
+        _rag_timer.stop()
         await mic.stop()
         await transcriber.stop()
         ui_app.shutdown()

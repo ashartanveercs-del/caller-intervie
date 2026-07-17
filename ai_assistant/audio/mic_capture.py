@@ -267,8 +267,10 @@ class DualMicCapture:
         return struct.pack(f"<{len(resampled)}h", *resampled)
 
     async def start(self) -> None:
-        if self._mic_device is not None:
-            logger.info("Starting mic capture (device %s)", self._mic_device)
+        # device=None means the system default input — always start the mic so
+        # "you" are captured out of the box (previously a None device was skipped).
+        logger.info("Starting mic capture (device %s)", self._mic_device)
+        try:
             self._mic_stream = sd.RawInputStream(
                 samplerate=self._sample_rate,
                 blocksize=self._blocksize,
@@ -278,7 +280,9 @@ class DualMicCapture:
                 callback=self._mic_callback,
             )
             self._mic_stream.start()
-
+        except Exception:
+            logger.exception("Failed to start mic capture on device %s", self._mic_device)
+            self._mic_stream = None
         logger.info("Dual mic capture started")
 
     def start_system_capture(self) -> None:
@@ -311,7 +315,8 @@ class DualMicCapture:
             self._mic_stream.close()
             self._mic_stream = None
         self._mic_device = device
-        if device is not None:
+        # device=None = system default; always (re)start so the mic keeps working.
+        try:
             self._mic_stream = sd.RawInputStream(
                 samplerate=self._sample_rate,
                 blocksize=self._blocksize,
@@ -321,6 +326,9 @@ class DualMicCapture:
                 callback=self._mic_callback,
             )
             self._mic_stream.start()
+        except Exception:
+            logger.exception("Failed to switch mic to device %s", device)
+            self._mic_stream = None
         logger.info("Switched mic to device %s", device)
 
     async def change_system_device(self, device: int | None) -> None:
