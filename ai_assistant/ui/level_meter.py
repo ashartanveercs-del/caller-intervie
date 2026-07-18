@@ -42,14 +42,21 @@ class LevelMeter(QWidget):
     # -- ballistics -----------------------------------------------------
 
     def _on_tick(self) -> None:
-        if self._raw > self._lvl:
-            self._lvl = max(self._raw, self._lvl * 0.4 + self._raw * 0.6)
+        prev = self._lvl
+        # Noise gate: ignore tiny background levels so the line sits calm in silence
+        raw = self._raw if self._raw > 0.04 else 0.0
+        if raw > self._lvl:
+            # gentler attack — less jumpy on transients
+            self._lvl = self._lvl * 0.6 + raw * 0.4
         else:
-            self._lvl *= 0.90
-        self._raw *= 0.6  # bursts decay if no fresh level arrives
-        if self._lvl < 0.001:
+            self._lvl *= 0.86  # smoother release
+        self._raw *= 0.55
+        if self._lvl < 0.005:
             self._lvl = 0.0
-        self.update()
+        # Only repaint when something visibly changed (or while idle-pulsing an
+        # armed line) — avoids constant flicker/jitter when nothing is happening.
+        if abs(self._lvl - prev) > 0.004 or (self._armed and self._lvl < 0.05):
+            self.update()
 
     # -- painting -------------------------------------------------------
 

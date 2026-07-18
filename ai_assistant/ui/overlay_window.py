@@ -359,6 +359,15 @@ class OverlayWindow(QWidget):
         row.addWidget(self._status)
         row.addStretch()
 
+        self._power_btn = QPushButton("⏻ On")
+        self._power_btn.setCheckable(True)
+        self._power_btn.setChecked(True)
+        self._power_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._power_btn.setToolTip("Turn listening on/off (Ctrl+Shift+L)")
+        self._style_power(True)
+        self._power_btn.clicked.connect(self._signals.toggle_listening.emit)
+        row.addWidget(self._power_btn)
+
         self._shield = ShieldGlyph()
         row.addWidget(self._shield, alignment=Qt.AlignmentFlag.AlignVCenter)
         row.addSpacing(4)
@@ -650,6 +659,21 @@ class OverlayWindow(QWidget):
         self._signals.system_level.connect(self._sys_meter.set_level)
         self._signals.assistant_state.connect(self._on_assistant_state)
         self._signals.capture_status.connect(self._on_capture_status)
+        self._signals.listening_changed.connect(self._on_listening_changed)
+
+    def _style_power(self, on: bool) -> None:
+        color = styles.SUCCESS if on else styles.TEXT_TERTIARY
+        self._power_btn.setText("⏻ On" if on else "⏻ Off")
+        self._power_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: 1px solid {color}; "
+            f"border-radius: 8px; color: {color}; font-size: 10px; font-weight: 600; "
+            f"padding: 2px 8px; }}"
+            f"QPushButton:hover {{ background: rgba(242,233,220,14); }}"
+        )
+
+    def _on_listening_changed(self, on: bool) -> None:
+        self._power_btn.setChecked(on)
+        self._style_power(on)
 
     def _on_mode_changed(self, mode: str) -> None:
         self._mode_toggle.set_mode(mode)
