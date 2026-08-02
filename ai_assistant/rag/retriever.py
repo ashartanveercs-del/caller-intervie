@@ -40,15 +40,17 @@ class RAGRetriever:
 
     def ingest_file(self, file_path: str) -> int:
         """Ingest a single file and return the number of chunks produced."""
-        pages, metadata = self._ingester.ingest(file_path)
+        pages, _metadata = self._ingester.ingest(file_path)
         chunks = self._splitter.split_pages(pages, source_path=file_path)
 
         if not chunks:
+            self.vector_store.remove_by_source(file_path)
             logger.warning("No chunks produced from %s", file_path)
             return 0
 
         texts = [c.text for c in chunks]
         embeddings = self.embedder.embed_texts(texts)
+        self.vector_store.remove_by_source(file_path)
         self.vector_store.add(embeddings, chunks)
 
         logger.info("Ingested %s — %d chunks added to store", file_path, len(chunks))

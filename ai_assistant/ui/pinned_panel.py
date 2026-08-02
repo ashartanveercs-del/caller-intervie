@@ -105,7 +105,7 @@ class PinnedPanel(QWidget):
     def __init__(self, signals: AppSignals, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._signals = signals
-        self._items: list[str] = []
+        self._entries: list[tuple[str, PinnedItem | None]] = []
         self._setup_ui()
         self._signals.pin_response.connect(self.add_pinned)
         self._signals.unpin_response.connect(self.remove_pinned)
@@ -131,19 +131,22 @@ class PinnedPanel(QWidget):
 
     @property
     def pin_count(self) -> int:
-        return sum(1 for t in self._items if t)
+        return sum(1 for _text, widget in self._entries if widget is not None)
 
     def add_pinned(self, text: str) -> None:
-        self._items.append(text)
-        idx = len(self._items) - 1
+        idx = len(self._entries)
         item = PinnedItem(text, idx, self._signals)
+        self._entries.append((text, item))
         self._container_layout.insertWidget(self._container_layout.count() - 1, item)
         self.count_changed.emit(self.pin_count)
 
     def remove_pinned(self, index: int) -> None:
-        if 0 <= index < len(self._items) and self._items[index]:
-            self._items[index] = ""
-            item = self._container_layout.itemAt(index)
-            if item and item.widget():
-                item.widget().deleteLater()
-            self.count_changed.emit(self.pin_count)
+        if not (0 <= index < len(self._entries)):
+            return
+        text, widget = self._entries[index]
+        if widget is None:
+            return
+        self._entries[index] = (text, None)
+        self._container_layout.removeWidget(widget)
+        widget.deleteLater()
+        self.count_changed.emit(self.pin_count)
