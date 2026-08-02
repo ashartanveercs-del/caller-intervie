@@ -214,7 +214,9 @@ class DeepgramTranscriber:
             self._mic_stream.connect(), self._dg_loop
         )
         try:
-            fut.result(timeout=15)
+            await asyncio.wait_for(asyncio.wrap_future(fut), timeout=15)
+        except asyncio.TimeoutError:
+            logger.error("Mic Deepgram connection timed out")
         except Exception:
             logger.exception("Mic Deepgram connection failed")
 
@@ -230,7 +232,9 @@ class DeepgramTranscriber:
             self._sys_stream.connect(), self._dg_loop
         )
         try:
-            fut.result(timeout=15)
+            await asyncio.wait_for(asyncio.wrap_future(fut), timeout=15)
+        except asyncio.TimeoutError:
+            logger.error("System Deepgram connection timed out")
         except Exception:
             logger.exception("System Deepgram connection failed")
 
@@ -240,9 +244,11 @@ class DeepgramTranscriber:
                 self._sys_stream.close(), self._dg_loop
             )
             try:
-                fut.result(timeout=5)
+                await asyncio.wait_for(asyncio.wrap_future(fut), timeout=5)
+            except asyncio.TimeoutError:
+                logger.warning("System Deepgram stream close timed out")
             except Exception:
-                pass
+                logger.exception("System Deepgram stream close failed")
             self._sys_stream = None
 
     async def send_mic_audio(self, data: bytes) -> None:
@@ -264,10 +270,16 @@ class DeepgramTranscriber:
                     stream.close(), self._dg_loop
                 )
                 try:
-                    fut.result(timeout=5)
+                    await asyncio.wait_for(asyncio.wrap_future(fut), timeout=5)
+                except asyncio.TimeoutError:
+                    logger.warning("Deepgram stream close timed out")
                 except Exception:
-                    pass
+                    logger.exception("Deepgram stream close failed")
         self._dg_loop.call_soon_threadsafe(self._dg_loop.stop)
         if self._dg_thread is not None:
-            self._dg_thread.join(timeout=3)
+            await asyncio.to_thread(self._dg_thread.join, 3)
+            if self._dg_thread.is_alive():
+                logger.warning("Deepgram event loop thread did not stop")
+            elif not self._dg_loop.is_closed():
+                self._dg_loop.close()
         logger.info("Deepgram client stopped")
