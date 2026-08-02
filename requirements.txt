@@ -1,0 +1,12 @@
+anthropic>=0.49
+websockets>=12.0,<13.0
+sounddevice>=0.5
+PyAudioWPatch>=0.2.12  # WASAPI loopback to capture interviewer/system audio
+PySide6>=6.6
+qasync>=0.27
+sentence-transformers>=3.0
+faiss-cpu>=1.8
+pymupdf>=1.24
+python-docx>=1.1
+python-dotenv>=1.0
+numpy>=1.26
