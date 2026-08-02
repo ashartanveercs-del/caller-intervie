@@ -59,3 +59,7 @@ class AppSignals(QObject):
     capture_status = Signal(bool)
     # RAG knowledge base finished loading in the background.
     rag_ready = Signal(bool)
+
+    # Which audio source is "you" (the candidate): "mic" or "system".
+    # The other source is treated as the interviewer.
+    you_source_changed = Signal(str)

@@ -9,9 +9,11 @@ from PySide6.QtWidgets import QTextEdit, QVBoxLayout, QWidget
 from ai_assistant.ui import styles
 from ai_assistant.ui.signals import AppSignals
 
-SOURCE_STYLES = {
-    "mic": {"label": "You", "color": styles.SPEAKER_YOU},
-    "system": {"label": "Interviewer", "color": styles.SPEAKER_INTERVIEWER},
+# Styling is keyed on ROLE, not raw source, so the labels follow whichever
+# audio source the user has designated as "you".
+ROLE_STYLES = {
+    "you": {"label": "You", "color": styles.SPEAKER_YOU},
+    "interviewer": {"label": "Interviewer", "color": styles.SPEAKER_INTERVIEWER},
 }
 
 _MAX_FINALS = 60  # keep the rendered history bounded
@@ -26,7 +28,15 @@ class TranscriptPanel(QWidget):
         self._finals: list[tuple[str, str]] = []
         self._interim: tuple[str, str] | None = None
         self._hovering = False
+        self._you_source = "mic"
         self._setup_ui()
+
+    def set_you_source(self, source: str) -> None:
+        """Set which audio source ('mic'/'system') is labeled 'You'; re-render."""
+        if source not in ("mic", "system"):
+            return
+        self._you_source = source
+        self._render()
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -75,7 +85,8 @@ class TranscriptPanel(QWidget):
         last_source: str | None = None
 
         def speaker_header(src: str) -> str:
-            style = SOURCE_STYLES.get(src, SOURCE_STYLES["mic"])
+            role = "you" if src == self._you_source else "interviewer"
+            style = ROLE_STYLES[role]
             return (
                 f'<div style="margin-top:6px;"><span style="color:{style["color"]};'
                 f'font-weight:600;font-size:11px;">{style["label"]}</span></div>'

@@ -65,8 +65,10 @@ STATE_STYLES: dict[str, tuple[str, str]] = {
 # Fonts — probed once against the running Qt font database
 # ---------------------------------------------------------------------------
 
-_SERIF_HEAD = ["Sitka Heading", "Sitka", "Georgia", "serif"]
-_SERIF_BODY = ["Sitka Text", "Sitka", "Georgia", "serif"]
+# Georgia first: Qt resolves the Sitka optical family to its *italic*
+# subfamily on some Windows installs, which italicised every serif line.
+_SERIF_HEAD = ["Georgia", "Sitka Heading", "serif"]
+_SERIF_BODY = ["Georgia", "Sitka Text", "serif"]
 _UI = ["Segoe UI Variable Text", "Segoe UI", "sans-serif"]
 _UI_SMALL = ["Segoe UI Variable Small", "Segoe UI", "sans-serif"]
 _MONO = ["Cascadia Mono", "Cascadia Code", "Consolas", "monospace"]
@@ -163,9 +165,9 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: tran
 # Ghost text button (header toggles, quick actions)
 GHOST_BUTTON = f"""
 QPushButton {{
-    background: transparent; color: {TEXT_SECONDARY};
-    border: none; border-radius: 6px; padding: 4px 8px;
-    font-family: {_css_stack(_UI)}; font-size: 11px; font-weight: 500;
+    background: transparent; color: #CFC2AB;
+    border: none; border-radius: 6px; padding: 4px 9px;
+    font-family: {_css_stack(_UI)}; font-size: 12px; font-weight: 500;
 }}
 QPushButton:hover {{ background: rgba(242,233,220,14); color: {ACCENT}; }}
 QPushButton:pressed {{ background: {ACCENT_PRESSED}; }}

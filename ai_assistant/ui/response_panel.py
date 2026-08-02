@@ -22,6 +22,7 @@ from PySide6.QtGui import (
     QLinearGradient,
     QPainter,
     QPaintEvent,
+    QTextCharFormat,
     QTextCursor,
 )
 from PySide6.QtWidgets import (
@@ -180,8 +181,11 @@ class ResponsePanel(QFrame):
         self._scroll_anim = QPropertyAnimation(
             self._body.verticalScrollBar(), b"value", self
         )
-        self._scroll_anim.setDuration(240)
-        self._scroll_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        # Linear + short: the follow animation retargets every ~100ms flush,
+        # and an eased curve restarting that often causes visible speed
+        # jitter. Constant velocity reads as calm teleprompter motion.
+        self._scroll_anim.setDuration(300)
+        self._scroll_anim.setEasingCurve(QEasingCurve.Type.Linear)
 
     # ------------------------------------------------------------------
 
@@ -200,8 +204,8 @@ class ResponsePanel(QFrame):
         head_row.setSpacing(8)
         self._headline = QLabel("")
         self._headline.setWordWrap(True)
-        self._headline.setFont(styles.make_font(styles.serif_head(), 17, italic=True))
-        self._headline.setStyleSheet(f"color: {styles.SPEAKER_INTERVIEWER};")
+        self._headline.setFont(styles.make_font(styles.serif_head(), 16, weight=600))
+        self._headline.setStyleSheet(f"color: {styles.TEXT_PRIMARY};")
         self._headline.setVisible(False)
         head_row.addWidget(self._headline, stretch=1)
 
@@ -226,7 +230,8 @@ class ResponsePanel(QFrame):
         self._body.document().setDefaultStyleSheet(
             f"p {{ line-height: 160%; margin: 0 0 10px 0; color: {styles.TEXT_PRIMARY}; }}"
         )
-        self._body.setFont(styles.make_font(styles.serif_body(), 15))
+        # Clean sans for the body — readable at a glance while speaking.
+        self._body.setFont(styles.make_font(styles.ui_family(), 14))
         self._body.setPlaceholderText("Your answers will appear here — spoken-ready.")
         self._body.anchorClicked.connect(self._on_anchor)
         layout.addWidget(self._body, stretch=1)
@@ -289,6 +294,11 @@ class ResponsePanel(QFrame):
 
     def _begin_stream(self) -> None:
         self._streaming = True
+        # Start every answer on a fresh document — otherwise raw text appends
+        # below the previous formatted answer and inherits the char format of
+        # its last element (the italic amber "Deep dive" link).
+        self._body.clear()
+        self._body.setCurrentCharFormat(QTextCharFormat())
         self._headline.setVisible(False)
         self._deep_dive_expanded = False
         self._elapsed_ms = 0
@@ -337,15 +347,19 @@ class ResponsePanel(QFrame):
 
     def on_response_complete(self, full_text: str) -> None:
         self._current_text = full_text
+        # Drop any unflushed tail — the 100ms flush timer must not insert raw
+        # text after the formatted render below.
+        self._chunk_buffer = ""
         self._streaming = False
         self._t_timer.stop()
         self._prompter.set_streaming(False)
+        sb = self._body.verticalScrollBar()
+        pos = sb.value()
         self._render_formatted(expand_deep_dive=False)
-        # Settle top-aligned for review
+        # Hold the reading position through the re-render — jumping back to
+        # the top read as a jarring "reload" mid-glance.
         self._scroll_anim.stop()
-        self._scroll_anim.setStartValue(self._body.verticalScrollBar().value())
-        self._scroll_anim.setEndValue(0)
-        self._scroll_anim.start()
+        sb.setValue(min(pos, sb.maximum()))
         self._signals.assistant_state.emit("listening")
 
     # ------------------------------------------------------------------

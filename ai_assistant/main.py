@@ -25,12 +25,40 @@ logger = logging.getLogger(__name__)
 
 
 def _setup_logging() -> None:
+    import os
+
+    # pythonw.exe (double-click / start.bat launch) has no console, so
+    # sys.stdout and sys.stderr are None. Any write to them — including a
+    # default logging StreamHandler or a third-party library — raises and can
+    # kill the process. Redirect them to devnull so nothing can crash on write.
+    # UTF-8 with errors ignored: a cp1252 devnull still RAISES on characters
+    # like "→" in log lines, and that exception killed the app under pythonw.
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8", errors="ignore")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8", errors="ignore")
+
+    # Always log to a file next to the app so there's a record even with no
+    # console (and so DEBUG spam never goes to a possibly-None stream).
+    log_path = Path(__file__).resolve().parent.parent / "interview.log"
+    handlers: list[logging.Handler] = [
+        logging.FileHandler(log_path, encoding="utf-8")
+    ]
+    # Add a console handler only when a REAL console/pipe is attached —
+    # never route logging through the devnull stub above.
+    if sys.__stderr__ is not None:
+        try:
+            handlers.append(logging.StreamHandler(sys.stderr))
+        except Exception:
+            pass
+
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
+        handlers=handlers,
     )
-    # Quiet down noisy libraries
+    # Quiet down noisy libraries (qasync/websockets dump raw audio bytes at DEBUG)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -38,6 +66,31 @@ def _setup_logging() -> None:
     logging.getLogger("datasets").setLevel(logging.WARNING)
     logging.getLogger("filelock").setLevel(logging.WARNING)
     logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+    logging.getLogger("qasync").setLevel(logging.WARNING)
+    logging.getLogger("websockets").setLevel(logging.WARNING)
+    logging.getLogger("asyncio").setLevel(logging.WARNING)
+
+    # Post-mortem instrumentation: under pythonw a fatal error is invisible,
+    # so route native crashes (faulthandler), uncaught exceptions, and normal
+    # interpreter exit into fatal.log to make any death diagnosable.
+    import atexit
+    import faulthandler
+    try:
+        fatal = open(log_path.parent / "fatal.log", "a", buffering=1, encoding="utf-8")
+        fatal.write(f"--- start pid={os.getpid()} ---\n")
+        faulthandler.enable(fatal)
+    except Exception:
+        fatal = None
+
+    def _excepthook(exc_type, exc, tb) -> None:
+        logging.getLogger("fatal").critical(
+            "Uncaught exception", exc_info=(exc_type, exc, tb)
+        )
+
+    sys.excepthook = _excepthook
+    atexit.register(
+        lambda: fatal and fatal.write(f"--- clean exit pid={os.getpid()} ---\n")
+    )
 
 
 def _compute_level(pcm_bytes: bytes) -> float:
@@ -77,9 +130,7 @@ async def audio_pump(
 
 
 async def async_main() -> None:
-    _setup_logging()
-    load_dotenv()
-
+    # Logging + dotenv are initialised once in main() before the loop starts.
     config = Config.from_env()
 
     if not config.deepgram_api_key:
@@ -204,7 +255,10 @@ async def async_main() -> None:
     def _on_summarize() -> None:
         ui_app.signals.response_clear.emit()
         asyncio.create_task(orchestrator.trigger_query(
-            "Summarize the conversation so far in 3-5 short bullet points."
+            "Summarize the ENTIRE conversation from the very beginning to now. "
+            "Cover every topic and question discussed, in order — do not skip "
+            "the earlier parts. Use as many concise bullet points as needed.",
+            full_transcript=True,
         ))
 
     def _on_detail() -> None:
@@ -227,21 +281,23 @@ async def async_main() -> None:
 
     async def _generate_notes() -> None:
         """Ask AI to extract key notes from recent conversation."""
-        from ai_assistant.llm.prompt_builder import TranscriptBuffer
         buf = orchestrator._transcript_buffer
-        recent = buf.get_recent_text(max_chars=10000)
-        if not recent:
+        full = buf.get_full_text()
+        if not full:
             ui_app.signals.note_added.emit("No conversation to take notes from yet.")
             return
 
         note_prompt = await prompt_builder.build(
             mode="active",
             transcript_buffer=buf,
+            use_full_transcript=True,
             query=(
-                "Extract the KEY POINTS from this conversation as brief bullet notes. "
-                "Focus on: questions asked, answers given, decisions made, "
+                "Extract the KEY POINTS from the ENTIRE conversation, from the very "
+                "beginning to now. Go through it in order and do not skip the earlier "
+                "parts. Focus on: questions asked, answers given, decisions made, "
                 "action items, and important topics. "
-                "Format: one bullet per point, max 8 bullets, be concise. "
+                "Format: one bullet per point, in chronological order, as many "
+                "bullets as it takes to cover everything. Be concise per bullet. "
                 "Use plain text, no markdown."
             ),
         )
@@ -273,6 +329,15 @@ async def async_main() -> None:
 
     ui_app.signals.chat_message_sent.connect(_on_chat_message)
     ui_app.signals.system_prompt_changed.connect(_on_system_prompt_changed)
+
+    # Role assignment — which audio source is "you" vs the interviewer
+    def _on_you_source_changed(source: str) -> None:
+        orchestrator.set_you_source(source)
+        if ui_app.overlay is not None:
+            ui_app.overlay.transcript_panel.set_you_source(source)
+        logger.info("You-source set to %s", source)
+
+    ui_app.signals.you_source_changed.connect(_on_you_source_changed)
 
     # File drop — ingest documents into RAG
     def _on_files_dropped(paths: list) -> None:

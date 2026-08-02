@@ -50,6 +50,12 @@ SYSTEM_TEMPLATE = (
     "You are a real-time interview assistant that generates structured answers "
     "the candidate can reference while speaking. Always produce an answer. "
     "Never produce meta-commentary or waiting messages.\n\n"
+    "The <conversation> transcript is labeled by role. Lines that begin with "
+    "'Interviewer:' are the person interviewing the candidate — treat these as "
+    "the questions to answer. Lines that begin with 'You:' are the candidate "
+    "(the person you are helping) speaking. Answer as the candidate: respond to "
+    "the interviewer's most recent question, and use the candidate's own 'You:' "
+    "lines only as context for what they have already said.\n\n"
     "{mode_instructions}"
 )
 
@@ -69,10 +75,17 @@ class TranscriptBuffer:
     def __init__(self, max_seconds: float = 300.0) -> None:
         self.max_seconds = max_seconds
         self._segments: list[TranscriptEvent] = []
+        # Full-session history of final segments — never pruned, so notes and
+        # summaries can cover the entire interview, not just the rolling window.
+        self._all_finals: list[TranscriptEvent] = []
+        # Which source is the candidate ("you"); the other is the interviewer.
+        self.you_source = "mic"
 
     def add(self, event: TranscriptEvent) -> None:
         """Append a transcript segment and prune old entries."""
         self._segments.append(event)
+        if event.is_final:
+            self._all_finals.append(event)
         self._prune(event.timestamp)
 
     def _prune(self, now: float) -> None:
@@ -87,8 +100,11 @@ class TranscriptBuffer:
         for seg in self._segments:
             if not seg.is_final:
                 continue
-            speaker = seg.speaker if seg.speaker is not None else 0
-            lines.append(f"[Speaker {speaker}]: {seg.text}")
+            # Label by role, not raw speaker index: whichever audio source the
+            # user has designated as "you" is the candidate; the other is the
+            # interviewer asking the questions.
+            role = "You" if seg.source == self.you_source else "Interviewer"
+            lines.append(f"{role}: {seg.text}")
 
         full_text = "\n".join(lines)
 
@@ -96,6 +112,20 @@ class TranscriptBuffer:
             # Keep the most recent portion
             full_text = full_text[-max_chars:]
 
+        return full_text
+
+    def get_full_text(self, max_chars: int = 200_000) -> str:
+        """Return the ENTIRE session transcript (all final segments, unpruned),
+        role-labeled, for notes and summaries. Truncated from the most recent
+        end only if it exceeds *max_chars*."""
+        lines: list[str] = []
+        for seg in self._all_finals:
+            role = "You" if seg.source == self.you_source else "Interviewer"
+            lines.append(f"{role}: {seg.text}")
+
+        full_text = "\n".join(lines)
+        if len(full_text) > max_chars:
+            full_text = full_text[-max_chars:]
         return full_text
 
 
@@ -138,8 +168,13 @@ class PromptBuilder:
         transcript_buffer: TranscriptBuffer,
         rag_context: str | None = None,
         query: str | None = None,
+        use_full_transcript: bool = False,
     ) -> BuiltPrompt:
-        """Assemble a BuiltPrompt that fits within the context budget."""
+        """Assemble a BuiltPrompt that fits within the context budget.
+
+        When *use_full_transcript* is True, include the entire session
+        transcript (for notes/summaries) instead of just the rolling window.
+        """
         cfg = self._config
         budget = cfg.max_context_tokens - cfg.max_output_tokens
 
@@ -153,9 +188,14 @@ class PromptBuilder:
 
         # --- Recent transcript (40 %) ---
         transcript_budget_chars = int(budget * cfg.recent_transcript_budget) * 4
-        transcript_text = transcript_buffer.get_recent_text(
-            max_chars=transcript_budget_chars
-        )
+        if use_full_transcript:
+            transcript_text = transcript_buffer.get_full_text(
+                max_chars=transcript_budget_chars
+            )
+        else:
+            transcript_text = transcript_buffer.get_recent_text(
+                max_chars=transcript_budget_chars
+            )
 
         # --- RAG context (30 %) ---
         rag_budget_chars = int(budget * cfg.rag_budget) * 4

@@ -52,6 +52,12 @@ class Orchestrator:
         self._mode = Mode.SUGGESTION
         self._debounce_handle: asyncio.TimerHandle | None = None
         self._listening = True
+        # Which audio source is the candidate ("you"); the other is the
+        # interviewer whose questions drive suggestions.
+        self._you_source = "mic"
+        # When the last final interviewer segment arrived — used to suppress
+        # own-speech triggers while interviewer audio is actually flowing.
+        self._last_interviewer_final = 0.0
 
         # Wire event handlers
         self._bus.on(EventType.TRANSCRIPT_UPDATE, self._on_transcript)
@@ -77,6 +83,19 @@ class Orchestrator:
         self._retriever = retriever
         logger.info("RAG retriever attached to orchestrator")
 
+    def set_you_source(self, source: str) -> None:
+        """Set which audio source ('mic' or 'system') is the candidate ('you').
+
+        The other source is treated as the interviewer, whose finished
+        sentences trigger suggestions.
+        """
+        if source not in ("mic", "system"):
+            return
+        self._you_source = source
+        self._transcript_buffer.you_source = source
+        logger.info("You-source set to %s (interviewer is %s)",
+                    source, "system" if source == "mic" else "mic")
+
     async def set_mode(self, new_mode: Mode) -> None:
         old = self._mode
         self._mode = new_mode
@@ -88,8 +107,15 @@ class Orchestrator:
         )
         logger.info("Mode changed: %s -> %s", old.value, new_mode.value)
 
-    async def trigger_query(self, explicit_query: Optional[str] = None) -> None:
-        """Manually trigger an LLM response (e.g. from hotkey)."""
+    async def trigger_query(
+        self,
+        explicit_query: Optional[str] = None,
+        full_transcript: bool = False,
+    ) -> None:
+        """Manually trigger an LLM response (e.g. from hotkey).
+
+        Set *full_transcript* for whole-conversation tasks like summarizing.
+        """
         await self._bus.emit(
             EventType.QUERY_TRIGGERED, {"query": explicit_query}
         )
@@ -101,6 +127,7 @@ class Orchestrator:
             transcript_buffer=self._transcript_buffer,
             rag_context=rag_context,
             query=explicit_query,
+            use_full_transcript=full_transcript,
         )
         await self._llm.submit(prompt)
 
@@ -121,11 +148,19 @@ class Orchestrator:
             return
 
         if self._mode == Mode.SUGGESTION:
-            # Auto-generate script when interviewer finishes a sentence
-            if event.source == "system":
+            interviewer_source = "system" if self._you_source == "mic" else "mic"
+            # Auto-generate script when the interviewer finishes a sentence
+            if event.source == interviewer_source:
+                self._last_interviewer_final = event.timestamp
                 self._schedule_suggestion(delay=0.8)
-            # Also trigger on your own speech in case interviewer audio isn't on
-            elif event.source == "mic" and event.speech_final:
+            # Fall back to your own speech ONLY when no interviewer audio has
+            # been heard recently — otherwise every sentence the candidate
+            # speaks would wipe and regenerate the answer they're reading.
+            elif (
+                event.source == self._you_source
+                and event.speech_final
+                and event.timestamp - self._last_interviewer_final > 90.0
+            ):
                 self._schedule_suggestion()
         elif self._mode == Mode.ACTIVE:
             if event.is_final:

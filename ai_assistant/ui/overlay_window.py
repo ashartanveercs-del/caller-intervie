@@ -359,7 +359,7 @@ class OverlayWindow(QWidget):
         row.addWidget(self._status)
         row.addStretch()
 
-        self._power_btn = QPushButton("⏻ On")
+        self._power_btn = QPushButton("On")
         self._power_btn.setCheckable(True)
         self._power_btn.setChecked(True)
         self._power_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
@@ -448,9 +448,12 @@ class OverlayWindow(QWidget):
 
     def _build_settings_tray(self) -> QWidget:
         tray = QWidget()
+        tray.setObjectName("settingsTray")
+        # Scope to the tray itself — an unscoped stylesheet cascades the border
+        # onto every child widget (boxes around all the labels).
         tray.setStyleSheet(
-            f"background: {styles.SURFACE}; border: 1px solid {styles.HAIRLINE}; "
-            f"border-radius: 10px;"
+            f"QWidget#settingsTray {{ background: {styles.SURFACE}; "
+            f"border: 1px solid {styles.HAIRLINE}; border-radius: 10px; }}"
         )
         lay = QVBoxLayout(tray)
         lay.setContentsMargins(12, 10, 12, 10)
@@ -479,16 +482,30 @@ class OverlayWindow(QWidget):
         sys_row.addWidget(self._sys_switch)
         lay.addLayout(sys_row)
 
+        # Which source is "you" (the candidate) vs the interviewer
+        role_row = QHBoxLayout()
+        role_label = QLabel("You are")
+        role_label.setStyleSheet(f"color: {styles.TEXT_SECONDARY}; font-size: 11px;")
+        role_row.addWidget(role_label)
+        self._you_source_combo = QComboBox()
+        self._you_source_combo.setStyleSheet(styles.COMBO_STYLE)
+        # index 0 -> "mic", index 1 -> "system"
+        self._you_source_combo.addItem("My mic (interviewer on system)")
+        self._you_source_combo.addItem("System audio (interviewer on mic)")
+        self._you_source_combo.setCurrentIndex(0)
+        self._you_source_combo.currentIndexChanged.connect(self._on_you_source_changed)
+        role_row.addWidget(self._you_source_combo, stretch=1)
+        lay.addLayout(role_row)
+
         # System prompt
         sp_label = QLabel("System prompt")
         sp_label.setStyleSheet(f"color: {styles.LABEL}; font-size: 10px; font-weight: 600;")
         lay.addWidget(sp_label)
         self._system_prompt_edit = QPlainTextEdit()
         self._system_prompt_edit.setPlaceholderText(
-            "e.g. 'Interviewing for a senior Python role at Google. "
-            "Favor system-design depth.'"
+            "e.g. Senior Python role at Google — favor system-design depth"
         )
-        self._system_prompt_edit.setFixedHeight(56)
+        self._system_prompt_edit.setFixedHeight(48)
         self._system_prompt_edit.setStyleSheet(
             f"QPlainTextEdit {{ background: {styles.SURFACE_RAISED}; color: {styles.TEXT_PRIMARY}; "
             f"border: 1px solid {styles.HAIRLINE}; border-radius: 8px; padding: 6px; "
@@ -574,7 +591,12 @@ class OverlayWindow(QWidget):
 
     def _toggle_settings(self) -> None:
         self._settings_open = not self._settings_open
-        target = 172 if self._settings_open else 0
+        # Size to actual content — a hardcoded height squeezed rows into overlap.
+        target = self._settings_tray.sizeHint().height() if self._settings_open else 0
+        # Grow/shrink the window by the same delta so the tray never squeezes
+        # (and overlaps) the rest of the layout.
+        delta = target - self._settings_tray.maximumHeight()
+        self.resize(self.width(), max(self.minimumHeight(), self.height() + delta))
         anim = QPropertyAnimation(self._settings_tray, b"maximumHeight", self)
         anim.setDuration(220)
         anim.setStartValue(self._settings_tray.maximumHeight())
@@ -604,6 +626,11 @@ class OverlayWindow(QWidget):
             device_index = self._mic_devices[combo_index]
             logger.info("Mic selection changed to device: %s", device_index)
             self.mic_changed.emit(device_index if device_index is not None else -1)
+
+    def _on_you_source_changed(self, combo_index: int) -> None:
+        source = "system" if combo_index == 1 else "mic"
+        logger.info("You-source changed to: %s", source)
+        self._signals.you_source_changed.emit(source)
 
     def _on_sys_toggled(self, checked: bool) -> None:
         self._sys_meter.set_armed(checked)
@@ -663,7 +690,8 @@ class OverlayWindow(QWidget):
 
     def _style_power(self, on: bool) -> None:
         color = styles.SUCCESS if on else styles.TEXT_TERTIARY
-        self._power_btn.setText("⏻ On" if on else "⏻ Off")
+        # Plain text — the U+23FB power glyph renders as a tofu box in Segoe UI.
+        self._power_btn.setText("On" if on else "Off")
         self._power_btn.setStyleSheet(
             f"QPushButton {{ background: transparent; border: 1px solid {color}; "
             f"border-radius: 8px; color: {color}; font-size: 10px; font-weight: 600; "

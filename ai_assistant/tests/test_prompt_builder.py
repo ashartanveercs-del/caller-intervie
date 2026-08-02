@@ -7,19 +7,44 @@ from ai_assistant.core.events import TranscriptEvent
 from ai_assistant.llm.prompt_builder import PromptBuilder, TranscriptBuffer
 
 
-def _final(text, speaker=0, ts=0.0, is_final=True):
+def _final(text, speaker=0, ts=0.0, is_final=True, source="mic"):
     return TranscriptEvent(
-        text=text, is_final=is_final, speech_final=True, speaker=speaker, timestamp=ts
+        text=text, is_final=is_final, speech_final=True, speaker=speaker,
+        timestamp=ts, source=source,
     )
 
 
-def test_buffer_formats_and_filters_final_only():
-    buf = TranscriptBuffer(max_seconds=1000)
-    buf.add(_final("hello", speaker=1, ts=1.0))
-    buf.add(_final("draft", speaker=0, ts=2.0, is_final=False))  # excluded
+def test_buffer_labels_by_role_and_filters_final_only():
+    buf = TranscriptBuffer(max_seconds=1000)  # default: mic = You
+    buf.add(_final("hello", ts=1.0, source="mic"))
+    buf.add(_final("what is a stack?", ts=1.5, source="system"))
+    buf.add(_final("draft", ts=2.0, is_final=False))  # excluded
     text = buf.get_recent_text()
-    assert "[Speaker 1]: hello" in text
+    assert "You: hello" in text
+    assert "Interviewer: what is a stack?" in text
     assert "draft" not in text
+
+
+def test_buffer_role_labels_follow_you_source():
+    buf = TranscriptBuffer(max_seconds=1000)
+    buf.you_source = "system"  # swap: system audio is now "You"
+    buf.add(_final("my answer", ts=1.0, source="system"))
+    buf.add(_final("their question", ts=1.5, source="mic"))
+    text = buf.get_recent_text()
+    assert "You: my answer" in text
+    assert "Interviewer: their question" in text
+
+
+def test_full_text_retains_beyond_prune_window():
+    buf = TranscriptBuffer(max_seconds=10)
+    buf.add(_final("earliest", ts=0.0, source="system"))
+    buf.add(_final("latest", ts=1000.0, source="mic"))  # prunes rolling window
+    # Rolling window drops the old line...
+    assert "earliest" not in buf.get_recent_text()
+    # ...but the full-session transcript keeps everything, role-labeled.
+    full = buf.get_full_text()
+    assert "Interviewer: earliest" in full
+    assert "You: latest" in full
 
 
 def test_buffer_prunes_old_segments():
@@ -38,7 +63,7 @@ def test_buffer_truncates_to_max_chars_keeping_tail():
     text = buf.get_recent_text(max_chars=30)
     assert len(text) <= 30
     assert "line49" in text  # newest kept
-    assert "line0]" not in text  # oldest dropped
+    assert "line0" not in text  # oldest dropped
 
 
 def test_history_trims_to_max():
