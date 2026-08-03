@@ -98,7 +98,8 @@ function unknownHealth(): RuntimeHealth {
 }
 
 export function createSessionStore(): StoreApi<SessionStoreState> {
-  const seenEventIds = new Set<string>();
+  const liveSeenEventIds = new Set<string>();
+  const persistedSeenEventIds = new Set<string>();
 
   return createStore<SessionStoreState>((set, get) => {
     const ingest = (value: unknown, source: IngestionSource) => {
@@ -109,6 +110,7 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
         get().recordError(error);
         return;
       }
+      const seenEventIds = source === "live" ? liveSeenEventIds : persistedSeenEventIds;
       if (!acceptsEnvelope(get(), envelope) || seenEventIds.has(envelope.id)) {
         return;
       }
@@ -116,6 +118,9 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
         return;
       }
 
+      if (source === "live" && envelope.kind === EventKind.SIDECAR_READY) {
+        liveSeenEventIds.clear();
+      }
       seenEventIds.add(envelope.id);
       if (source === "live") {
         set({ lastSequence: envelope.sequence });
@@ -207,7 +212,7 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
         });
       },
       beginSession(session) {
-        seenEventIds.clear();
+        persistedSeenEventIds.clear();
         set((state) => resetForSession(state, session));
       },
       endSession(status) {
@@ -217,7 +222,7 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
       },
       restoreSession(session) {
         const restoresCurrentSession = get().session?.id === session.id;
-        if (!restoresCurrentSession) seenEventIds.clear();
+        if (!restoresCurrentSession) persistedSeenEventIds.clear();
         set((state) => restoresCurrentSession
           ? { session, languages: languagesFromSession(session, state.languages.ui), lastError: null }
           : resetForSession(state, session));

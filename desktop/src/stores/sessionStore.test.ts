@@ -401,4 +401,39 @@ describe("session store", () => {
 
     expect(store.getState().turns.map((turn) => turn.text)).toEqual(["A first turn", "A second turn"]);
   });
+
+  it("keeps live ready dedupe across a session switch and resets only for a new generation", () => {
+    const store = createSessionStore();
+    const firstReady = event(EventKind.SIDECAR_READY, { status: "ready" }, {
+      session_id: null,
+      sequence: 0,
+    });
+    const liveSequenceTen = event(EventKind.AUDIO_HEALTH, {
+      source: "mic",
+      status: "ready",
+      message: null,
+    }, { session_id: null, sequence: 10 });
+
+    store.getState().applyEnvelope(firstReady);
+    store.getState().applyEnvelope(liveSequenceTen);
+    activate(store);
+    store.getState().applyEnvelope(firstReady);
+    for (let sequence = 1; sequence <= 10; sequence += 1) {
+      store.getState().applyEnvelope(question(ids.questionOne, `Stale ${sequence}`, sequence));
+    }
+
+    expect(store.getState().sidecarGeneration).toBe(1);
+    expect(store.getState().lastSequence).toBe(10);
+    expect(store.getState().turns).toEqual([]);
+
+    store.getState().applyEnvelope(event(EventKind.SIDECAR_READY, { status: "ready" }, {
+      session_id: null,
+      sequence: 0,
+    }));
+    store.getState().applyEnvelope(question(ids.questionOne, "New generation", 1));
+
+    expect(store.getState().sidecarGeneration).toBe(2);
+    expect(store.getState().turns.map((turn) => turn.text)).toEqual(["New generation"]);
+    expect(store.getState().lastSequence).toBe(1);
+  });
 });
