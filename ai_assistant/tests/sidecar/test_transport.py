@@ -243,6 +243,101 @@ def test_cancelling_send_keeps_the_write_lock_until_the_worker_finishes():
     assert read_frame(output) is None
 
 
+def test_repeated_cancellation_keeps_the_write_lock_until_the_worker_finishes():
+    output = _CancellationBlockingWriteStream()
+    transport = SidecarTransport(BytesIO(), output)
+    first = _envelope("sidecar-ready.json")
+    second = _envelope("sidecar-ready.json", sequence=2)
+
+    async def verify() -> None:
+        first_send = asyncio.create_task(transport.send(first))
+        await asyncio.to_thread(output.first_write_started.wait, 1)
+        first_send.cancel()
+        await asyncio.sleep(0)
+        first_send.cancel()
+        second_send = asyncio.create_task(transport.send(second))
+        try:
+            await asyncio.sleep(0.05)
+            assert not output.second_write_started.is_set()
+            assert output.max_active_writes == 1
+        finally:
+            output.release_first_write.set()
+        with pytest.raises(asyncio.CancelledError):
+            await first_send
+        await second_send
+
+    asyncio.run(verify())
+
+    output.seek(0)
+    assert output.max_active_writes == 1
+    assert read_frame(output) == first
+    assert read_frame(output) == second
+    assert read_frame(output) is None
+
+
+class _RepeatedCancellationReadStream:
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self._offset = 0
+        self.started = threading.Event()
+        self.close_called = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+        self.closed = False
+
+    @property
+    def unread_data(self) -> bytes:
+        return self._data[self._offset :]
+
+    def read(self, size: int) -> bytes:
+        self.started.set()
+        assert self.release.wait(timeout=1)
+        try:
+            if self.closed:
+                return b""
+            chunk = self._data[self._offset : self._offset + size]
+            self._offset += len(chunk)
+            return chunk
+        finally:
+            self.finished.set()
+
+    def close(self) -> None:
+        self.closed = True
+        self.close_called.set()
+
+
+def test_repeated_cancellation_keeps_read_cleanup_active_until_the_worker_finishes():
+    command = _envelope("session-start.json")
+    input_stream = _RepeatedCancellationReadStream(encode_frame(command))
+    transport = SidecarTransport(input_stream, BytesIO())
+    handled: list[Envelope] = []
+
+    async def handler(received: Envelope) -> None:
+        handled.append(received)
+
+    async def verify() -> None:
+        run_task = asyncio.create_task(transport.run(handler))
+        await asyncio.to_thread(input_stream.started.wait, 1)
+        run_task.cancel()
+        await asyncio.to_thread(input_stream.close_called.wait, 1)
+        run_task.cancel()
+        try:
+            await asyncio.sleep(0.05)
+            assert not run_task.done()
+            assert not input_stream.finished.is_set()
+        finally:
+            input_stream.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await run_task
+
+    asyncio.run(verify())
+
+    assert input_stream.closed
+    assert input_stream.finished.is_set()
+    assert input_stream.unread_data == encode_frame(command)
+    assert handled == []
+
+
 class _FailingAfterCancellationWriteStream:
     def __init__(self) -> None:
         self.started = threading.Event()
