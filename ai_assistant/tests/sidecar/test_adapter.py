@@ -139,9 +139,14 @@ class FakeRuntimeService:
         self._raise_if_needed()
         self.audio_device = (source, device)
 
-    async def trigger_query(self, text: str, answer_format: str) -> None:
+    async def trigger_query(
+        self,
+        text: str,
+        answer_format: str,
+        correlation_id: str | None = None,
+    ) -> None:
         self._raise_if_needed()
-        self.query = (text, answer_format)
+        self.query = (text, answer_format, correlation_id)
 
     async def ingest_documents(self, paths: list[str]) -> DocumentIngestionResult:
         self._raise_if_needed()
@@ -184,7 +189,7 @@ async def test_start_command_maps_all_language_fields_and_correlates_state() -> 
         (CommandKind.YOU_SOURCE_SET, {"source": "system"}, "you_source", "system"),
         (CommandKind.AUDIO_SYSTEM_SET, {"enabled": True}, "system_audio", True),
         (CommandKind.AUDIO_DEVICE_SET, {"source": "mic", "device": 7}, "audio_device", ("mic", 7)),
-        (CommandKind.QUERY_TRIGGER, {"text": "Summarize", "answer_format": "summary"}, "query", ("Summarize", "summary")),
+        (CommandKind.QUERY_TRIGGER, {"text": "Summarize", "answer_format": "summary"}, "query", ("Summarize", "summary", COMMAND_ID)),
     ],
 )
 @_async_test
@@ -257,9 +262,21 @@ async def test_response_events_keep_request_as_correlation_id() -> None:
         TranscriptEvent(text="Question", is_final=True, speech_final=True, source="system")
     )
     transcript = output.last
-    await adapter.on_response_chunk(ResponseChunkEvent(text="First", request_id="request-1"))
+    await adapter.on_response_chunk(
+        ResponseChunkEvent(
+            text="First",
+            request_id="request-1",
+            correlation_id=transcript.id,
+        )
+    )
     await adapter.on_response_complete(
-        ResponseCompleteEvent(full_text="First answer", request_id="request-1", input_tokens=12, output_tokens=8)
+        ResponseCompleteEvent(
+            full_text="First answer",
+            request_id="request-1",
+            input_tokens=12,
+            output_tokens=8,
+            correlation_id=transcript.id,
+        )
     )
 
     chunk, completed = output.events[-2:]
@@ -393,6 +410,78 @@ async def test_transcript_updates_share_turn_id_until_the_utterance_completes() 
     interim, final, next_turn = output.events
     assert interim.payload["turn_id"] == final.payload["turn_id"]
     assert next_turn.payload["turn_id"] != final.payload["turn_id"]
+
+
+@_async_test
+async def test_request_correlation_is_bound_to_its_triggering_transcript() -> None:
+    output = CollectingOutput()
+    adapter = RuntimeProtocolAdapter(FakeRuntimeService(), output.write)
+    triggering_id = "018f0000-0000-7000-8000-000000000040"
+    later_id = "018f0000-0000-7000-8000-000000000041"
+
+    await adapter.on_transcript(
+        TranscriptEvent(
+            text="First question",
+            is_final=True,
+            speech_final=True,
+            source="system",
+            event_id=triggering_id,
+        )
+    )
+    assert output.last.id == triggering_id
+    await adapter.on_transcript(
+        TranscriptEvent(
+            text="Later non-trigger",
+            is_final=True,
+            speech_final=True,
+            source="mic",
+            event_id=later_id,
+        )
+    )
+    await adapter.on_response_chunk(
+        ResponseChunkEvent(
+            text="Answer",
+            request_id="request-1",
+            correlation_id=triggering_id,
+        )
+    )
+
+    assert output.events[-1].correlation_id == triggering_id
+
+
+@_async_test
+async def test_speech_final_advances_turn_before_a_blocked_output_write() -> None:
+    class BlockingOutput(CollectingOutput):
+        def __init__(self) -> None:
+            super().__init__()
+            self.final_write_started = asyncio.Event()
+            self.release_final_write = asyncio.Event()
+
+        async def write(self, event: Envelope) -> None:
+            if event.payload.get("speech_final"):
+                self.final_write_started.set()
+                await self.release_final_write.wait()
+            self.events.append(event)
+
+    output = BlockingOutput()
+    adapter = RuntimeProtocolAdapter(FakeRuntimeService(), output.write)
+
+    await adapter.on_transcript(
+        TranscriptEvent(text="First", is_final=False, speech_final=False, source="mic")
+    )
+    final_task = asyncio.create_task(
+        adapter.on_transcript(
+            TranscriptEvent(text="First complete", is_final=True, speech_final=True, source="mic")
+        )
+    )
+    await output.final_write_started.wait()
+    await adapter.on_transcript(
+        TranscriptEvent(text="Second", is_final=False, speech_final=False, source="mic")
+    )
+    output.release_final_write.set()
+    await final_task
+
+    assert output.events[1].payload["turn_id"] != output.events[0].payload["turn_id"]
 
 
 @_async_test

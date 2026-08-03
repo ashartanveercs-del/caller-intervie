@@ -184,15 +184,27 @@ class RuntimeService:
                 await self._deps.transcriber.stop_system_stream()
             self._system_audio_enabled = enabled
 
-    async def trigger_query(self, text: str, answer_format: str) -> None:
+    async def trigger_query(
+        self,
+        text: str,
+        answer_format: str,
+        correlation_id: str | None = None,
+    ) -> None:
         async with self._lifecycle_lock:
             self._require_active()
             if answer_format == "chat":
                 self._deps.prompt_builder.add_to_history("user", text)
-            await self._deps.orchestrator.trigger_query(
-                text,
-                full_transcript=answer_format == "summary",
-            )
+            if correlation_id is None:
+                await self._deps.orchestrator.trigger_query(
+                    text,
+                    full_transcript=answer_format == "summary",
+                )
+            else:
+                await self._deps.orchestrator.trigger_query(
+                    text,
+                    full_transcript=answer_format == "summary",
+                    correlation_id=correlation_id,
+                )
 
     async def ingest_documents(self, paths: list[str]) -> DocumentIngestionResult:
         async with self._lifecycle_lock:

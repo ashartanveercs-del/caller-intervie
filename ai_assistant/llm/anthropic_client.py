@@ -42,7 +42,11 @@ class AnthropicLLM:
     # Streaming generation
     # ------------------------------------------------------------------
 
-    async def stream_generate(self, prompt: BuiltPrompt) -> str:
+    async def stream_generate(
+        self,
+        prompt: BuiltPrompt,
+        correlation_id: str | None = None,
+    ) -> str:
         """Stream a response and emit chunk / complete events.
 
         Returns the full concatenated response text.
@@ -61,7 +65,11 @@ class AnthropicLLM:
                 full_text += text
                 await self._event_bus.emit(
                     EventType.RESPONSE_CHUNK,
-                    ResponseChunkEvent(text=text, request_id=request_id),
+                    ResponseChunkEvent(
+                        text=text,
+                        request_id=request_id,
+                        correlation_id=correlation_id,
+                    ),
                 )
 
             final_message = await stream.get_final_message()
@@ -76,6 +84,7 @@ class AnthropicLLM:
                 request_id=request_id,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
+                correlation_id=correlation_id,
             ),
         )
 
@@ -98,15 +107,19 @@ class AnthropicLLM:
             self._active_task.cancel()
             logger.debug("Cancelled active generation task")
 
-    async def submit(self, prompt: BuiltPrompt) -> None:
+    async def submit(
+        self,
+        prompt: BuiltPrompt,
+        correlation_id: str | None = None,
+    ) -> None:
         """Cancel any running generation and start a new one."""
         self.cancel_active()
-        self._active_task = asyncio.create_task(self._run(prompt))
+        self._active_task = asyncio.create_task(self._run(prompt, correlation_id))
 
-    async def _run(self, prompt: BuiltPrompt) -> None:
+    async def _run(self, prompt: BuiltPrompt, correlation_id: str | None) -> None:
         """Wrapper that handles cancellation and API errors."""
         try:
-            await self.stream_generate(prompt)
+            await self.stream_generate(prompt, correlation_id)
         except asyncio.CancelledError:
             pass
         except anthropic.APIStatusError as exc:

@@ -9,6 +9,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Awaitable, Callable, Optional
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ class TranscriptEvent:
     started_at_ms: Optional[int] = None
     ended_at_ms: Optional[int] = None
     turn_id: Optional[str] = None
+    event_id: str = field(default_factory=lambda: str(uuid4()))
 
 
 @dataclass
@@ -50,6 +52,7 @@ class ModeChangeEvent:
 class ResponseChunkEvent:
     text: str
     request_id: str
+    correlation_id: Optional[str] = None
 
 
 @dataclass
@@ -58,6 +61,7 @@ class ResponseCompleteEvent:
     request_id: str
     input_tokens: int
     output_tokens: int
+    correlation_id: Optional[str] = None
 
 
 class EventBus:

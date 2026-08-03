@@ -122,6 +122,7 @@ class Orchestrator:
         self,
         explicit_query: Optional[str] = None,
         full_transcript: bool = False,
+        correlation_id: str | None = None,
     ) -> None:
         """Manually trigger an LLM response (e.g. from hotkey).
 
@@ -140,7 +141,7 @@ class Orchestrator:
             query=explicit_query,
             use_full_transcript=full_transcript,
         )
-        await self._llm.submit(prompt)
+        await self._llm.submit(prompt, correlation_id=correlation_id)
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -163,7 +164,7 @@ class Orchestrator:
             # Auto-generate script when the interviewer finishes a sentence
             if event.source == interviewer_source:
                 self._last_interviewer_final = event.timestamp
-                self._schedule_suggestion(delay=0.8)
+                self._schedule_suggestion(delay=0.8, correlation_id=event.event_id)
             # Fall back to your own speech ONLY when no interviewer audio has
             # been heard recently — otherwise every sentence the candidate
             # speaks would wipe and regenerate the answer they're reading.
@@ -172,16 +173,20 @@ class Orchestrator:
                 and event.speech_final
                 and event.timestamp - self._last_interviewer_final > 90.0
             ):
-                self._schedule_suggestion()
+                self._schedule_suggestion(correlation_id=event.event_id)
         elif self._mode == Mode.ACTIVE:
             if event.is_final:
-                await self.trigger_query()
+                await self.trigger_query(correlation_id=event.event_id)
 
     # ------------------------------------------------------------------
     # Suggestion debounce
     # ------------------------------------------------------------------
 
-    def _schedule_suggestion(self, delay: float | None = None) -> None:
+    def _schedule_suggestion(
+        self,
+        delay: float | None = None,
+        correlation_id: str | None = None,
+    ) -> None:
         """Debounce: wait before generating a suggestion to avoid spam."""
         loop = asyncio.get_running_loop()
         if self._debounce_handle is not None:
@@ -190,20 +195,23 @@ class Orchestrator:
         self._debounce_handle = loop.call_later(
             wait,
             self._launch_suggestion,
+            correlation_id,
         )
 
-    def _launch_suggestion(self) -> None:
+    def _launch_suggestion(self, correlation_id: str | None = None) -> None:
         self._debounce_handle = None
-        self._suggestion_task = asyncio.create_task(self._generate_suggestion())
+        self._suggestion_task = asyncio.create_task(
+            self._generate_suggestion(correlation_id)
+        )
 
-    async def _generate_suggestion(self) -> None:
+    async def _generate_suggestion(self, correlation_id: str | None = None) -> None:
         rag_context = self._get_rag_context()
         prompt = await self._prompt_builder.build(
             mode=Mode.SUGGESTION.value,
             transcript_buffer=self._transcript_buffer,
             rag_context=rag_context,
         )
-        await self._llm.submit(prompt)
+        await self._llm.submit(prompt, correlation_id=correlation_id)
 
     # ------------------------------------------------------------------
     # RAG helper

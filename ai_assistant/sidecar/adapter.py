@@ -36,8 +36,6 @@ class RuntimeProtocolAdapter:
         self._output = output
         self._turn_ids: dict[str, str] = {}
         self._suggestion_ids: dict[str, str] = {}
-        self._response_correlations: dict[str, str | None] = {}
-        self._pending_response_correlation_id: str | None = None
         runtime.event_bus.on(EventType.TRANSCRIPT_UPDATE, self.on_transcript)
         runtime.event_bus.on(EventType.RESPONSE_CHUNK, self.on_response_chunk)
         runtime.event_bus.on(EventType.RESPONSE_COMPLETE, self.on_response_complete)
@@ -92,7 +90,9 @@ class RuntimeProtocolAdapter:
         snapshot = self._runtime.snapshot()
         turn_id = event.turn_id or self._turn_ids.get(event.source) or str(uuid4())
         self._turn_ids[event.source] = turn_id
-        envelope = await self._emit(
+        if event.speech_final:
+            self._turn_ids.pop(event.source, None)
+        await self._emit(
             EventKind.TRANSCRIPT_UPDATED,
             {
                 "turn_id": turn_id,
@@ -109,28 +109,25 @@ class RuntimeProtocolAdapter:
                 "ended_at_ms": event.ended_at_ms if event.ended_at_ms is not None else timestamp_ms,
             },
             session_id=snapshot.session_id,
+            event_id=event.event_id,
         )
-        if event.is_final:
-            self._pending_response_correlation_id = envelope.id
-        if event.speech_final:
-            self._turn_ids.pop(event.source, None)
 
     async def on_response_chunk(self, event: ResponseChunkEvent) -> None:
-        suggestion_id, correlation_id = self._response_identity(event.request_id)
+        suggestion_id = self._suggestion_id(event.request_id)
         await self._emit(
             EventKind.SUGGESTION_CHUNK,
             {"suggestion_id": suggestion_id, "text": event.text},
             session_id=self._runtime.snapshot().session_id,
-            correlation_id=correlation_id,
+            correlation_id=event.correlation_id,
         )
 
     async def on_response_complete(self, event: ResponseCompleteEvent) -> None:
-        suggestion_id, correlation_id = self._response_identity(event.request_id)
+        suggestion_id = self._suggestion_id(event.request_id)
         await self._emit(
             EventKind.SUGGESTION_COMPLETED,
             {"suggestion_id": suggestion_id, "text": event.full_text},
             session_id=self._runtime.snapshot().session_id,
-            correlation_id=correlation_id,
+            correlation_id=event.correlation_id,
         )
 
     async def on_runtime_error(self, _event: object) -> None:
@@ -167,9 +164,10 @@ class RuntimeProtocolAdapter:
             return
         if kind is CommandKind.QUERY_TRIGGER:
             await self._runtime.trigger_query(
-                self._string(payload, "text"), self._string(payload, "answer_format")
+                self._string(payload, "text"),
+                self._string(payload, "answer_format"),
+                correlation_id=command.id,
             )
-            self._pending_response_correlation_id = command.id
             await self._emit_snapshot(correlation_id)
             return
         if kind is CommandKind.AUDIO_SYSTEM_SET:
@@ -281,10 +279,11 @@ class RuntimeProtocolAdapter:
         *,
         session_id: str | None = None,
         correlation_id: str | None = None,
+        event_id: str | None = None,
     ) -> Envelope:
         event = Envelope(
             version=PROTOCOL_VERSION,
-            id=str(uuid4()),
+            id=event_id or str(uuid4()),
             session_id=session_id,
             sequence=next(_sequence_numbers),
             timestamp_ms=time.time_ns() // 1_000_000,
@@ -297,9 +296,5 @@ class RuntimeProtocolAdapter:
             await result
         return event
 
-    def _response_identity(self, request_id: str) -> tuple[str, str | None]:
-        suggestion_id = self._suggestion_ids.setdefault(request_id, str(uuid4()))
-        correlation_id = self._response_correlations.setdefault(
-            request_id, self._pending_response_correlation_id
-        )
-        return suggestion_id, correlation_id
+    def _suggestion_id(self, request_id: str) -> str:
+        return self._suggestion_ids.setdefault(request_id, str(uuid4()))

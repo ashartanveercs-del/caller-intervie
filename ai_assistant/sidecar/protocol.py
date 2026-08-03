@@ -11,11 +11,13 @@ from typing import Any
 
 
 PROTOCOL_VERSION = 1
+MAX_PROTOCOL_VERSION = 65_535
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
 
 _UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
+_NAMESPACED_KIND_RE = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$")
 _ENVELOPE_FIELDS = {
     "version",
     "id",
@@ -68,6 +70,13 @@ def _require_nonnegative_integer(value: object, field: str) -> int:
     if value > MAX_SAFE_INTEGER:
         raise ValueError(f"{field} must be a safe integer")
     return value
+
+
+def _require_protocol_version(value: object) -> int:
+    version = _require_nonnegative_integer(value, "version")
+    if version > MAX_PROTOCOL_VERSION:
+        raise ValueError("version must be a u16")
+    return version
 
 
 def _freeze_json(value: Any) -> Any:
@@ -135,11 +144,11 @@ class WireEnvelope:
             raise ValueError("payload must be an object")
 
         kind = value["kind"]
-        if not isinstance(kind, str):
-            raise ValueError("kind must be a string")
+        if not isinstance(kind, str) or not _NAMESPACED_KIND_RE.fullmatch(kind):
+            raise ValueError("kind must be a namespaced string")
 
         return cls(
-            version=_require_nonnegative_integer(value["version"], "version"),
+            version=_require_protocol_version(value["version"]),
             id=_require_uuid(value["id"], "id"),
             session_id=session_id,
             sequence=_require_nonnegative_integer(value["sequence"], "sequence"),

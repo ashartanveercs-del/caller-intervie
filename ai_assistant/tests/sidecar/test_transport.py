@@ -5,10 +5,12 @@ from io import BytesIO
 import json
 from pathlib import Path
 import subprocess
+import struct
 import sys
 import threading
 import time
 
+import msgpack
 import pytest
 
 from ai_assistant.sidecar.framing import FrameError, encode_frame, read_frame
@@ -25,6 +27,13 @@ def _envelope(name: str, *, sequence: int | None = None) -> Envelope:
     if sequence is not None:
         raw["sequence"] = sequence
     return Envelope.from_dict(raw)
+
+
+def _wire_frame(**changes: object) -> bytes:
+    raw = json.loads((FIXTURES / "session-start.json").read_text(encoding="utf-8"))
+    raw.update(changes)
+    payload = msgpack.packb(raw, use_bin_type=True)
+    return struct.pack(">I", len(payload)) + payload
 
 
 def test_run_dispatches_commands_and_writes_handler_responses():
@@ -61,6 +70,24 @@ def test_run_rejects_invalid_envelopes_before_dispatch():
     )
 
     with pytest.raises(FrameError, match="envelope"):
+        asyncio.run(transport.run(handler))
+
+    assert handled == []
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [({"version": 65_536}, "version"), ({"kind": "bogus"}, "kind")],
+)
+def test_run_rejects_nonrecoverable_wire_envelopes_before_dispatch(changes, message):
+    handled: list[Envelope] = []
+
+    async def handler(command: Envelope) -> None:
+        handled.append(command)
+
+    transport = SidecarTransport(BytesIO(_wire_frame(**changes)), BytesIO())
+
+    with pytest.raises(FrameError, match=message):
         asyncio.run(transport.run(handler))
 
     assert handled == []
