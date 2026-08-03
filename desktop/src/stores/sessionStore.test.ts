@@ -39,9 +39,21 @@ function question(turnId: string, text: string, sequence: number): Envelope {
   );
 }
 
+function activate(store: ReturnType<typeof createSessionStore>, id = ids.session) {
+  store.getState().beginSession({
+    id,
+    mode: "interview",
+    status: "active",
+    inputLanguage: "en",
+    responseLanguage: "ur",
+    reviewLanguage: "en",
+  });
+}
+
 describe("session store", () => {
   it("ignores duplicate event ids and stale sequences within one sidecar generation", () => {
     const store = createSessionStore();
+    activate(store);
     const first = question(ids.questionOne, "First", 4);
 
     store.getState().applyEnvelope(first);
@@ -53,6 +65,7 @@ describe("session store", () => {
 
   it("accepts a new sidecar generation after a restart even when its sequence starts over", () => {
     const store = createSessionStore();
+    activate(store);
 
     store.getState().applyEnvelope(question(ids.questionOne, "Before restart", 9));
     store.getState().clearTransientState();
@@ -66,6 +79,7 @@ describe("session store", () => {
 
   it("replaces a partial transcript and commits the final transcript", () => {
     const store = createSessionStore();
+    activate(store);
 
     store.getState().applyEnvelope(
       event(EventKind.TRANSCRIPT_UPDATED, {
@@ -94,6 +108,7 @@ describe("session store", () => {
 
   it("binds concurrent suggestion correlations to their intended question turns", () => {
     const store = createSessionStore();
+    activate(store);
     store.getState().applyEnvelope(question(ids.questionOne, "First question", 1));
     store.getState().applyEnvelope(question(ids.questionTwo, "Second question", 2));
     store.getState().associateRequestWithTurn(ids.queryOne, ids.questionOne);
@@ -120,6 +135,7 @@ describe("session store", () => {
 
   it("retains a completed answer when another question arrives", () => {
     const store = createSessionStore();
+    activate(store);
     store.getState().applyEnvelope(question(ids.questionOne, "First question", 1));
     store.getState().associateRequestWithTurn(ids.queryOne, ids.questionOne);
     store.getState().applyEnvelope(
@@ -140,12 +156,16 @@ describe("session store", () => {
     const store = createSessionStore();
 
     store.getState().setLanguages({ ui: "ar", input: "auto", response: "ur", review: "en" });
-    store.getState().applyEnvelope(
-      event(EventKind.AUDIO_HEALTH, { dependency: "microphone", status: "degraded", message: "Muted" }),
-    );
-    store.getState().applyEnvelope(
-      event(EventKind.PROVIDER_HEALTH, { dependency: "model_provider", status: "ready" }),
-    );
+    store.getState().applyEnvelope(event(EventKind.AUDIO_HEALTH, {
+      source: "mic",
+      status: "degraded",
+      message: "Muted",
+    }, { session_id: null }));
+    store.getState().applyEnvelope(event(EventKind.PROVIDER_HEALTH, {
+      provider: "model",
+      status: "ready",
+      message: null,
+    }, { session_id: null }));
 
     expect(store.getState().languages).toEqual({ ui: "ar", input: "auto", response: "ur", review: "en" });
     expect(store.getState().health.microphone).toMatchObject({ status: "degraded", message: "Muted" });
@@ -188,6 +208,7 @@ describe("session store", () => {
 
   it("restores replayed events idempotently and records only ambiguous replay associations", () => {
     const store = createSessionStore();
+    activate(store);
     const first = question(ids.questionOne, "First question", 1);
     const second = question(ids.questionTwo, "Second question", 2);
     const answer = event(
@@ -205,11 +226,147 @@ describe("session store", () => {
 
   it("rejects malformed envelopes without corrupting state", () => {
     const store = createSessionStore();
+    activate(store);
     store.getState().applyEnvelope(question(ids.questionOne, "First", 1));
 
     store.getState().applyEnvelope({ id: "not-an-envelope" } as unknown as Envelope);
 
     expect(store.getState().turns.map((turn) => turn.text)).toEqual(["First"]);
     expect(store.getState().lastError).toMatch(/invalid/i);
+  });
+
+  it.each([
+    ["before", ["ready", "persisted", "live"]],
+    ["during", ["persisted", "ready", "persisted", "live"]],
+    ["after", ["persisted", "ready", "live"]],
+  ])("keeps the live sequence watermark isolated when ready arrives %s replay", (_position, order) => {
+    const store = createSessionStore();
+    activate(store);
+    const persistedOne = question(ids.questionOne, "Persisted one", 40);
+    const persistedTwo = question(ids.questionTwo, "Persisted two", 41);
+    const ready = event(EventKind.SIDECAR_READY, { status: "ready" }, { session_id: null, sequence: 0 });
+    const live = question(ids.questionTwo, "Live sequence one", 1);
+    let persistedCount = 0;
+
+    for (const step of order) {
+      if (step === "ready") store.getState().applyEnvelope(ready);
+      if (step === "persisted") {
+        store.getState().applyPersistedEnvelope(persistedCount++ === 0 ? persistedOne : persistedTwo);
+      }
+      if (step === "live") store.getState().applyEnvelope(live);
+    }
+
+    expect(store.getState().turns.map((turn) => turn.text)).toContain("Live sequence one");
+    expect(store.getState().lastSequence).toBe(1);
+  });
+
+  it("accumulates delta chunks and replaces them with the completed suggestion text", () => {
+    const store = createSessionStore();
+    activate(store);
+    store.getState().applyEnvelope(question(ids.questionOne, "Question", 1));
+    store.getState().associateRequestWithTurn(ids.queryOne, ids.questionOne);
+
+    store.getState().applyEnvelope(event(EventKind.SUGGESTION_CHUNK, {
+      suggestion_id: "018f0000-0000-7000-8000-000000000021",
+      text: "First ",
+    }, { correlation_id: ids.queryOne, sequence: 2 }));
+    store.getState().applyEnvelope(event(EventKind.SUGGESTION_CHUNK, {
+      suggestion_id: "018f0000-0000-7000-8000-000000000021",
+      text: "second",
+    }, { correlation_id: ids.queryOne, sequence: 3 }));
+
+    expect(store.getState().partialSuggestionsById["018f0000-0000-7000-8000-000000000021"]?.text).toBe("First second");
+
+    store.getState().applyEnvelope(event(EventKind.SUGGESTION_COMPLETED, {
+      suggestion_id: "018f0000-0000-7000-8000-000000000021",
+      text: "Authoritative final answer",
+    }, { correlation_id: ids.queryOne, sequence: 4 }));
+
+    expect(store.getState().partialSuggestionsById["018f0000-0000-7000-8000-000000000021"]).toBeUndefined();
+    expect(store.getState().suggestionsByTurn[ids.questionOne]).toMatchObject({
+      text: "Authoritative final answer",
+      durability: "durable",
+    });
+  });
+
+  it("retains unresolved completed suggestions and resolves them when a request association arrives", () => {
+    const store = createSessionStore();
+    activate(store);
+    store.getState().applyEnvelope(question(ids.questionOne, "Question", 1));
+    const suggestionId = "018f0000-0000-7000-8000-000000000022";
+    store.getState().applyEnvelope(event(EventKind.SUGGESTION_CHUNK, {
+      suggestion_id: suggestionId,
+      text: "Partial ",
+    }, { correlation_id: ids.queryOne, sequence: 2 }));
+    store.getState().applyEnvelope(event(EventKind.SUGGESTION_COMPLETED, {
+      suggestion_id: suggestionId,
+      text: "Completed answer",
+    }, { correlation_id: ids.queryOne, sequence: 3 }));
+
+    expect(store.getState().unresolvedCompletedSuggestionsById[suggestionId]).toMatchObject({
+      text: "Completed answer",
+      correlationId: ids.queryOne,
+      payload: { suggestion_id: suggestionId, text: "Completed answer" },
+    });
+
+    store.getState().associateRequestWithTurn(ids.queryOne, ids.questionOne);
+
+    expect(store.getState().suggestionsByTurn[ids.questionOne]).toMatchObject({ text: "Completed answer" });
+    expect(store.getState().unresolvedCompletedSuggestionsById[suggestionId]).toBeUndefined();
+    expect(store.getState().partialSuggestionsById[suggestionId]).toBeUndefined();
+  });
+
+  it("clears associated incomplete suggestions while preserving only completed durable suggestions", () => {
+    const store = createSessionStore();
+    activate(store);
+    store.getState().applyEnvelope(question(ids.questionOne, "Question", 1));
+    store.getState().associateRequestWithTurn(ids.queryOne, ids.questionOne);
+    store.getState().applyEnvelope(event(EventKind.SUGGESTION_CHUNK, {
+      suggestion_id: "018f0000-0000-7000-8000-000000000023",
+      text: "Partial",
+    }, { correlation_id: ids.queryOne, sequence: 2 }));
+
+    store.getState().clearTransientState();
+
+    expect(store.getState().partialSuggestionsById).toEqual({});
+    expect(store.getState().suggestionsByTurn).toEqual({});
+  });
+
+  it("maps canonical audio and provider health payloads to their dedicated dependencies", () => {
+    const store = createSessionStore();
+
+    store.getState().applyEnvelope(event(EventKind.AUDIO_HEALTH, {
+      source: "system",
+      status: "ready",
+      message: null,
+    }, { session_id: null, sequence: 1 }));
+    store.getState().applyEnvelope(event(EventKind.PROVIDER_HEALTH, {
+      provider: "speech",
+      status: "degraded",
+      message: "Reconnect",
+    }, { session_id: null, sequence: 2 }));
+
+    expect(store.getState().health.systemAudio).toMatchObject({ status: "ready" });
+    expect(store.getState().health.speechProvider).toMatchObject({ status: "degraded", message: "Reconnect" });
+  });
+
+  it("clears prior session state and ignores late envelopes from a different session", () => {
+    const store = createSessionStore();
+    const sessionB = "018f0000-0000-7000-8000-000000000024";
+    activate(store, ids.session);
+    store.getState().applyEnvelope(question(ids.questionOne, "Session A", 1));
+    activate(store, sessionB);
+
+    store.getState().applyEnvelope(question(ids.questionTwo, "Late session A", 2));
+    store.getState().applyEnvelope(event(EventKind.TRANSCRIPT_UPDATED, {
+      turn_id: ids.questionTwo,
+      text: "Session B",
+      is_final: true,
+      speech_final: true,
+      speaker_role: "interviewer",
+    }, { session_id: sessionB, sequence: 3 }));
+
+    expect(store.getState().turns.map((turn) => turn.text)).toEqual(["Session B"]);
+    expect(store.getState().session?.id).toBe(sessionB);
   });
 });

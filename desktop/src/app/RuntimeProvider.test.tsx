@@ -2,7 +2,7 @@ import { StrictMode } from "react";
 import { act, render, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { EventKind, type Envelope } from "../shared/protocol";
-import type { PlatformApi, SidecarStatus } from "../platform";
+import type { PlatformApi, SessionRecord, SidecarStatus } from "../platform";
 import { RuntimeProvider, useRuntime } from "./RuntimeProvider";
 
 const sessionId = "018f0000-0000-7000-8000-000000000001";
@@ -42,6 +42,31 @@ function fakePlatform(): PlatformApi & { emit(event: Envelope): void; unlisten: 
 function Consumer() {
   const runtime = useRuntime();
   return <button onClick={() => void runtime.restart()}>restart</button>;
+}
+
+function session(id: string): SessionRecord {
+  return {
+    id,
+    mode: "interview",
+    status: "active",
+    inputLanguage: "en",
+    responseLanguage: "ur",
+    reviewLanguage: "en",
+  };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve };
+}
+
+function SessionStarter({ id, onRuntime }: { id: string; onRuntime(runtime: ReturnType<typeof useRuntime>): void }) {
+  const runtime = useRuntime();
+  onRuntime(runtime);
+  return <button onClick={() => runtime.store.getState().beginSession(session(id))}>start session</button>;
 }
 
 describe("RuntimeProvider", () => {
@@ -104,5 +129,54 @@ describe("RuntimeProvider", () => {
     });
 
     expect(platform.subscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not let a stale restore overwrite a user-started session", async () => {
+    const platform = fakePlatform();
+    const activeRestore = deferred<SessionRecord | null>();
+    vi.mocked(platform.restoreActiveSession).mockReturnValue(activeRestore.promise);
+    let runtime: ReturnType<typeof useRuntime> | undefined;
+    const view = render(
+      <RuntimeProvider platform={platform}>
+        <SessionStarter id="018f0000-0000-7000-8000-000000000031" onRuntime={(value) => { runtime = value; }} />
+      </RuntimeProvider>,
+    );
+
+    await waitFor(() => expect(platform.restoreActiveSession).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      view.getByRole("button", { name: "start session" }).click();
+    });
+    await act(async () => {
+      activeRestore.resolve(session("018f0000-0000-7000-8000-000000000032"));
+      await Promise.resolve();
+    });
+
+    expect(runtime?.store.getState().session?.id).toBe("018f0000-0000-7000-8000-000000000031");
+    expect(platform.getTimeline).not.toHaveBeenCalled();
+  });
+
+  it("invalidates a pending restore after unmount under StrictMode", async () => {
+    const platform = fakePlatform();
+    const activeRestore = deferred<SessionRecord | null>();
+    vi.mocked(platform.restoreActiveSession).mockReturnValue(activeRestore.promise);
+    let runtime: ReturnType<typeof useRuntime> | undefined;
+    const view = render(
+      <StrictMode>
+        <RuntimeProvider platform={platform}>
+          <SessionStarter id="018f0000-0000-7000-8000-000000000033" onRuntime={(value) => { runtime = value; }} />
+        </RuntimeProvider>
+      </StrictMode>,
+    );
+
+    await waitFor(() => expect(platform.restoreActiveSession).toHaveBeenCalledTimes(1));
+    view.unmount();
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    await act(async () => {
+      activeRestore.resolve(session("018f0000-0000-7000-8000-000000000034"));
+      await Promise.resolve();
+    });
+
+    expect(runtime?.store.getState().session).toBeNull();
+    expect(platform.getTimeline).not.toHaveBeenCalled();
   });
 });
