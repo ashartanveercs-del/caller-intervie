@@ -5,6 +5,106 @@ use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameError {
+    code: &'static str,
+    message: &'static str,
+}
+
+impl FrameError {
+    fn too_large() -> Self {
+        Self {
+            code: "frame_too_large",
+            message: "frame payload exceeds the configured maximum",
+        }
+    }
+
+    fn invalid_frame() -> Self {
+        Self {
+            code: "invalid_frame",
+            message: "frame contains invalid MessagePack",
+        }
+    }
+
+    fn invalid_envelope() -> Self {
+        Self {
+            code: "invalid_envelope",
+            message: "frame contains an invalid protocol envelope",
+        }
+    }
+
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+}
+
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+
+impl std::error::Error for FrameError {}
+
+pub struct FrameDecoder {
+    max_frame_bytes: usize,
+    buffer: Vec<u8>,
+}
+
+impl FrameDecoder {
+    pub fn new(max_frame_bytes: usize) -> Self {
+        Self {
+            max_frame_bytes,
+            buffer: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<Envelope>, FrameError> {
+        self.buffer.extend_from_slice(chunk);
+        let mut envelopes = Vec::new();
+
+        loop {
+            if self.buffer.len() < 4 {
+                break;
+            }
+
+            let payload_size = u32::from_be_bytes(self.buffer[..4].try_into().unwrap()) as usize;
+            if payload_size > self.max_frame_bytes {
+                self.buffer.clear();
+                return Err(FrameError::too_large());
+            }
+            let frame_size = 4 + payload_size;
+            if self.buffer.len() < frame_size {
+                break;
+            }
+
+            let payload = self.buffer[4..frame_size].to_vec();
+            self.buffer.drain(..frame_size);
+            let value: serde_json::Value =
+                rmp_serde::from_slice(&payload).map_err(|_| FrameError::invalid_frame())?;
+            let envelope =
+                serde_json::from_value(value).map_err(|_| FrameError::invalid_envelope())?;
+            envelopes.push(envelope);
+        }
+
+        Ok(envelopes)
+    }
+}
+
+pub fn encode_frame(envelope: &Envelope) -> Result<Vec<u8>, FrameError> {
+    let payload = rmp_serde::to_vec_named(envelope).map_err(|_| FrameError::invalid_frame())?;
+    if payload.len() > MAX_FRAME_BYTES {
+        return Err(FrameError::too_large());
+    }
+
+    let payload_size = u32::try_from(payload.len()).map_err(|_| FrameError::too_large())?;
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&payload_size.to_be_bytes());
+    frame.extend_from_slice(&payload);
+    Ok(frame)
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum CommandKind {
@@ -206,9 +306,164 @@ fn validate_uuid(value: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommandValidationError {
+    InvalidVersion,
+    InvalidCommandKind,
+    InvalidCommandPayload,
+    InvalidSessionId,
+}
+
+impl CommandValidationError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidVersion => "invalid_protocol_version",
+            Self::InvalidCommandKind => "invalid_command_kind",
+            Self::InvalidCommandPayload => "invalid_command_payload",
+            Self::InvalidSessionId => "invalid_session_id",
+        }
+    }
+}
+
+pub fn validate_command(command: &Envelope) -> Result<(), CommandValidationError> {
+    if command.version != PROTOCOL_VERSION {
+        return Err(CommandValidationError::InvalidVersion);
+    }
+    if validate_uuid(&command.id).is_err()
+        || command
+            .correlation_id
+            .as_deref()
+            .is_some_and(|value| validate_uuid(value).is_err())
+    {
+        return Err(CommandValidationError::InvalidSessionId);
+    }
+
+    let ProtocolKind::Command(kind) = &command.kind else {
+        return Err(CommandValidationError::InvalidCommandKind);
+    };
+
+    let requires_session = !matches!(
+        kind,
+        CommandKind::HandshakeRequest | CommandKind::SessionSnapshotRequest
+    );
+    if requires_session && command.session_id.is_none()
+        || command
+            .session_id
+            .as_deref()
+            .is_some_and(|value| validate_uuid(value).is_err())
+    {
+        return Err(CommandValidationError::InvalidSessionId);
+    }
+
+    let payload = &command.payload;
+    let valid = match kind {
+        CommandKind::HandshakeRequest
+        | CommandKind::SessionStop
+        | CommandKind::SessionSnapshotRequest => payload.is_empty(),
+        CommandKind::SessionStart => {
+            has_exact_keys(
+                payload,
+                &[
+                    "mode",
+                    "input_language",
+                    "response_language",
+                    "review_language",
+                    "you_source",
+                    "brief_id",
+                ],
+            ) && required_string(payload, "mode")
+                && required_string(payload, "input_language")
+                && required_string(payload, "response_language")
+                && required_string(payload, "review_language")
+                && required_source(payload, "you_source")
+                && required_string(payload, "brief_id")
+        }
+        CommandKind::ListeningSet | CommandKind::AudioSystemSet => {
+            has_exact_keys(payload, &["enabled"])
+                && payload.get("enabled").is_some_and(Value::is_boolean)
+        }
+        CommandKind::YouSourceSet => {
+            has_exact_keys(payload, &["source"]) && required_source(payload, "source")
+        }
+        CommandKind::QueryTrigger => {
+            has_exact_keys(payload, &["text", "answer_format"])
+                && required_string(payload, "text")
+                && required_string(payload, "answer_format")
+        }
+        CommandKind::AudioDeviceSet => {
+            has_exact_keys(payload, &["source", "device"])
+                && required_source(payload, "source")
+                && payload
+                    .get("device")
+                    .is_some_and(|value| value.is_null() || value.as_i64().is_some())
+        }
+        CommandKind::KnowledgeIngest => {
+            has_exact_keys(payload, &["paths"])
+                && payload
+                    .get("paths")
+                    .and_then(Value::as_array)
+                    .is_some_and(|paths| paths.iter().all(Value::is_string))
+        }
+    };
+
+    valid
+        .then_some(())
+        .ok_or(CommandValidationError::InvalidCommandPayload)
+}
+
+pub fn validate_event(event: &Envelope) -> Result<(), CommandValidationError> {
+    if event.version != PROTOCOL_VERSION {
+        return Err(CommandValidationError::InvalidVersion);
+    }
+    if validate_uuid(&event.id).is_err()
+        || event
+            .session_id
+            .as_deref()
+            .is_some_and(|value| validate_uuid(value).is_err())
+        || event
+            .correlation_id
+            .as_deref()
+            .is_some_and(|value| validate_uuid(value).is_err())
+    {
+        return Err(CommandValidationError::InvalidSessionId);
+    }
+    let ProtocolKind::Event(kind) = &event.kind else {
+        return Err(CommandValidationError::InvalidCommandKind);
+    };
+
+    if *kind == EventKind::SidecarReady
+        && (event.session_id.is_some()
+            || !has_exact_keys(&event.payload, &["status"])
+            || event.payload.get("status") != Some(&Value::String("ready".into())))
+    {
+        return Err(CommandValidationError::InvalidCommandPayload);
+    }
+    Ok(())
+}
+
+fn has_exact_keys(payload: &Map<String, Value>, expected: &[&str]) -> bool {
+    payload.len() == expected.len() && expected.iter().all(|key| payload.contains_key(*key))
+}
+
+fn required_string(payload: &Map<String, Value>, key: &str) -> bool {
+    payload
+        .get(key)
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty())
+}
+
+fn required_source(payload: &Map<String, Value>, key: &str) -> bool {
+    matches!(
+        payload.get(key).and_then(Value::as_str),
+        Some("mic" | "system")
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Envelope, EventKind, MAX_SAFE_INTEGER, PROTOCOL_VERSION};
+    use super::{
+        Envelope, EventKind, FrameDecoder, MAX_FRAME_BYTES, MAX_SAFE_INTEGER, PROTOCOL_VERSION,
+    };
 
     #[test]
     fn transcript_fixture_round_trips() {
@@ -277,5 +532,14 @@ mod tests {
         raw["timestamp_ms"] = serde_json::json!(MAX_SAFE_INTEGER + 1);
 
         assert!(serde_json::from_value::<Envelope>(raw).is_err());
+    }
+
+    #[test]
+    fn decoder_rejects_a_frame_larger_than_the_protocol_limit() {
+        let error = FrameDecoder::new(MAX_FRAME_BYTES)
+            .push(&((MAX_FRAME_BYTES as u32 + 1).to_be_bytes()))
+            .unwrap_err();
+
+        assert_eq!(error.code(), "frame_too_large");
     }
 }
