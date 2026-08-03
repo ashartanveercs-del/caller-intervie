@@ -37,6 +37,27 @@ def test_two_frames_decode_without_bleeding():
     assert read_frame(stream) is None
 
 
+class _FragmentedReadStream:
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self._offset = 0
+        self._chunk_sizes = iter((1, 3, 2, 1, 2, 3) * 100)
+
+    def read(self, size: int) -> bytes:
+        chunk_size = min(size, next(self._chunk_sizes))
+        chunk = self._data[self._offset : self._offset + chunk_size]
+        self._offset += len(chunk)
+        return chunk
+
+
+def test_fragmented_reads_decode_a_complete_frame():
+    envelope = _envelope("session-start.json")
+    stream = _FragmentedReadStream(encode_frame(envelope))
+
+    assert read_frame(stream) == envelope
+    assert read_frame(stream) is None
+
+
 def test_write_frame_writes_a_readable_envelope():
     envelope = _envelope("session-start.json")
     stream = BytesIO()
@@ -45,6 +66,40 @@ def test_write_frame_writes_a_readable_envelope():
 
     stream.seek(0)
     assert read_frame(stream) == envelope
+
+
+class _ThreeByteWriteStream(BytesIO):
+    def write(self, data: bytes) -> int:
+        return super().write(data[:3])
+
+
+def test_write_frame_retries_short_writes_until_the_frame_is_complete():
+    envelope = _envelope("session-start.json")
+    stream = _ThreeByteWriteStream()
+
+    write_frame(stream, envelope)
+
+    assert stream.getvalue() == encode_frame(envelope)
+
+
+class _ZeroProgressWriteStream:
+    def write(self, data: bytes) -> int:
+        return 0
+
+
+def test_write_frame_rejects_zero_progress_writes():
+    with pytest.raises(FrameError, match="progress"):
+        write_frame(_ZeroProgressWriteStream(), _envelope("session-start.json"))
+
+
+class _NoneProgressWriteStream:
+    def write(self, data: bytes) -> None:
+        return None
+
+
+def test_write_frame_rejects_non_blocking_no_progress_writes():
+    with pytest.raises(FrameError, match="progress"):
+        write_frame(_NoneProgressWriteStream(), _envelope("session-start.json"))
 
 
 def test_truncated_header_is_rejected():

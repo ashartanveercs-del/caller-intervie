@@ -132,6 +132,143 @@ def test_run_reads_on_a_worker_thread_without_blocking_the_event_loop():
     asyncio.run(verify())
 
 
+class _CloseableBlockingReadStream:
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self._offset = 0
+        self.started = threading.Event()
+        self.finished = threading.Event()
+        self.release = threading.Event()
+        self.closed = False
+
+    @property
+    def unread_data(self) -> bytes:
+        return self._data[self._offset :]
+
+    def read(self, size: int) -> bytes:
+        self.started.set()
+        assert self.release.wait(timeout=1)
+        try:
+            if self.closed:
+                return b""
+            chunk = self._data[self._offset : self._offset + size]
+            self._offset += len(chunk)
+            return chunk
+        finally:
+            self.finished.set()
+
+    def close(self) -> None:
+        self.closed = True
+        self.release.set()
+
+
+def test_cancelling_run_closes_and_joins_the_active_read_worker():
+    command = _envelope("session-start.json")
+    input_stream = _CloseableBlockingReadStream(encode_frame(command))
+    transport = SidecarTransport(input_stream, BytesIO())
+    handled: list[Envelope] = []
+
+    async def handler(received: Envelope) -> None:
+        handled.append(received)
+
+    async def verify() -> None:
+        task = asyncio.create_task(transport.run(handler))
+        await asyncio.to_thread(input_stream.started.wait, 1)
+        task.cancel()
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=0.5)
+        finally:
+            input_stream.release.set()
+
+    asyncio.run(verify())
+
+    assert input_stream.closed
+    assert input_stream.finished.is_set()
+    assert input_stream.unread_data == encode_frame(command)
+    assert handled == []
+
+
+class _CancellationBlockingWriteStream(BytesIO):
+    def __init__(self) -> None:
+        super().__init__()
+        self._state_lock = threading.Lock()
+        self.active_writes = 0
+        self.max_active_writes = 0
+        self.first_write_started = threading.Event()
+        self.second_write_started = threading.Event()
+        self.release_first_write = threading.Event()
+
+    def write(self, data: bytes) -> int:
+        with self._state_lock:
+            self.active_writes += 1
+            self.max_active_writes = max(self.max_active_writes, self.active_writes)
+            is_first_write = self.active_writes == 1 and not self.first_write_started.is_set()
+        try:
+            if is_first_write:
+                self.first_write_started.set()
+                assert self.release_first_write.wait(timeout=1)
+            else:
+                self.second_write_started.set()
+            return super().write(data)
+        finally:
+            with self._state_lock:
+                self.active_writes -= 1
+
+
+def test_cancelling_send_keeps_the_write_lock_until_the_worker_finishes():
+    output = _CancellationBlockingWriteStream()
+    transport = SidecarTransport(BytesIO(), output)
+    first = _envelope("sidecar-ready.json")
+    second = _envelope("sidecar-ready.json", sequence=2)
+
+    async def verify() -> None:
+        first_send = asyncio.create_task(transport.send(first))
+        await asyncio.to_thread(output.first_write_started.wait, 1)
+        first_send.cancel()
+        second_send = asyncio.create_task(transport.send(second))
+        await asyncio.sleep(0.05)
+        assert not output.second_write_started.is_set()
+        output.release_first_write.set()
+        with pytest.raises(asyncio.CancelledError):
+            await first_send
+        await second_send
+
+    asyncio.run(verify())
+
+    output.seek(0)
+    assert output.max_active_writes == 1
+    assert read_frame(output) == first
+    assert read_frame(output) == second
+    assert read_frame(output) is None
+
+
+class _FailingAfterCancellationWriteStream:
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def write(self, data: bytes) -> int:
+        self.started.set()
+        assert self.release.wait(timeout=1)
+        return 0
+
+
+def test_cancelling_send_reraises_cancellation_after_the_worker_fails():
+    output = _FailingAfterCancellationWriteStream()
+    transport = SidecarTransport(BytesIO(), output)
+
+    async def verify() -> None:
+        send_task = asyncio.create_task(transport.send(_envelope("sidecar-ready.json")))
+        await asyncio.to_thread(output.started.wait, 1)
+        send_task.cancel()
+        output.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await send_task
+
+    asyncio.run(verify())
+
+
 def test_healthcheck_writes_only_one_json_object_to_stdout():
     completed = subprocess.run(
         [sys.executable, "-m", "ai_assistant.sidecar", "--healthcheck"],
