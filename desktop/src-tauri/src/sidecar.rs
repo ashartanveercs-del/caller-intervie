@@ -15,10 +15,99 @@ use crate::protocol::{
     MAX_FRAME_BYTES,
 };
 
-pub const SIDECAR_EXTERNAL_BIN: &str = "binaries/callerinterview-sidecar";
+pub const SIDECAR_PROGRAM: &str = "callerinterview-sidecar";
 pub const SIDECAR_EVENT: &str = "sidecar://event";
 pub const PRODUCTION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_DIAGNOSTICS: usize = 20;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub fn packaged_sidecar_path(host_executable: &std::path::Path) -> std::path::PathBuf {
+    let mut path = host_executable
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(""))
+        .join(SIDECAR_PROGRAM);
+    if cfg!(windows) {
+        path.set_extension("exe");
+    }
+    path
+}
+
+pub fn smoke_packaged_sidecar() -> Result<(), SidecarError> {
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    let host = std::env::current_exe()
+        .map_err(|error| SidecarError::new("sidecar_smoke_failed", error.to_string()))?;
+    let path = packaged_sidecar_path(&host);
+    let mut child = std::process::Command::new(path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| SidecarError::new("sidecar_smoke_failed", error.to_string()))?;
+    let handshake = Envelope {
+        version: crate::protocol::PROTOCOL_VERSION,
+        id: uuid::Uuid::new_v4().to_string(),
+        session_id: None,
+        sequence: 0,
+        timestamp_ms: 0,
+        kind: CommandKind::HandshakeRequest.into(),
+        payload: Default::default(),
+        correlation_id: None,
+    };
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| SidecarError::new("sidecar_smoke_failed", "sidecar stdin is unavailable"))?
+        .write_all(
+            &encode_frame(&handshake)
+                .map_err(|error| SidecarError::new(error.code(), error.to_string()))?,
+        )
+        .map_err(|error| SidecarError::new("sidecar_smoke_failed", error.to_string()))?;
+    let mut stdout = child.stdout.take().ok_or_else(|| {
+        SidecarError::new("sidecar_smoke_failed", "sidecar stdout is unavailable")
+    })?;
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut chunk = [0_u8; 8192];
+        while let Ok(length) = stdout.read(&mut chunk) {
+            if length == 0 {
+                break;
+            }
+            if sender.send(chunk[..length].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + PRODUCTION_HANDSHAKE_TIMEOUT;
+    let mut decoder = FrameDecoder::new(MAX_FRAME_BYTES);
+    let result = 'ready: loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let chunk = receiver.recv_timeout(remaining).map_err(|_| {
+            SidecarError::new(
+                "sidecar_handshake_timeout",
+                "sidecar did not emit sidecar.ready within 45 seconds",
+            )
+        })?;
+        for event in decoder
+            .push(&chunk)
+            .map_err(|error| SidecarError::new(error.code(), error.to_string()))?
+        {
+            if matches!(
+                event.kind,
+                crate::protocol::ProtocolKind::Event(EventKind::SidecarReady)
+            ) {
+                validate_event(&event).map_err(|error| {
+                    SidecarError::new(error.code(), "sidecar emitted an invalid ready event")
+                })?;
+                break 'ready Ok(());
+            }
+        }
+    };
+    let _ = child.kill();
+    result
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -48,7 +137,7 @@ impl SidecarError {
     pub fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
-            message: message.into(),
+            message: redact_diagnostic(&message.into()),
         }
     }
 
@@ -69,7 +158,7 @@ impl std::error::Error for SidecarError {}
 pub trait SidecarPort: Send + Sync {
     async fn write(&self, bytes: Vec<u8>) -> Result<(), SidecarError>;
     async fn kill(&self) -> Result<(), SidecarError>;
-    fn observe(&self, _supervisor: SidecarSupervisor) {}
+    fn observe(&self, _supervisor: SidecarSupervisor, _generation: u64) {}
 }
 
 #[async_trait]
@@ -116,6 +205,7 @@ struct SupervisorInner {
     data: AsyncMutex<SupervisorData>,
     port: AsyncMutex<Option<Arc<dyn SidecarPort>>>,
     decoder: AsyncMutex<FrameDecoder>,
+    stderr: AsyncMutex<(u64, String)>,
     launcher: Option<Arc<dyn SidecarLauncher>>,
     sink: Arc<dyn SidecarEventSink>,
     restart_delay: Duration,
@@ -134,6 +224,7 @@ impl SidecarSupervisor {
                 data: AsyncMutex::new(SupervisorData::default()),
                 port: AsyncMutex::new(Some(port)),
                 decoder: AsyncMutex::new(FrameDecoder::new(MAX_FRAME_BYTES)),
+                stderr: AsyncMutex::new((0, String::new())),
                 launcher: None,
                 sink: Arc::new(NoopEventSink),
                 restart_delay: Duration::ZERO,
@@ -157,6 +248,7 @@ impl SidecarSupervisor {
                 data: AsyncMutex::new(SupervisorData::default()),
                 port: AsyncMutex::new(None),
                 decoder: AsyncMutex::new(FrameDecoder::new(MAX_FRAME_BYTES)),
+                stderr: AsyncMutex::new((0, String::new())),
                 launcher: Some(launcher),
                 sink,
                 restart_delay,
@@ -166,7 +258,10 @@ impl SidecarSupervisor {
     }
 
     pub async fn start(&self) -> Result<SidecarStatus, SidecarError> {
-        self.launch().await?;
+        if let Err(error) = self.launch().await {
+            self.fail(&error).await;
+            return Err(error);
+        }
         Ok(self.status().await)
     }
 
@@ -197,7 +292,10 @@ impl SidecarSupervisor {
         port.write(bytes).await
     }
 
-    pub async fn accept_stdout(&self, chunk: &[u8]) -> Result<(), SidecarError> {
+    pub async fn accept_stdout(&self, generation: u64, chunk: &[u8]) -> Result<(), SidecarError> {
+        if !self.is_current(generation).await {
+            return Ok(());
+        }
         let envelopes = self
             .inner
             .decoder
@@ -206,12 +304,15 @@ impl SidecarSupervisor {
             .push(chunk)
             .map_err(|error| SidecarError::new(error.code(), error.to_string()))?;
         for event in envelopes {
-            self.accept_event(event).await?;
+            self.accept_event(generation, event).await?;
         }
         Ok(())
     }
 
-    pub async fn accept_event(&self, event: Envelope) -> Result<(), SidecarError> {
+    pub async fn accept_event(&self, generation: u64, event: Envelope) -> Result<(), SidecarError> {
+        if !self.is_current(generation).await {
+            return Ok(());
+        }
         validate_event(&event)
             .map_err(|error| SidecarError::new(error.code(), "sidecar event validation failed"))?;
         let is_ready = matches!(
@@ -232,14 +333,28 @@ impl SidecarSupervisor {
         self.inner.sink.emit(&event)
     }
 
-    pub async fn accept_stderr(&self, stderr: &[u8]) {
-        self.push_diagnostic(format!("stderr: {}", String::from_utf8_lossy(stderr)))
-            .await;
+    pub async fn accept_stderr(&self, generation: u64, stderr: &[u8]) {
+        if !self.is_current(generation).await {
+            return;
+        }
+        let mut pending = self.inner.stderr.lock().await;
+        if pending.0 != generation {
+            return;
+        }
+        pending.1.push_str(&String::from_utf8_lossy(stderr));
+        while let Some(end) = pending.1.find(['\n', '\r']) {
+            let line = pending.1.drain(..=end).collect::<String>();
+            self.push_diagnostic(format!("stderr: {line}")).await;
+        }
     }
 
-    pub async fn handle_unexpected_exit(&self) {
+    pub async fn handle_unexpected_exit(&self, generation: u64) {
+        self.flush_stderr(generation).await;
         {
             let mut data = self.inner.data.lock().await;
+            if data.generation != generation {
+                return;
+            }
             if data.ignored_exit_events > 0 {
                 data.ignored_exit_events -= 1;
                 return;
@@ -281,8 +396,12 @@ impl SidecarSupervisor {
             let mut data = self.inner.data.lock().await;
             data.explicit_shutdown = false;
             data.state = SidecarState::Starting;
+            data.restart_count = 0;
         }
-        self.launch().await?;
+        if let Err(error) = self.launch().await {
+            self.fail(&error).await;
+            return Err(error);
+        }
         Ok(self.status().await)
     }
 
@@ -311,7 +430,9 @@ impl SidecarSupervisor {
             data.generation += 1;
             data.generation
         };
-        port.observe(self.clone());
+        *self.inner.decoder.lock().await = FrameDecoder::new(MAX_FRAME_BYTES);
+        *self.inner.stderr.lock().await = (generation, String::new());
+        port.observe(self.clone(), generation);
         self.send_handshake().await?;
         self.arm_handshake_timeout(generation);
         Ok(())
@@ -378,9 +499,32 @@ impl SidecarSupervisor {
         Ok(())
     }
 
+    async fn is_current(&self, generation: u64) -> bool {
+        self.inner.data.lock().await.generation == generation
+    }
+
     async fn push_diagnostic(&self, diagnostic: impl AsRef<str>) {
         let mut data = self.inner.data.lock().await;
         self.push_diagnostic_locked(&mut data, diagnostic.as_ref());
+    }
+
+    async fn flush_stderr(&self, generation: u64) {
+        let line = {
+            let mut pending = self.inner.stderr.lock().await;
+            if pending.0 != generation {
+                return;
+            }
+            std::mem::take(&mut pending.1)
+        };
+        if !line.is_empty() {
+            self.push_diagnostic(format!("stderr: {line}")).await;
+        }
+    }
+
+    async fn fail(&self, error: &SidecarError) {
+        let mut data = self.inner.data.lock().await;
+        data.state = SidecarState::Failed;
+        self.push_diagnostic_locked(&mut data, &error.to_string());
     }
 
     fn push_diagnostic_locked(&self, data: &mut SupervisorData, diagnostic: &str) {
@@ -431,37 +575,54 @@ impl SidecarLauncher for TauriSidecarLauncher {
         let (events, child) = self
             .app
             .shell()
-            .sidecar(SIDECAR_EXTERNAL_BIN)
+            .sidecar(SIDECAR_PROGRAM)
             .map_err(|error| SidecarError::new("sidecar_launch_failed", error.to_string()))?
             .set_raw_out(true)
             .spawn()
             .map_err(|error| SidecarError::new("sidecar_launch_failed", error.to_string()))?;
         Ok(Arc::new(TauriSidecarPort {
-            child: Mutex::new(Some(child)),
+            child: Arc::new(Mutex::new(Some(child))),
             events: Arc::new(AsyncMutex::new(Some(events))),
         }))
     }
 }
 
 struct TauriSidecarPort {
-    child: Mutex<Option<CommandChild>>,
+    child: Arc<Mutex<Option<CommandChild>>>,
     events: Arc<AsyncMutex<Option<tauri::async_runtime::Receiver<CommandEvent>>>>,
 }
 
 #[async_trait]
 impl SidecarPort for TauriSidecarPort {
     async fn write(&self, bytes: Vec<u8>) -> Result<(), SidecarError> {
-        self.child
+        let mut child = self
+            .child
             .lock()
             .map_err(|_| {
                 SidecarError::new("sidecar_write_failed", "sidecar child lock was poisoned")
             })?
-            .as_mut()
+            .take()
             .ok_or_else(|| {
                 SidecarError::new("sidecar_unavailable", "sidecar child is unavailable")
-            })?
-            .write(&bytes)
-            .map_err(|error| SidecarError::new("sidecar_write_failed", error.to_string()))
+            })?;
+        let slot = self.child.clone();
+        let write = tokio::task::spawn_blocking(move || {
+            let result = child.write(&bytes);
+            if let Ok(mut slot) = slot.lock() {
+                *slot = Some(child);
+            }
+            result
+        });
+        match tokio::time::timeout(WRITE_TIMEOUT, write).await {
+            Ok(Ok(result)) => {
+                result.map_err(|error| SidecarError::new("sidecar_write_failed", error.to_string()))
+            }
+            Ok(Err(error)) => Err(SidecarError::new("sidecar_write_failed", error.to_string())),
+            Err(_) => Err(SidecarError::new(
+                "sidecar_write_timeout",
+                "sidecar stdin write timed out",
+            )),
+        }
     }
 
     async fn kill(&self) -> Result<(), SidecarError> {
@@ -480,7 +641,7 @@ impl SidecarPort for TauriSidecarPort {
             .map_err(|error| SidecarError::new("sidecar_kill_failed", error.to_string()))
     }
 
-    fn observe(&self, supervisor: SidecarSupervisor) {
+    fn observe(&self, supervisor: SidecarSupervisor, generation: u64) {
         let events = self.events.clone();
         tauri::async_runtime::spawn(async move {
             let Some(mut receiver) = events.lock().await.take() else {
@@ -489,13 +650,15 @@ impl SidecarPort for TauriSidecarPort {
             while let Some(event) = receiver.recv().await {
                 match event {
                     CommandEvent::Stdout(chunk) => {
-                        if let Err(error) = supervisor.accept_stdout(&chunk).await {
+                        if let Err(error) = supervisor.accept_stdout(generation, &chunk).await {
                             supervisor.push_diagnostic(error.to_string()).await;
                         }
                     }
-                    CommandEvent::Stderr(chunk) => supervisor.accept_stderr(&chunk).await,
+                    CommandEvent::Stderr(chunk) => {
+                        supervisor.accept_stderr(generation, &chunk).await
+                    }
                     CommandEvent::Terminated(_) | CommandEvent::Error(_) => {
-                        supervisor.handle_unexpected_exit().await;
+                        supervisor.handle_unexpected_exit(generation).await;
                         return;
                     }
                     _ => {}
@@ -537,8 +700,8 @@ mod tests {
     };
 
     use super::{
-        redact_diagnostic, SidecarError, SidecarLauncher, SidecarPort, SidecarState,
-        SidecarSupervisor,
+        packaged_sidecar_path, redact_diagnostic, SidecarError, SidecarLauncher, SidecarPort,
+        SidecarState, SidecarSupervisor, SIDECAR_PROGRAM,
     };
 
     const SESSION_ID: &str = "018f0000-0000-7000-8000-000000000003";
@@ -600,6 +763,30 @@ mod tests {
         }
     }
 
+    fn session_event(kind: EventKind, payload: Map<String, Value>) -> Envelope {
+        Envelope {
+            version: PROTOCOL_VERSION,
+            id: "018f0000-0000-7000-8000-000000000008".into(),
+            session_id: Some(SESSION_ID.into()),
+            sequence: 4,
+            timestamp_ms: 4,
+            kind: ProtocolKind::Event(kind),
+            payload,
+            correlation_id: None,
+        }
+    }
+
+    #[test]
+    fn sidecar_program_is_resolved_beside_the_packaged_host() {
+        let host = std::path::Path::new(r"C:\\package\\CallerInterview.exe");
+
+        assert_eq!(SIDECAR_PROGRAM, "callerinterview-sidecar");
+        assert_eq!(
+            packaged_sidecar_path(host),
+            std::path::PathBuf::from(r"C:\\package\\callerinterview-sidecar.exe")
+        );
+    }
+
     #[test]
     fn decoder_accepts_split_frame_chunks() {
         let envelope = fixture_envelope();
@@ -654,6 +841,57 @@ mod tests {
         assert_eq!(error.code(), "invalid_envelope");
     }
 
+    #[test]
+    fn known_events_require_bounded_payloads_and_correct_session_semantics() {
+        let invalid_session_state = Envelope {
+            session_id: None,
+            payload: Map::new(),
+            ..session_event(EventKind::SessionState, Map::new())
+        };
+        assert!(crate::protocol::validate_event(&invalid_session_state).is_err());
+
+        let invalid_transcript = session_event(
+            EventKind::TranscriptUpdated,
+            Map::from_iter([
+                (
+                    "turn_id".into(),
+                    json!("018f0000-0000-7000-8000-000000000009"),
+                ),
+                ("text".into(), json!("x".repeat(65 * 1024))),
+                ("is_final".into(), json!(true)),
+                ("speech_final".into(), json!(true)),
+                ("speaker_role".into(), json!("interviewee")),
+                ("source".into(), json!("mic")),
+                ("language".into(), json!("en")),
+                ("confidence".into(), json!(0.9)),
+                ("started_at_ms".into(), json!(1)),
+                ("ended_at_ms".into(), json!(2)),
+            ]),
+        );
+        assert!(crate::protocol::validate_event(&invalid_transcript).is_err());
+
+        let invalid_suggestion = session_event(
+            EventKind::SuggestionStarted,
+            Map::from_iter([("suggestion_id".into(), json!("not-a-uuid"))]),
+        );
+        assert!(crate::protocol::validate_event(&invalid_suggestion).is_err());
+
+        let invalid_error = session_event(
+            EventKind::SuggestionError,
+            Map::from_iter([
+                (
+                    "suggestion_id".into(),
+                    json!("018f0000-0000-7000-8000-000000000009"),
+                ),
+                ("message".into(), json!(42)),
+            ]),
+        );
+        assert!(crate::protocol::validate_event(&invalid_error).is_err());
+
+        let invalid_rag = session_event(EventKind::RagStatus, Map::new());
+        assert!(crate::protocol::validate_event(&invalid_rag).is_err());
+    }
+
     #[tokio::test]
     async fn supervisor_rejects_command_until_validated_ready_event() {
         let port = FakeSidecarPort::default();
@@ -662,6 +900,33 @@ mod tests {
         let error = supervisor.send(fixture_command()).await.unwrap_err();
 
         assert_eq!(error.code(), "sidecar_not_ready");
+    }
+
+    #[tokio::test]
+    async fn old_generation_bytes_and_ready_events_are_ignored_after_restart() {
+        let port = Arc::new(FakeSidecarPort::default());
+        let launcher = FakeSidecarLauncher {
+            port,
+            launches: Arc::new(Mutex::new(0)),
+        };
+        let supervisor = SidecarSupervisor::with_launcher(Arc::new(launcher), Duration::ZERO);
+        supervisor.start().await.unwrap();
+        let half_header = &encode_frame(&fixture_envelope()).unwrap()[..2];
+        supervisor.accept_stdout(1, half_header).await.unwrap();
+
+        supervisor.restart().await.unwrap();
+        supervisor.accept_stdout(1, &[0, 0]).await.unwrap();
+        supervisor
+            .accept_event(1, fixture_envelope())
+            .await
+            .unwrap();
+
+        assert_eq!(supervisor.status().await.state, SidecarState::Starting);
+        supervisor
+            .accept_event(2, fixture_envelope())
+            .await
+            .unwrap();
+        assert_eq!(supervisor.status().await.state, SidecarState::Ready);
     }
 
     #[tokio::test]
@@ -674,13 +939,51 @@ mod tests {
         let supervisor =
             SidecarSupervisor::with_launcher(Arc::new(launcher.clone()), Duration::ZERO);
 
-        supervisor.handle_unexpected_exit().await;
+        supervisor.handle_unexpected_exit(0).await;
         assert_eq!(supervisor.status().await.state, SidecarState::Starting);
         assert_eq!(*launcher.launches.lock().unwrap(), 1);
 
-        supervisor.handle_unexpected_exit().await;
+        supervisor.handle_unexpected_exit(1).await;
         assert_eq!(supervisor.status().await.state, SidecarState::Failed);
         assert_eq!(*launcher.launches.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_restart_resets_automatic_restart_budget() {
+        let port = Arc::new(FakeSidecarPort::default());
+        let launcher = FakeSidecarLauncher {
+            port,
+            launches: Arc::new(Mutex::new(0)),
+        };
+        let supervisor = SidecarSupervisor::with_launcher(Arc::new(launcher), Duration::ZERO);
+
+        supervisor.handle_unexpected_exit(0).await;
+        assert_eq!(supervisor.status().await.restart_count, 1);
+        supervisor.restart().await.unwrap();
+
+        assert_eq!(supervisor.status().await.restart_count, 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_restart_failure_enters_failed_state_with_redacted_diagnostic() {
+        #[derive(Clone)]
+        struct FailingLauncher;
+        #[async_trait]
+        impl SidecarLauncher for FailingLauncher {
+            async fn launch(&self) -> Result<Arc<dyn SidecarPort>, SidecarError> {
+                Err(SidecarError::new(
+                    "sidecar_launch_failed",
+                    "DEEPSEEK_API_KEY=secret-value",
+                ))
+            }
+        }
+        let supervisor =
+            SidecarSupervisor::with_launcher(Arc::new(FailingLauncher), Duration::ZERO);
+
+        assert!(supervisor.restart().await.is_err());
+        let status = supervisor.status().await;
+        assert_eq!(status.state, SidecarState::Failed);
+        assert!(!status.diagnostics.join(" ").contains("secret-value"));
     }
 
     #[tokio::test]
@@ -694,7 +997,7 @@ mod tests {
             SidecarSupervisor::with_launcher(Arc::new(launcher.clone()), Duration::ZERO);
 
         supervisor.shutdown().await.unwrap();
-        supervisor.handle_unexpected_exit().await;
+        supervisor.handle_unexpected_exit(0).await;
 
         assert_eq!(supervisor.status().await.state, SidecarState::Stopped);
         assert_eq!(*launcher.launches.lock().unwrap(), 0);
@@ -722,7 +1025,10 @@ mod tests {
     async fn supervisor_rejects_event_kinds_and_invalid_command_schemas_before_writing() {
         let port = FakeSidecarPort::default();
         let supervisor = SidecarSupervisor::with_port(Arc::new(port.clone()));
-        supervisor.accept_event(fixture_envelope()).await.unwrap();
+        supervisor
+            .accept_event(0, fixture_envelope())
+            .await
+            .unwrap();
 
         let mut event_as_command = fixture_command();
         event_as_command.kind = ProtocolKind::Event(EventKind::RuntimeError);
@@ -745,6 +1051,67 @@ mod tests {
             "invalid_session_id"
         );
         assert!(port.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stderr_redaction_is_safe_across_chunk_boundaries_and_error_serialization() {
+        let port = FakeSidecarPort::default();
+        let supervisor = SidecarSupervisor::with_port(Arc::new(port));
+        supervisor.accept_stderr(0, b"DEEPSEEK_API_").await;
+        supervisor.accept_stderr(0, b"KEY=secret-value ").await;
+
+        let diagnostics = supervisor.status().await.diagnostics.join(" ");
+        assert!(!diagnostics.contains("secret-value"));
+        assert!(!serde_json::to_string(&SidecarError::new(
+            "sidecar_launch_failed",
+            "DEEPSEEK_API_KEY=secret-value"
+        ))
+        .unwrap()
+        .contains("secret-value"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_does_not_wait_for_a_blocked_port_write() {
+        #[derive(Clone)]
+        struct BlockingPort {
+            started: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait]
+        impl SidecarPort for BlockingPort {
+            async fn write(&self, _bytes: Vec<u8>) -> Result<(), SidecarError> {
+                self.started.notify_waiters();
+                self.release.notified().await;
+                Ok(())
+            }
+            async fn kill(&self) -> Result<(), SidecarError> {
+                Ok(())
+            }
+        }
+
+        let port = BlockingPort {
+            started: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        let supervisor = SidecarSupervisor::with_port(Arc::new(port.clone()));
+        supervisor
+            .accept_event(0, fixture_envelope())
+            .await
+            .unwrap();
+        let started = port.started.notified();
+        let send = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.send(fixture_command()).await }
+        });
+        started.await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), supervisor.shutdown())
+                .await
+                .is_ok()
+        );
+        port.release.notify_waiters();
+        let _ = send.await;
     }
 
     #[test]

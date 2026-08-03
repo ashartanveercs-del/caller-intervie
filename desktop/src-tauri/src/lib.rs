@@ -13,9 +13,11 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let state = state::AppState::new(app.handle().clone());
-            tauri::async_runtime::block_on(state.sidecar.start())
-                .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
+            let sidecar = state.sidecar.clone();
             app.manage(state);
+            tauri::async_runtime::spawn(async move {
+                let _ = sidecar.start().await;
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

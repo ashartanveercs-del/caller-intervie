@@ -25,3 +25,14 @@ pub async fn send_sidecar_command(
 pub async fn restart_sidecar(state: State<'_, AppState>) -> Result<SidecarStatus, CommandError> {
     state.sidecar.restart().await
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn webview_capability_exposes_no_shell_plugin_permissions() {
+        let capability = include_str!("../capabilities/default.json");
+
+        assert!(!capability.contains("shell:"));
+        assert!(capability.contains("core:default"));
+    }
+}

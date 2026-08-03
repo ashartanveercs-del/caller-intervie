@@ -36,10 +36,13 @@
         "session.state",
         "transcript.updated",
         "suggestion.chunk",
+        "suggestion.started",
         "suggestion.completed",
+        "suggestion.error",
         "audio.health",
         "provider.health",
         "knowledge.state",
+        "rag.status",
         "runtime.error"
       ]
     },
