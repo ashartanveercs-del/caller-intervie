@@ -129,7 +129,7 @@ a:focus-visible {
   position: absolute;
   z-index: 1;
   top: calc(100% + var(--space-2));
-  right: 0;
+  inset-inline-end: 0;
   width: max-content;
   max-width: 200px;
   padding: var(--space-1) var(--space-2);

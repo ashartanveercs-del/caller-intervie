@@ -1,6 +1,7 @@
 import { Settings, UserRound } from "lucide-react";
 import { type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
+import { NavLink } from "react-router-dom";
 import { HealthIndicator } from "../components/HealthIndicator";
 import { IconButton } from "../components/IconButton";
 import "../i18n";
@@ -16,11 +17,6 @@ const modes = [
   { key: "presentation", href: "/prepare/presentation" },
 ] as const;
 
-function isCurrentMode(href: string) {
-  const pathname = window.location.pathname;
-  return href === "/" ? pathname === "/" : pathname.startsWith(href);
-}
-
 export function AppShell({ children }: AppShellProps) {
   const { t } = useTranslation();
 
@@ -30,14 +26,13 @@ export function AppShell({ children }: AppShellProps) {
         <h1 className="app-shell__brand">{t("app.name")}</h1>
         <nav aria-label={t("app.navigation")} className="app-shell__modes">
           {modes.map(({ key, href }) => (
-            <a
-              aria-current={isCurrentMode(href) ? "page" : undefined}
+            <NavLink
               className="app-shell__mode-link"
-              href={href}
               key={key}
+              to={href}
             >
               {t(`modes.${key}`)}
-            </a>
+            </NavLink>
           ))}
         </nav>
         <div className="app-shell__actions">
