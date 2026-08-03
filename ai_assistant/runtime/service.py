@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from contextlib import suppress
 import inspect
 import logging
 import struct
@@ -37,7 +36,7 @@ class RuntimeService:
     def __init__(self, dependencies: RuntimeDependencies) -> None:
         self._deps = dependencies
         self._state: Literal[
-            "idle", "starting", "listening", "paused", "stopped", "error"
+            "idle", "starting", "listening", "paused", "stopping", "stopped", "error"
         ] = "idle"
         self._session: SessionConfig | None = None
         self._system_audio_enabled = False
@@ -45,6 +44,7 @@ class RuntimeService:
         self._transcriber_started = False
         self._pump_task: asyncio.Task[None] | None = None
         self._lifecycle_lock = asyncio.Lock()
+        self._cleanup_complete = True
         self._audio_level_handler: AudioLevelHandler | None = None
 
         self._retriever = None
@@ -62,7 +62,7 @@ class RuntimeService:
     async def start_session(self, config: SessionConfig) -> None:
         """Validate configuration and start transcription plus audio capture."""
         async with self._lifecycle_lock:
-            if self._state in ("starting", "listening", "paused"):
+            if self._state in ("starting", "listening", "paused", "stopping"):
                 raise RuntimeStateError("A runtime session is already active")
 
             missing = [
@@ -78,6 +78,7 @@ class RuntimeService:
                 raise RuntimeConfigurationError(missing)
 
             self._state = "starting"
+            self._cleanup_complete = False
             self._session = config
             self._deps.config.deepgram_language = config.input_language
             self._deps.config.response_language = config.response_language
@@ -95,22 +96,29 @@ class RuntimeService:
                 self._state = "listening"
             except BaseException:
                 self._state = "error"
+                cleanup_errors: list[BaseException] = []
+                self._cancel_orchestration(cleanup_errors)
                 await self._stop_started_dependencies()
+                self._cleanup_complete = True
                 raise
 
     async def stop_session(self) -> None:
         """Stop owned resources once; repeated calls have no side effects."""
         async with self._lifecycle_lock:
-            if not self._capture_started and not self._transcriber_started:
-                if self._state != "idle":
-                    self._state = "stopped"
+            if self._cleanup_complete:
                 return
 
+            self._state = "stopping"
+            errors: list[BaseException] = []
+            self._cancel_orchestration(errors)
             self._rag_generation += 1
 
-            errors = await self._stop_started_dependencies()
+            errors.extend(await self._stop_started_dependencies())
             self._system_audio_enabled = False
-            self._save_rag_index()
+            rag_error = self._save_rag_index()
+            if rag_error is not None:
+                errors.append(rag_error)
+            self._cleanup_complete = True
             self._state = "error" if errors else "stopped"
             if errors:
                 raise errors[0]
@@ -121,12 +129,13 @@ class RuntimeService:
         self._state = "listening" if enabled else "paused"
 
     async def set_mode(self, mode: str) -> None:
-        self._require_active()
-        try:
-            parsed = Mode(mode)
-        except ValueError as error:
-            raise ValueError(f"Unknown mode: {mode}") from error
-        await self._deps.orchestrator.set_mode(parsed)
+        async with self._lifecycle_lock:
+            self._require_active()
+            try:
+                parsed = Mode(mode)
+            except ValueError as error:
+                raise ValueError(f"Unknown mode: {mode}") from error
+            await self._deps.orchestrator.set_mode(parsed)
 
     def set_you_source(self, source: AudioSource) -> None:
         self._require_active()
@@ -149,61 +158,65 @@ class RuntimeService:
         source: AudioSource,
         device: int | None,
     ) -> None:
-        self._require_active()
-        if source == "mic":
-            await self._deps.capture.change_mic_device(device)
-        elif source == "system":
-            await self._deps.capture.change_system_device(device)
-        else:
-            raise ValueError(f"Unknown audio source: {source}")
+        async with self._lifecycle_lock:
+            self._require_active()
+            if source == "mic":
+                await self._deps.capture.change_mic_device(device)
+            elif source == "system":
+                await self._deps.capture.change_system_device(device)
+            else:
+                raise ValueError(f"Unknown audio source: {source}")
 
     async def set_system_audio(self, enabled: bool) -> None:
-        self._require_active()
-        if enabled == self._system_audio_enabled:
-            return
-        if enabled:
-            self._deps.capture.start_system_capture()
-            try:
-                await self._deps.transcriber.start_system_stream()
-            except BaseException:
+        async with self._lifecycle_lock:
+            self._require_active()
+            if enabled == self._system_audio_enabled:
+                return
+            if enabled:
+                self._deps.capture.start_system_capture()
+                try:
+                    await self._deps.transcriber.start_system_stream()
+                except BaseException:
+                    self._deps.capture.stop_system_capture()
+                    raise
+            else:
                 self._deps.capture.stop_system_capture()
-                raise
-        else:
-            self._deps.capture.stop_system_capture()
-            await self._deps.transcriber.stop_system_stream()
-        self._system_audio_enabled = enabled
+                await self._deps.transcriber.stop_system_stream()
+            self._system_audio_enabled = enabled
 
     async def trigger_query(self, text: str, answer_format: str) -> None:
-        self._require_active()
-        if answer_format == "chat":
-            self._deps.prompt_builder.add_to_history("user", text)
-        await self._deps.orchestrator.trigger_query(
-            text,
-            full_transcript=answer_format == "summary",
-        )
-
-    async def ingest_documents(self, paths: list[str]) -> DocumentIngestionResult:
-        self._require_active()
-        if self._retriever is None:
-            raise RuntimeStateError("Knowledge base is not ready")
-
-        def _ingest() -> DocumentIngestionResult:
-            total_chunks = 0
-            for path in paths:
-                try:
-                    count = self._retriever.ingest_file(path)
-                    total_chunks += count
-                    logger.info("Ingested %s — %d chunks", path, count)
-                except Exception:
-                    logger.exception("Failed to ingest %s", path)
-            self._retriever.save_index(self._deps.config.rag_db_path)
-            return DocumentIngestionResult(
-                files=len(paths),
-                chunks_added=total_chunks,
-                total_chunks=self._retriever.vector_store.size,
+        async with self._lifecycle_lock:
+            self._require_active()
+            if answer_format == "chat":
+                self._deps.prompt_builder.add_to_history("user", text)
+            await self._deps.orchestrator.trigger_query(
+                text,
+                full_transcript=answer_format == "summary",
             )
 
-        return await asyncio.to_thread(_ingest)
+    async def ingest_documents(self, paths: list[str]) -> DocumentIngestionResult:
+        async with self._lifecycle_lock:
+            self._require_active()
+            if self._retriever is None:
+                raise RuntimeStateError("Knowledge base is not ready")
+
+            def _ingest() -> DocumentIngestionResult:
+                total_chunks = 0
+                for path in paths:
+                    try:
+                        count = self._retriever.ingest_file(path)
+                        total_chunks += count
+                        logger.info("Ingested %s — %d chunks", path, count)
+                    except Exception:
+                        logger.exception("Failed to ingest %s", path)
+                self._retriever.save_index(self._deps.config.rag_db_path)
+                return DocumentIngestionResult(
+                    files=len(paths),
+                    chunks_added=total_chunks,
+                    total_chunks=self._retriever.vector_store.size,
+                )
+
+            return await asyncio.to_thread(_ingest)
 
     def snapshot(self) -> RuntimeSnapshot:
         session = self._session
@@ -281,8 +294,12 @@ class RuntimeService:
         self._pump_task = None
         if pump_task is not None:
             pump_task.cancel()
-            with suppress(asyncio.CancelledError):
+            try:
                 await pump_task
+            except asyncio.CancelledError:
+                pass
+            except BaseException as error:
+                errors.append(error)
 
         if self._capture_started:
             self._capture_started = False
@@ -297,6 +314,16 @@ class RuntimeService:
             except BaseException as error:
                 errors.append(error)
         return errors
+
+    def _cancel_orchestration(self, errors: list[BaseException]) -> None:
+        try:
+            self._deps.orchestrator.set_listening(False)
+        except BaseException as error:
+            errors.append(error)
+        try:
+            self._deps.orchestrator.cancel_pending()
+        except BaseException as error:
+            errors.append(error)
 
     def _start_knowledge_load(self) -> None:
         rag_factory = self._deps.rag_factory
@@ -342,14 +369,16 @@ class RuntimeService:
             exc_info=(type(error), error, error.__traceback__),
         )
 
-    def _save_rag_index(self) -> None:
+    def _save_rag_index(self) -> BaseException | None:
         if self._retriever is None:
-            return
+            return None
         try:
             self._retriever.save_index(self._deps.config.rag_db_path)
             logger.info("Saved RAG index to %s", self._deps.config.rag_db_path)
-        except Exception:
+        except BaseException as error:
             logger.warning("Failed to save RAG index")
+            return error
+        return None
 
     def _require_active(self) -> None:
         if self._state not in ("listening", "paused"):

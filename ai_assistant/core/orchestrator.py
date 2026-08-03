@@ -51,6 +51,7 @@ class Orchestrator:
         )
         self._mode = Mode.SUGGESTION
         self._debounce_handle: asyncio.TimerHandle | None = None
+        self._suggestion_task: asyncio.Task[None] | None = None
         self._listening = True
         # Which audio source is the candidate ("you"); the other is the
         # interviewer whose questions drive suggestions.
@@ -95,6 +96,16 @@ class Orchestrator:
         self._transcript_buffer.you_source = source
         logger.info("You-source set to %s (interviewer is %s)",
                     source, "system" if source == "mic" else "mic")
+
+    def cancel_pending(self) -> None:
+        """Cancel debounce, suggestion preparation, and active LLM generation."""
+        if self._debounce_handle is not None:
+            self._debounce_handle.cancel()
+            self._debounce_handle = None
+        if self._suggestion_task is not None and not self._suggestion_task.done():
+            self._suggestion_task.cancel()
+        self._suggestion_task = None
+        self._llm.cancel_active()
 
     async def set_mode(self, new_mode: Mode) -> None:
         old = self._mode
@@ -178,8 +189,12 @@ class Orchestrator:
         wait = delay if delay is not None else self.SUGGESTION_DEBOUNCE_SECONDS
         self._debounce_handle = loop.call_later(
             wait,
-            lambda: asyncio.create_task(self._generate_suggestion()),
+            self._launch_suggestion,
         )
+
+    def _launch_suggestion(self) -> None:
+        self._debounce_handle = None
+        self._suggestion_task = asyncio.create_task(self._generate_suggestion())
 
     async def _generate_suggestion(self) -> None:
         rag_context = self._get_rag_context()

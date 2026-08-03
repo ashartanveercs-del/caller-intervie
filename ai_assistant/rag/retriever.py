@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from functools import wraps
 import logging
 import os
 from pathlib import Path
+import threading
 from typing import Optional
 
 from ai_assistant.rag.chunking import RecursiveTextSplitter
@@ -14,6 +16,15 @@ from ai_assistant.rag.models import ChunkWithScore, RetrievalResult
 from ai_assistant.rag.vector_store import FAISSVectorStore
 
 logger = logging.getLogger(__name__)
+
+
+def _with_store_lock(method):
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._store_lock:
+            return method(self, *args, **kwargs)
+
+    return locked
 
 
 class RAGRetriever:
@@ -30,6 +41,7 @@ class RAGRetriever:
         self.vector_store = vector_store
         self.relevance_threshold = relevance_threshold
         self.default_k = default_k
+        self._store_lock = threading.RLock()
 
         self._ingester = DocumentIngester()
         self._splitter = RecursiveTextSplitter()
@@ -38,6 +50,7 @@ class RAGRetriever:
     # Ingestion
     # ------------------------------------------------------------------
 
+    @_with_store_lock
     def ingest_file(self, file_path: str) -> int:
         """Ingest a single file and return the number of chunks produced."""
         pages, _metadata = self._ingester.ingest(file_path)
@@ -56,6 +69,7 @@ class RAGRetriever:
         logger.info("Ingested %s — %d chunks added to store", file_path, len(chunks))
         return len(chunks)
 
+    @_with_store_lock
     def ingest_directory(
         self,
         dir_path: str,
@@ -93,6 +107,7 @@ class RAGRetriever:
     # Query
     # ------------------------------------------------------------------
 
+    @_with_store_lock
     def query(
         self,
         query_text: str,
@@ -127,10 +142,12 @@ class RAGRetriever:
     # Persistence helpers
     # ------------------------------------------------------------------
 
+    @_with_store_lock
     def save_index(self, directory: str) -> None:
         """Save the vector store to disk."""
         self.vector_store.save(directory)
 
+    @_with_store_lock
     def load_index(self, directory: str) -> None:
         """Load a previously saved vector store."""
         self.vector_store.load(directory)
@@ -139,6 +156,7 @@ class RAGRetriever:
     # Source management
     # ------------------------------------------------------------------
 
+    @_with_store_lock
     def remove_source(self, file_path: str) -> None:
         """Remove all chunks for *file_path* from the store."""
         self.vector_store.remove_by_source(file_path)

@@ -9,6 +9,12 @@ from ai_assistant.core.events import EventBus
 
 async def _delayed_noop(self) -> None:
     await asyncio.sleep(0.05)
+    self._running = True
+    self._ws = object()
+
+
+async def _failed_connect(self) -> None:
+    await asyncio.sleep(0)
 
 
 async def _assert_loop_progresses(awaitable) -> None:
@@ -32,6 +38,44 @@ def test_start_does_not_block_main_event_loop(monkeypatch):
         transcriber = DeepgramTranscriber(Config(), EventBus())
         try:
             await _assert_loop_progresses(transcriber.start())
+        finally:
+            await transcriber.stop()
+
+    asyncio.run(scenario())
+
+
+def test_initial_mic_connection_failure_is_propagated(monkeypatch):
+    monkeypatch.setattr(_DGStream, "connect", _failed_connect)
+
+    async def scenario() -> None:
+        transcriber = DeepgramTranscriber(Config(), EventBus())
+        try:
+            try:
+                await transcriber.start()
+            except RuntimeError as error:
+                assert str(error) == "Mic Deepgram connection failed"
+            else:
+                raise AssertionError("initial connection failure was suppressed")
+        finally:
+            await transcriber.stop()
+
+    asyncio.run(scenario())
+
+
+def test_initial_system_connection_failure_is_propagated(monkeypatch):
+    monkeypatch.setattr(_DGStream, "connect", _delayed_noop)
+
+    async def scenario() -> None:
+        transcriber = DeepgramTranscriber(Config(), EventBus())
+        await transcriber.start()
+        monkeypatch.setattr(_DGStream, "connect", _failed_connect)
+        try:
+            try:
+                await transcriber.start_system_stream()
+            except RuntimeError as error:
+                assert str(error) == "System Deepgram connection failed"
+            else:
+                raise AssertionError("system connection failure was suppressed")
         finally:
             await transcriber.stop()
 

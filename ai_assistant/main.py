@@ -23,6 +23,29 @@ from ai_assistant.ui.app import AssistantApp
 logger = logging.getLogger(__name__)
 
 
+def _application_shutdown_event(application) -> asyncio.Event:
+    """Translate Qt's quit signal into an asyncio event from any thread."""
+    loop = asyncio.get_running_loop()
+    shutdown_event = asyncio.Event()
+
+    def _request_shutdown() -> None:
+        loop.call_soon_threadsafe(shutdown_event.set)
+
+    application.aboutToQuit.connect(_request_shutdown)
+    return shutdown_event
+
+
+async def _run_until_application_quit(
+    application,
+    runtime,
+    shutdown_event: asyncio.Event | None = None,
+) -> None:
+    """Wait for normal Qt termination and drain the runtime before returning."""
+    event = shutdown_event or _application_shutdown_event(application)
+    await event.wait()
+    await runtime.stop_session()
+
+
 def _setup_logging() -> None:
     import os
 
@@ -107,7 +130,8 @@ async def async_main() -> None:
 
     # Qt remains an adapter: it creates widgets and translates runtime events.
     ui_app = AssistantApp()
-    ui_app.setup()
+    qt_app = ui_app.setup()
+    shutdown_event = _application_shutdown_event(qt_app)
 
     async def _on_transcript(event) -> None:
         if ui_app.overlay is not None:
@@ -303,13 +327,10 @@ async def async_main() -> None:
     _rag_timer.start()
 
     try:
-        await asyncio.Event().wait()
+        await _run_until_application_quit(qt_app, runtime, shutdown_event)
     finally:
         _rag_timer.stop()
-        try:
-            await runtime.stop_session()
-        finally:
-            ui_app.shutdown()
+        ui_app.shutdown()
 
 
 def main() -> None:

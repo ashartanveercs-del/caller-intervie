@@ -283,6 +283,7 @@ class DualMicCapture:
         except Exception:
             logger.exception("Failed to start mic capture on device %s", self._mic_device)
             self._mic_stream = None
+            raise
         logger.info("Dual mic capture started")
 
     def start_system_capture(self) -> None:

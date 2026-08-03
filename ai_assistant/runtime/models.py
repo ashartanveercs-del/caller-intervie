@@ -7,7 +7,9 @@ from typing import Literal
 
 
 AudioSource = Literal["mic", "system"]
-RuntimeState = Literal["idle", "starting", "listening", "paused", "stopped", "error"]
+RuntimeState = Literal[
+    "idle", "starting", "listening", "paused", "stopping", "stopped", "error"
+]
 KnowledgeState = Literal["disabled", "loading", "ready", "error"]
 
 

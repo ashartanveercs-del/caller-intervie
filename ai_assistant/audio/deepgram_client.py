@@ -48,6 +48,11 @@ class _DGStream:
         self._running = False
         self._reconnect_attempts = 0
 
+    @property
+    def connected(self) -> bool:
+        """Whether this stream has an active provider websocket."""
+        return self._running and self._ws is not None
+
     def _build_url(self) -> str:
         params = {
             "model": self._config.deepgram_model,
@@ -217,8 +222,12 @@ class DeepgramTranscriber:
             await asyncio.wait_for(asyncio.wrap_future(fut), timeout=15)
         except asyncio.TimeoutError:
             logger.error("Mic Deepgram connection timed out")
+            raise
         except Exception:
             logger.exception("Mic Deepgram connection failed")
+            raise
+        if not self._mic_stream.connected:
+            raise RuntimeError("Mic Deepgram connection failed")
 
     async def start_system_stream(self) -> None:
         """Start the system audio Deepgram stream (called when user selects device)."""
@@ -235,8 +244,12 @@ class DeepgramTranscriber:
             await asyncio.wait_for(asyncio.wrap_future(fut), timeout=15)
         except asyncio.TimeoutError:
             logger.error("System Deepgram connection timed out")
+            raise
         except Exception:
             logger.exception("System Deepgram connection failed")
+            raise
+        if not self._sys_stream.connected:
+            raise RuntimeError("System Deepgram connection failed")
 
     async def stop_system_stream(self) -> None:
         if self._sys_stream is not None:

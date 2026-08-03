@@ -15,6 +15,7 @@ from ai_assistant.core.events import EventBus
 from ai_assistant.runtime import (
     RuntimeConfigurationError,
     RuntimeService,
+    RuntimeStateError,
     SessionConfig,
     build_runtime,
 )
@@ -55,6 +56,9 @@ class FakeCapture:
         self.system_stop_calls = 0
         self.mic_devices: list[int | None] = []
         self.system_devices: list[int | None] = []
+        self.iteration_error: Exception | None = None
+        self.stop_entered: asyncio.Event | None = None
+        self.stop_release: asyncio.Event | None = None
         self._chunks: asyncio.Queue[tuple[str, bytes]] = asyncio.Queue()
 
     async def start(self) -> None:
@@ -63,6 +67,10 @@ class FakeCapture:
 
     async def stop(self) -> None:
         self.stop_calls += 1
+        if self.stop_entered is not None:
+            self.stop_entered.set()
+        if self.stop_release is not None:
+            await self.stop_release.wait()
         self.started = False
 
     def start_system_capture(self) -> None:
@@ -81,6 +89,8 @@ class FakeCapture:
         await self._chunks.put((source, chunk))
 
     async def __aiter__(self):
+        if self.iteration_error is not None:
+            raise self.iteration_error
         while True:
             yield await self._chunks.get()
 
@@ -158,6 +168,7 @@ class FakeOrchestrator:
         self.you_source = "mic"
         self.retriever = None
         self.query_calls: list[tuple[str | None, bool]] = []
+        self.cancel_pending_calls = 0
         self._transcript_buffer = FakeTranscriptBuffer(transcript)
 
     def set_listening(self, enabled: bool) -> None:
@@ -178,6 +189,9 @@ class FakeOrchestrator:
         full_transcript: bool = False,
     ) -> None:
         self.query_calls.append((explicit_query, full_transcript))
+
+    def cancel_pending(self) -> None:
+        self.cancel_pending_calls += 1
 
 
 class FakeVectorStore:
@@ -271,6 +285,28 @@ def test_stop_is_idempotent_and_stops_each_dependency_once() -> None:
     assert deps.transcriber.stop_calls == 1
 
 
+def test_failed_audio_pump_does_not_skip_remaining_cleanup() -> None:
+    async def scenario() -> tuple[RuntimeService, FakeRuntimeDependencies, FakeRetriever]:
+        retriever = FakeRetriever()
+        deps = _dependencies()
+        deps.capture.iteration_error = RuntimeError("audio pump failed")
+        deps.rag_factory = lambda: retriever
+        service = RuntimeService(deps)
+        await service.start_session(_session())
+        await _wait_for_knowledge(service)
+        await asyncio.sleep(0)
+
+        with pytest.raises(RuntimeError, match="audio pump failed"):
+            await service.stop_session()
+        return service, deps, retriever
+
+    service, deps, retriever = _run(scenario())
+    assert deps.capture.stop_calls == 1
+    assert deps.transcriber.stop_calls == 1
+    assert retriever.saved_to == [deps.config.rag_db_path]
+    assert service.snapshot().state == "error"
+
+
 def test_failed_partial_start_is_cleaned_up_and_stop_remains_idempotent() -> None:
     async def scenario() -> tuple[RuntimeService, FakeRuntimeDependencies]:
         deps = _dependencies()
@@ -285,7 +321,52 @@ def test_failed_partial_start_is_cleaned_up_and_stop_remains_idempotent() -> Non
     assert deps.transcriber.stop_calls == 1
     assert deps.capture.start_calls == 0
     assert deps.capture.stop_calls == 0
+    assert deps.orchestrator.listening is False
+    assert deps.orchestrator.cancel_pending_calls == 1
+    assert service.snapshot().state == "error"
+
+
+def test_stopping_blocks_new_async_operations_and_cancels_orchestrator() -> None:
+    async def scenario() -> tuple[RuntimeService, FakeRuntimeDependencies, FakeRetriever]:
+        retriever = FakeRetriever()
+        deps = _dependencies()
+        deps.rag_factory = lambda: retriever
+        deps.capture.stop_entered = asyncio.Event()
+        deps.capture.stop_release = asyncio.Event()
+        service = RuntimeService(deps)
+        await service.start_session(_session())
+        await _wait_for_knowledge(service)
+
+        stop_task = asyncio.create_task(service.stop_session())
+        await deps.capture.stop_entered.wait()
+        operation_tasks = [
+            asyncio.create_task(service.set_system_audio(True)),
+            asyncio.create_task(service.set_audio_device("mic", 9)),
+            asyncio.create_task(service.trigger_query("late query", "detail")),
+            asyncio.create_task(service.ingest_documents(["late.txt"])),
+        ]
+        await asyncio.sleep(0)
+
+        assert service.snapshot().state == "stopping"
+        assert deps.capture.system_start_calls == 0
+        assert deps.capture.mic_devices == []
+        assert deps.orchestrator.query_calls == []
+        assert retriever.ingested == []
+
+        deps.capture.stop_release.set()
+        await stop_task
+        for task in operation_tasks:
+            with pytest.raises(RuntimeStateError, match="No runtime session is active"):
+                await task
+        return service, deps, retriever
+
+    service, deps, retriever = _run(scenario())
     assert service.snapshot().state == "stopped"
+    assert deps.orchestrator.cancel_pending_calls == 1
+    assert deps.capture.system_start_calls == 0
+    assert deps.capture.mic_devices == []
+    assert deps.orchestrator.query_calls == []
+    assert retriever.ingested == []
 
 
 def test_device_and_role_switching_use_public_runtime_controls() -> None:
