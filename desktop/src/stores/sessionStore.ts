@@ -207,6 +207,7 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
         });
       },
       beginSession(session) {
+        seenEventIds.clear();
         set((state) => resetForSession(state, session));
       },
       endSession(status) {
@@ -215,7 +216,9 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
         }));
       },
       restoreSession(session) {
-        set((state) => state.session?.id === session.id
+        const restoresCurrentSession = get().session?.id === session.id;
+        if (!restoresCurrentSession) seenEventIds.clear();
+        set((state) => restoresCurrentSession
           ? { session, languages: languagesFromSession(session, state.languages.ui), lastError: null }
           : resetForSession(state, session));
       },
