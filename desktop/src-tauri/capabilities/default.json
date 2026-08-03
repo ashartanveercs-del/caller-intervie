@@ -5,6 +5,17 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "opener:default"
+    "opener:default",
+    {
+      "identifier": "shell:allow-spawn",
+      "allow": [
+        {
+          "name": "binaries/callerinterview-sidecar",
+          "sidecar": true,
+          "args": false
+        }
+      ]
+    },
+    "shell:allow-stdin-write"
   ]
 }

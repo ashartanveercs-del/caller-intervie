@@ -11,9 +11,9 @@ import sys
 from ai_assistant.config import Config
 from ai_assistant.runtime import build_runtime
 
-from .adapter import RuntimeProtocolAdapter
-from .protocol import PROTOCOL_VERSION
-from .transport import SidecarTransport
+from ai_assistant.sidecar.adapter import RuntimeProtocolAdapter
+from ai_assistant.sidecar.protocol import PROTOCOL_VERSION
+from ai_assistant.sidecar.transport import SidecarTransport
 
 
 def _configure_logging() -> None:
