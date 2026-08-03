@@ -206,7 +206,7 @@ describe("session store", () => {
     expect(store.getState().unresolvedSuggestionCorrelations).toEqual([]);
   });
 
-  it("restores replayed events idempotently and records only ambiguous replay associations", () => {
+  it("ignores duplicate replay within the same materialized session and records ambiguous associations", () => {
     const store = createSessionStore();
     activate(store);
     const first = question(ids.questionOne, "First question", 1);
@@ -350,7 +350,7 @@ describe("session store", () => {
     expect(store.getState().health.speechProvider).toMatchObject({ status: "degraded", message: "Reconnect" });
   });
 
-  it("clears prior session state and ignores late envelopes from a different session", () => {
+  it("ignores a late session A envelope while session B is active", () => {
     const store = createSessionStore();
     const sessionB = "018f0000-0000-7000-8000-000000000024";
     activate(store, ids.session);
@@ -368,5 +368,37 @@ describe("session store", () => {
 
     expect(store.getState().turns.map((turn) => turn.text)).toEqual(["Session B"]);
     expect(store.getState().session?.id).toBe(sessionB);
+  });
+
+  it("replays session A again after materializing session B", () => {
+    const store = createSessionStore();
+    const sessionA = ids.session;
+    const sessionB = "018f0000-0000-7000-8000-000000000025";
+    const timelineA = [
+      question(ids.questionOne, "A first turn", 40),
+      question(ids.questionTwo, "A second turn", 41),
+    ];
+
+    store.getState().restoreSession({
+      id: sessionA,
+      mode: "interview",
+      status: "active",
+      inputLanguage: "en",
+      responseLanguage: "ur",
+      reviewLanguage: "en",
+    });
+    store.getState().restoreReplay(timelineA);
+    activate(store, sessionB);
+    store.getState().restoreSession({
+      id: sessionA,
+      mode: "interview",
+      status: "active",
+      inputLanguage: "en",
+      responseLanguage: "ur",
+      reviewLanguage: "en",
+    });
+    store.getState().restoreReplay(timelineA);
+
+    expect(store.getState().turns.map((turn) => turn.text)).toEqual(["A first turn", "A second turn"]);
   });
 });
