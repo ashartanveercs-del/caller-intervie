@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import threading
 from pathlib import Path
 from uuid import uuid4
 
@@ -24,12 +25,16 @@ logger = logging.getLogger(__name__)
 
 
 def _application_shutdown_event(application) -> asyncio.Event:
-    """Translate Qt's quit signal into an asyncio event from any thread."""
+    """Best-effort translation of external Qt termination into asyncio."""
     loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
     shutdown_event = asyncio.Event()
 
     def _request_shutdown() -> None:
-        loop.call_soon_threadsafe(shutdown_event.set)
+        if threading.get_ident() == loop_thread:
+            shutdown_event.set()
+        else:
+            loop.call_soon_threadsafe(shutdown_event.set)
 
     application.aboutToQuit.connect(_request_shutdown)
     return shutdown_event
@@ -132,6 +137,8 @@ async def async_main() -> None:
     ui_app = AssistantApp()
     qt_app = ui_app.setup()
     shutdown_event = _application_shutdown_event(qt_app)
+    # Normal tray quit stays inside the combined Qt/async loop until cleanup is done.
+    ui_app.signals.quit_requested.connect(shutdown_event.set)
 
     async def _on_transcript(event) -> None:
         if ui_app.overlay is not None:

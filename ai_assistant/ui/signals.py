@@ -52,6 +52,9 @@ class AppSignals(QObject):
     # Status
     status_message = Signal(str)
 
+    # Application lifecycle
+    quit_requested = Signal()
+
     # High-level assistant state driving the header dot + status word.
     # One of: "loading", "listening", "composing", "paused", "error".
     assistant_state = Signal(str)

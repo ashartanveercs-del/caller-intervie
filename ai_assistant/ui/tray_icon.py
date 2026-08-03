@@ -6,7 +6,7 @@ import logging
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QActionGroup, QColor, QFont, QIcon, QPainter, QPixmap
-from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
+from PySide6.QtWidgets import QMenu, QSystemTrayIcon, QWidget
 
 from ai_assistant.ui import styles
 from ai_assistant.ui.signals import AppSignals
@@ -113,7 +113,7 @@ class TrayIcon(QSystemTrayIcon):
 
         # Quit
         quit_action = QAction("Quit", menu)
-        quit_action.triggered.connect(QApplication.quit)
+        quit_action.triggered.connect(self._signals.quit_requested.emit)
         menu.addAction(quit_action)
 
         self.setContextMenu(menu)
