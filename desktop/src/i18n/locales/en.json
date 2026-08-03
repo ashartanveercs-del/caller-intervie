@@ -1,0 +1,35 @@
+{
+  "app": {
+    "name": "CallerInterview",
+    "navigation": "Conversation modes",
+    "account": "Open account",
+    "accountTooltip": "Account",
+    "settings": "Open settings",
+    "settingsTooltip": "Settings"
+  },
+  "modes": {
+    "interview": "Interview",
+    "sales": "Sales",
+    "meeting": "Meeting",
+    "presentation": "Presentation"
+  },
+  "health": {
+    "connected": "Runtime connected"
+  },
+  "home": {
+    "title": "Interview workspace",
+    "description": "Prepare and run a structured interview session."
+  },
+  "prepare": {
+    "title": "Prepare {{mode}} session",
+    "description": "Set the session brief before going live."
+  },
+  "live": {
+    "title": "Live session",
+    "description": "The live conversation workspace will appear here."
+  },
+  "review": {
+    "title": "Session review",
+    "description": "The recorded session timeline will appear here."
+  }
+}

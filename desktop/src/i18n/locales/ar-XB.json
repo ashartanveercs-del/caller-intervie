@@ -1,0 +1,35 @@
+{
+  "app": {
+    "name": "[[ C~aall~erI~nte~rvie~w ]]",
+    "navigation": "[[ C~onve~rsat~ion m~odes ]]",
+    "account": "[[ O~pen a~ccou~nt ]]",
+    "accountTooltip": "[[ A~ccou~nt ]]",
+    "settings": "[[ O~pen s~etti~ngs ]]",
+    "settingsTooltip": "[[ S~etti~ngs ]]"
+  },
+  "modes": {
+    "interview": "[[ I~nte~rvie~w ]]",
+    "sales": "[[ S~ale~s ]]",
+    "meeting": "[[ M~eeti~ng ]]",
+    "presentation": "[[ P~rese~ntat~ion ]]"
+  },
+  "health": {
+    "connected": "[[ R~unti~me c~onne~cted ]]"
+  },
+  "home": {
+    "title": "[[ I~nte~rvie~w w~orks~pace ]]",
+    "description": "[[ P~repa~re a~nd r~un a s~truc~ture~d i~nte~rvie~w s~essi~on. ]]"
+  },
+  "prepare": {
+    "title": "[[ P~repa~re {{mode}} s~essi~on ]]",
+    "description": "[[ S~et t~he s~essi~on b~rief b~efor~e g~oing l~ive. ]]"
+  },
+  "live": {
+    "title": "[[ L~ive s~essi~on ]]",
+    "description": "[[ T~he l~ive c~onve~rsat~ion w~orks~pace w~ill a~ppea~r h~ere. ]]"
+  },
+  "review": {
+    "title": "[[ S~essi~on r~evie~w ]]",
+    "description": "[[ T~he r~ecor~ded s~essi~on t~imel~ine w~ill a~ppea~r h~ere. ]]"
+  }
+}

@@ -1,12 +1,6 @@
+import { RouterProvider } from "react-router-dom";
+import { router } from "./router";
+
 export function App() {
-  return (
-    <main>
-      <h1>CallerInterview</h1>
-      <nav aria-label="Conversation modes">
-        <a href="/" aria-current="page">
-          Interview
-        </a>
-      </nav>
-    </main>
-  );
+  return <RouterProvider router={router} />;
 }

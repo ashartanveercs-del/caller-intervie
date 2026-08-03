@@ -1,0 +1,31 @@
+:root {
+  --color-ink: #1d2733;
+  --color-ink-muted: #64707d;
+  --color-surface: #ffffff;
+  --color-surface-muted: #f4f6f8;
+  --color-canvas: #edf1f4;
+  --color-border: #d3d9df;
+  --color-action: #2563a7;
+  --color-action-strong: #1f5289;
+  --color-healthy: #2f7d52;
+  --color-degraded: #a56a12;
+  --color-error: #b84242;
+
+  --radius-small: 4px;
+  --radius-medium: 6px;
+  --radius-large: 8px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+
+  --toolbar-height: 56px;
+  --live-question-height: 168px;
+  --status-height: 32px;
+
+  font-family: Inter, "Segoe UI", system-ui, sans-serif;
+  letter-spacing: 0;
+}

@@ -1,0 +1,227 @@
+@import "./tokens.css";
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  background: var(--color-canvas);
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  color: var(--color-ink);
+  background: var(--color-canvas);
+  font-family: inherit;
+  letter-spacing: 0;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  letter-spacing: 0;
+}
+
+button:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--color-action);
+  outline-offset: 2px;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+.app-shell {
+  display: grid;
+  min-block-size: 100vh;
+  grid-template-rows: var(--toolbar-height) minmax(0, 1fr) var(--status-height);
+}
+
+.app-shell__topbar {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-5);
+  padding: 0 var(--space-4);
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-surface);
+}
+
+.app-shell__brand {
+  flex: 0 0 auto;
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.app-shell__modes {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  align-self: stretch;
+  overflow-x: auto;
+}
+
+.app-shell__mode-link {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 var(--space-3);
+  color: var(--color-ink-muted);
+  border-bottom: 2px solid transparent;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.app-shell__mode-link:hover {
+  color: var(--color-ink);
+  background: var(--color-surface-muted);
+}
+
+.app-shell__mode-link[aria-current="page"] {
+  color: var(--color-action-strong);
+  border-bottom-color: var(--color-action);
+  font-weight: 600;
+}
+
+.app-shell__actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: var(--space-1);
+}
+
+.icon-button {
+  position: relative;
+  display: inline-flex;
+}
+
+.icon-button__control {
+  display: inline-grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  padding: 0;
+  color: var(--color-ink-muted);
+  border: 1px solid transparent;
+  border-radius: var(--radius-small);
+  background: transparent;
+  cursor: pointer;
+}
+
+.icon-button__control:hover:not(:disabled),
+.icon-button__control[aria-pressed="true"] {
+  color: var(--color-ink);
+  border-color: var(--color-border);
+  background: var(--color-surface-muted);
+}
+
+.icon-button__control:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.icon-button__tooltip {
+  position: absolute;
+  z-index: 1;
+  top: calc(100% + var(--space-2));
+  right: 0;
+  width: max-content;
+  max-width: 200px;
+  padding: var(--space-1) var(--space-2);
+  color: var(--color-surface);
+  border-radius: var(--radius-small);
+  background: var(--color-ink);
+  font-size: 0.75rem;
+  line-height: 1.25;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-2px);
+  transition: opacity 120ms ease, transform 120ms ease;
+}
+
+.icon-button:hover .icon-button__tooltip,
+.icon-button:focus-within .icon-button__tooltip {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.app-shell__content {
+  min-height: 0;
+  overflow: auto;
+  padding: var(--space-6);
+}
+
+.route-view {
+  max-width: 760px;
+}
+
+.route-view h2 {
+  margin: 0 0 var(--space-2);
+  font-size: 1.25rem;
+}
+
+.route-view p {
+  max-width: 62ch;
+  margin: 0;
+  color: var(--color-ink-muted);
+  line-height: 1.5;
+}
+
+.app-shell__statusbar {
+  display: flex;
+  align-items: center;
+  padding: 0 var(--space-4);
+  border-top: 1px solid var(--color-border);
+  background: var(--color-surface);
+}
+
+.health-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--color-ink-muted);
+  font-size: 0.8125rem;
+}
+
+.health-indicator__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.health-indicator--healthy {
+  color: var(--color-healthy);
+}
+
+.health-indicator--degraded {
+  color: var(--color-degraded);
+}
+
+.health-indicator--error {
+  color: var(--color-error);
+}
+
+@media (max-width: 720px) {
+  .app-shell__topbar {
+    gap: var(--space-2);
+    padding-inline: var(--space-2);
+  }
+
+  .app-shell__brand {
+    font-size: 0.875rem;
+  }
+
+  .app-shell__mode-link {
+    padding-inline: var(--space-2);
+  }
+
+  .app-shell__content {
+    padding: var(--space-4);
+  }
+}
