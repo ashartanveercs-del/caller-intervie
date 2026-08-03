@@ -34,6 +34,9 @@ class TranscriptEvent:
     confidence: float = 0.0
     timestamp: float = field(default_factory=time.time)
     source: str = "mic"  # "mic" = you, "system" = interviewer
+    language: Optional[str] = None
+    started_at_ms: Optional[int] = None
+    ended_at_ms: Optional[int] = None
 
 
 @dataclass
