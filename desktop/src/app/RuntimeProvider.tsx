@@ -19,6 +19,12 @@ type SubscriptionLifecycle = {
   ready: Promise<void>;
 };
 
+type RestoreLifecycle = {
+  users: number;
+  releaseTimer: ReturnType<typeof setTimeout> | null;
+  version: number;
+};
+
 const RuntimeContext = createContext<RuntimeContextValue | null>(null);
 
 export type RuntimeProviderProps = {
@@ -30,6 +36,7 @@ export function RuntimeProvider({ children, platform: suppliedPlatform }: Runtim
   const platformRef = useRef<PlatformApi | null>(null);
   const storeRef = useRef<StoreApi<SessionStoreState> | null>(null);
   const lifecycleRef = useRef<SubscriptionLifecycle | null>(null);
+  const restoreLifecycleRef = useRef<RestoreLifecycle | null>(null);
   const startedRef = useRef(false);
 
   if (!platformRef.current) {
@@ -43,25 +50,50 @@ export function RuntimeProvider({ children, platform: suppliedPlatform }: Runtim
   const store = storeRef.current;
 
   useEffect(() => {
+    let lifecycle = restoreLifecycleRef.current;
+    if (!lifecycle) {
+      lifecycle = { users: 0, releaseTimer: null, version: 0 };
+      restoreLifecycleRef.current = lifecycle;
+    }
+    lifecycle.users += 1;
+    if (lifecycle.releaseTimer !== null) {
+      clearTimeout(lifecycle.releaseTimer);
+      lifecycle.releaseTimer = null;
+    }
     if (startedRef.current) {
-      return;
+      return () => releaseRestoreLifecycle(lifecycle!, restoreLifecycleRef);
     }
     startedRef.current = true;
+    const restoreVersion = ++lifecycle.version;
+    const restoreRevision = store.getState().sessionRevision;
+    const isCurrent = () => lifecycle!.users > 0 && lifecycle!.version === restoreVersion;
 
     void platform.sidecarStatus()
-      .then(store.getState().setSidecarStatus)
-      .catch(store.getState().recordError);
+      .then((status) => {
+        if (isCurrent()) store.getState().setSidecarStatus(status);
+      })
+      .catch((error) => {
+        if (isCurrent()) store.getState().recordError(error);
+      });
 
     void platform.restoreActiveSession()
       .then(async (session) => {
-        if (!session) {
+        if (!session || !isCurrent() || store.getState().sessionRevision !== restoreRevision || store.getState().session) {
           return;
         }
         store.getState().restoreSession(session);
+        const restoredRevision = store.getState().sessionRevision;
         const timeline = await platform.getTimeline(session.id);
+        if (!isCurrent() || store.getState().session?.id !== session.id || store.getState().sessionRevision !== restoredRevision) {
+          return;
+        }
         store.getState().restoreReplay(timeline);
       })
-      .catch(store.getState().recordError);
+      .catch((error) => {
+        if (isCurrent()) store.getState().recordError(error);
+      });
+
+    return () => releaseRestoreLifecycle(lifecycle!, restoreLifecycleRef);
   }, [platform, store]);
 
   useEffect(() => {
@@ -135,6 +167,19 @@ export function RuntimeProvider({ children, platform: suppliedPlatform }: Runtim
   const value = useMemo<RuntimeContextValue>(() => ({ platform, store, send, restart }), [platform, restart, send, store]);
 
   return <RuntimeContext.Provider value={value}>{children}</RuntimeContext.Provider>;
+}
+
+function releaseRestoreLifecycle(
+  lifecycle: RestoreLifecycle,
+  reference: { current: RestoreLifecycle | null },
+) {
+  lifecycle.users -= 1;
+  if (lifecycle.users !== 0) return;
+  lifecycle.releaseTimer = setTimeout(() => {
+    if (lifecycle.users !== 0) return;
+    lifecycle.version += 1;
+    reference.current = null;
+  }, 0);
 }
 
 export function useRuntime(): RuntimeContextValue {

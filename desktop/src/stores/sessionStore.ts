@@ -38,16 +38,31 @@ export type Suggestion = {
   id: string;
   text: string;
   isComplete: boolean;
+  durability: "transient" | "durable";
   correlationId: string | null;
   turnId?: string;
+  eventId: string;
+  sessionId: string | null;
+  sequence: number;
+  timestampMs: number;
+  payload: Record<string, unknown>;
+};
+
+export type UnresolvedCompletedSuggestion = Suggestion & {
+  isComplete: true;
+  durability: "durable";
+  associationReason: "missing-request-association" | "ambiguous-replay";
 };
 
 export type SessionStoreState = {
   session: SessionRecord | null;
+  sessionRevision: number;
   turns: TranscriptTurn[];
   partialTurnsById: Record<string, TranscriptTurn>;
   suggestionsByTurn: Record<string, Suggestion>;
-  partialSuggestionsByCorrelation: Record<string, Suggestion>;
+  partialSuggestionsById: Record<string, Suggestion>;
+  partialSuggestionIdByCorrelation: Record<string, string>;
+  unresolvedCompletedSuggestionsById: Record<string, UnresolvedCompletedSuggestion>;
   requestToTurn: Record<string, string>;
   unresolvedSuggestionCorrelations: string[];
   health: RuntimeHealth;
@@ -56,6 +71,7 @@ export type SessionStoreState = {
   lastSequence: number;
   lastError: string | null;
   applyEnvelope(value: unknown): void;
+  applyPersistedEnvelope(value: unknown): void;
   associateRequestWithTurn(requestId: string, turnId: string): void;
   beginSession(session: SessionRecord): void;
   endSession(status: "completed" | "interrupted"): void;
@@ -66,6 +82,8 @@ export type SessionStoreState = {
   setSidecarStatus(status: SidecarStatus): void;
   recordError(error: unknown): void;
 };
+
+type IngestionSource = "live" | "persisted";
 
 const initialLanguages: SessionLanguages = { ui: "en", input: "en", response: "en", review: "en" };
 
@@ -83,7 +101,7 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
   const seenEventIds = new Set<string>();
 
   return createStore<SessionStoreState>((set, get) => {
-    const applyEnvelope = (value: unknown, replay = false) => {
+    const ingest = (value: unknown, source: IngestionSource) => {
       let envelope: Envelope;
       try {
         envelope = decodeEnvelope(value);
@@ -91,35 +109,36 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
         get().recordError(error);
         return;
       }
-
-      const current = get();
-      if (seenEventIds.has(envelope.id)) {
+      if (!acceptsEnvelope(get(), envelope) || seenEventIds.has(envelope.id)) {
         return;
       }
-      if (!replay && envelope.kind !== EventKind.SIDECAR_READY && envelope.sequence <= current.lastSequence) {
+      if (source === "live" && envelope.kind !== EventKind.SIDECAR_READY && envelope.sequence <= get().lastSequence) {
         return;
       }
 
       seenEventIds.add(envelope.id);
-      const nextSequence = envelope.kind === EventKind.SIDECAR_READY ? envelope.sequence : Math.max(current.lastSequence, envelope.sequence);
-      set({ lastSequence: nextSequence });
+      if (source === "live") {
+        set({ lastSequence: envelope.sequence });
+      }
 
       switch (envelope.kind) {
         case EventKind.SIDECAR_READY:
-          set((state) => ({
-            sidecarGeneration: state.sidecarGeneration + 1,
-            lastSequence: envelope.sequence,
-            health: { ...state.health, sidecar: { status: "ready" } },
-          }));
+          if (source === "live") {
+            set((state) => ({
+              sidecarGeneration: state.sidecarGeneration + 1,
+              lastSequence: envelope.sequence,
+              health: { ...state.health, sidecar: { status: "ready" } },
+            }));
+          }
           return;
         case EventKind.TRANSCRIPT_UPDATED:
           applyTranscript(get, set, envelope);
           return;
         case EventKind.SUGGESTION_CHUNK:
-          applySuggestion(get, set, envelope, false, replay);
+          applySuggestion(get, set, envelope, false, source);
           return;
         case EventKind.SUGGESTION_COMPLETED:
-          applySuggestion(get, set, envelope, true, replay);
+          applySuggestion(get, set, envelope, true, source);
           return;
         case EventKind.AUDIO_HEALTH:
         case EventKind.PROVIDER_HEALTH:
@@ -138,10 +157,13 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
 
     return {
       session: null,
+      sessionRevision: 0,
       turns: [],
       partialTurnsById: {},
       suggestionsByTurn: {},
-      partialSuggestionsByCorrelation: {},
+      partialSuggestionsById: {},
+      partialSuggestionIdByCorrelation: {},
+      unresolvedCompletedSuggestionsById: {},
       requestToTurn: {},
       unresolvedSuggestionCorrelations: [],
       health: unknownHealth(),
@@ -149,29 +171,43 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
       sidecarGeneration: 0,
       lastSequence: -1,
       lastError: null,
-      applyEnvelope,
+      applyEnvelope(value) {
+        ingest(value, "live");
+      },
+      applyPersistedEnvelope(value) {
+        ingest(value, "persisted");
+      },
       associateRequestWithTurn(requestId, turnId) {
         set((state) => {
-          const partial = state.partialSuggestionsByCorrelation[requestId];
-          const partialSuggestionsByCorrelation = { ...state.partialSuggestionsByCorrelation };
-          if (partial) {
-            delete partialSuggestionsByCorrelation[requestId];
+          const unresolved = Object.values(state.unresolvedCompletedSuggestionsById)
+            .filter((suggestion) => suggestion.correlationId === requestId)
+            .sort((left, right) => left.sequence - right.sequence);
+          const unresolvedCompletedSuggestionsById = { ...state.unresolvedCompletedSuggestionsById };
+          const partialSuggestionsById = { ...state.partialSuggestionsById };
+          const partialSuggestionIdByCorrelation = { ...state.partialSuggestionIdByCorrelation };
+          let suggestionsByTurn = state.suggestionsByTurn;
+          for (const suggestion of unresolved) {
+            delete unresolvedCompletedSuggestionsById[suggestion.id];
+            delete partialSuggestionsById[suggestion.id];
+            if (suggestion.correlationId) delete partialSuggestionIdByCorrelation[suggestion.correlationId];
+            suggestionsByTurn = {
+              ...suggestionsByTurn,
+              [turnId]: resolvedSuggestion(suggestion, turnId),
+            };
           }
           return {
             requestToTurn: { ...state.requestToTurn, [requestId]: turnId },
-            partialSuggestionsByCorrelation,
-            suggestionsByTurn: partial
-              ? { ...state.suggestionsByTurn, [turnId]: { ...partial, turnId } }
-              : state.suggestionsByTurn,
+            partialSuggestionsById,
+            partialSuggestionIdByCorrelation,
+            unresolvedCompletedSuggestionsById,
+            unresolvedSuggestionCorrelations: Object.values(unresolvedCompletedSuggestionsById)
+              .flatMap((suggestion) => suggestion.correlationId ? [suggestion.correlationId] : []),
+            suggestionsByTurn,
           };
         });
       },
       beginSession(session) {
-        set({
-          session,
-          languages: languagesFromSession(session, get().languages.ui),
-          lastError: null,
-        });
+        set((state) => resetForSession(state, session));
       },
       endSession(status) {
         set((state) => ({
@@ -179,19 +215,21 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
         }));
       },
       restoreSession(session) {
-        get().beginSession(session);
+        set((state) => state.session?.id === session.id
+          ? { session, languages: languagesFromSession(session, state.languages.ui), lastError: null }
+          : resetForSession(state, session));
       },
       restoreReplay(events) {
         for (const event of [...events].sort(compareChronologically)) {
-          applyEnvelope(event, true);
+          ingest(event, "persisted");
         }
       },
       clearTransientState() {
         set((state) => ({
           partialTurnsById: {},
-          partialSuggestionsByCorrelation: {},
+          partialSuggestionsById: {},
+          partialSuggestionIdByCorrelation: {},
           requestToTurn: {},
-          unresolvedSuggestionCorrelations: [],
           health: { ...unknownHealth(), sidecar: { status: "pending" } },
           sidecarGeneration: state.sidecarGeneration + 1,
           lastSequence: -1,
@@ -203,7 +241,10 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
       },
       setSidecarStatus(status) {
         set((state) => ({
-          health: { ...state.health, sidecar: { status: sidecarHealth(status.state), message: status.diagnostics[0] } },
+          health: {
+            ...state.health,
+            sidecar: { status: sidecarHealth(status.state), message: status.diagnostics[0] },
+          },
         }));
       },
       recordError(error) {
@@ -211,6 +252,33 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
       },
     };
   });
+}
+
+function acceptsEnvelope(state: SessionStoreState, envelope: Envelope): boolean {
+  if (envelope.session_id === null) {
+    return envelope.kind === EventKind.SIDECAR_READY
+      || envelope.kind === EventKind.AUDIO_HEALTH
+      || envelope.kind === EventKind.PROVIDER_HEALTH
+      || envelope.kind === EventKind.RUNTIME_ERROR;
+  }
+  return envelope.kind !== EventKind.SIDECAR_READY && state.session?.id === envelope.session_id;
+}
+
+function resetForSession(state: SessionStoreState, session: SessionRecord): Partial<SessionStoreState> {
+  return {
+    session,
+    sessionRevision: state.sessionRevision + 1,
+    turns: [],
+    partialTurnsById: {},
+    suggestionsByTurn: {},
+    partialSuggestionsById: {},
+    partialSuggestionIdByCorrelation: {},
+    unresolvedCompletedSuggestionsById: {},
+    requestToTurn: {},
+    unresolvedSuggestionCorrelations: [],
+    languages: languagesFromSession(session, state.languages.ui),
+    lastError: null,
+  };
 }
 
 function applyTranscript(
@@ -233,7 +301,6 @@ function applyTranscript(
     language: stringPayload(envelope.payload, "language"),
     sequence: envelope.sequence,
   };
-
   set((state) => {
     if (!turn.isFinal) {
       return { partialTurnsById: { ...state.partialTurnsById, [turn.id]: turn } };
@@ -241,10 +308,12 @@ function applyTranscript(
     const partialTurnsById = { ...state.partialTurnsById };
     delete partialTurnsById[turn.id];
     const position = state.turns.findIndex((item) => item.id === turn.id);
-    const turns = position === -1
-      ? [...state.turns, turn]
-      : state.turns.map((item, index) => (index === position ? turn : item));
-    return { turns, partialTurnsById };
+    return {
+      turns: position === -1
+        ? [...state.turns, turn]
+        : state.turns.map((item, index) => index === position ? turn : item),
+      partialTurnsById,
+    };
   });
 }
 
@@ -253,63 +322,126 @@ function applySuggestion(
   set: StoreApi<SessionStoreState>["setState"],
   envelope: Envelope,
   isComplete: boolean,
-  replay: boolean,
+  source: IngestionSource,
 ) {
   const suggestionId = stringPayload(envelope.payload, "suggestion_id");
-  const text = stringPayload(envelope.payload, "text");
-  if (!suggestionId || text === undefined) {
+  const delta = stringPayload(envelope.payload, "text");
+  if (!suggestionId || delta === undefined) {
     get().recordError(`${envelope.kind} payload is missing suggestion_id or text`);
     return;
   }
-  const correlationId = envelope.correlation_id;
   const state = get();
-  const turnId = correlationId ? state.requestToTurn[correlationId] : undefined;
-  const replayTurnId = !turnId && replay ? deriveReplayTurnId(state) : undefined;
-  const association = turnId ?? replayTurnId;
+  if (!isComplete && hasCompletedSuggestion(state, suggestionId)) {
+    return;
+  }
+  const correlationId = envelope.correlation_id;
+  const associatedTurnId = correlationId ? state.requestToTurn[correlationId] : undefined;
+  const replayTurnId = !associatedTurnId && source === "persisted" ? deriveReplayTurnId(state) : undefined;
+  const turnId = associatedTurnId ?? replayTurnId;
+  const prior = state.partialSuggestionsById[suggestionId];
   const suggestion: Suggestion = {
     id: suggestionId,
-    text,
+    text: isComplete ? delta : `${prior?.text ?? ""}${delta}`,
     isComplete,
+    durability: isComplete ? "durable" : "transient",
     correlationId,
-    turnId: association,
+    turnId,
+    eventId: envelope.id,
+    sessionId: envelope.session_id,
+    sequence: envelope.sequence,
+    timestampMs: envelope.timestamp_ms,
+    payload: { ...envelope.payload },
   };
 
-  if (association) {
-    set((current) => {
-      const prior = current.suggestionsByTurn[association];
-      if (!isComplete && prior?.isComplete) {
-        return {};
-      }
-      return {
-        suggestionsByTurn: { ...current.suggestionsByTurn, [association]: suggestion },
-      };
-    });
+  if (!isComplete) {
+    set((current) => ({
+      partialSuggestionsById: { ...current.partialSuggestionsById, [suggestionId]: suggestion },
+      partialSuggestionIdByCorrelation: correlationId
+        ? { ...current.partialSuggestionIdByCorrelation, [correlationId]: suggestionId }
+        : current.partialSuggestionIdByCorrelation,
+    }));
     return;
   }
 
-  if (correlationId) {
-    set((current) => ({
-      partialSuggestionsByCorrelation: isComplete
-        ? current.partialSuggestionsByCorrelation
-        : { ...current.partialSuggestionsByCorrelation, [correlationId]: suggestion },
-      unresolvedSuggestionCorrelations: isComplete && !current.unresolvedSuggestionCorrelations.includes(correlationId)
-        ? [...current.unresolvedSuggestionCorrelations, correlationId]
-        : current.unresolvedSuggestionCorrelations,
-    }));
+  if (turnId) {
+    set((current) => removePartialAndStoreCompleted(current, suggestion, turnId));
+    return;
   }
+
+  const unresolved: UnresolvedCompletedSuggestion = {
+    ...suggestion,
+    isComplete: true,
+    durability: "durable",
+    associationReason: source === "persisted" ? "ambiguous-replay" : "missing-request-association",
+  };
+  set((current) => {
+    const partialSuggestionsById = { ...current.partialSuggestionsById };
+    const partialSuggestionIdByCorrelation = { ...current.partialSuggestionIdByCorrelation };
+    delete partialSuggestionsById[suggestionId];
+    if (correlationId) delete partialSuggestionIdByCorrelation[correlationId];
+    const unresolvedCompletedSuggestionsById = {
+      ...current.unresolvedCompletedSuggestionsById,
+      [suggestionId]: unresolved,
+    };
+    return {
+      partialSuggestionsById,
+      partialSuggestionIdByCorrelation,
+      unresolvedCompletedSuggestionsById,
+      unresolvedSuggestionCorrelations: Object.values(unresolvedCompletedSuggestionsById)
+        .flatMap((item) => item.correlationId ? [item.correlationId] : []),
+    };
+  });
+}
+
+function removePartialAndStoreCompleted(
+  state: SessionStoreState,
+  suggestion: Suggestion,
+  turnId: string,
+): Partial<SessionStoreState> {
+  const partialSuggestionsById = { ...state.partialSuggestionsById };
+  const partialSuggestionIdByCorrelation = { ...state.partialSuggestionIdByCorrelation };
+  delete partialSuggestionsById[suggestion.id];
+  if (suggestion.correlationId) delete partialSuggestionIdByCorrelation[suggestion.correlationId];
+  return {
+    partialSuggestionsById,
+    partialSuggestionIdByCorrelation,
+    suggestionsByTurn: { ...state.suggestionsByTurn, [turnId]: { ...suggestion, turnId } },
+  };
+}
+
+function resolvedSuggestion(suggestion: UnresolvedCompletedSuggestion, turnId: string): Suggestion {
+  return {
+    id: suggestion.id,
+    text: suggestion.text,
+    isComplete: true,
+    durability: "durable",
+    correlationId: suggestion.correlationId,
+    turnId,
+    eventId: suggestion.eventId,
+    sessionId: suggestion.sessionId,
+    sequence: suggestion.sequence,
+    timestampMs: suggestion.timestampMs,
+    payload: suggestion.payload,
+  };
+}
+
+function hasCompletedSuggestion(state: SessionStoreState, suggestionId: string): boolean {
+  return Object.values(state.suggestionsByTurn).some((suggestion) => suggestion.id === suggestionId)
+    || suggestionId in state.unresolvedCompletedSuggestionsById;
 }
 
 function deriveReplayTurnId(state: SessionStoreState): string | undefined {
-  const candidates = state.turns.filter((turn) => !state.suggestionsByTurn[turn.id]);
+  const candidates = state.turns.filter((turn) =>
+    turn.speakerRole === "interviewer" && !state.suggestionsByTurn[turn.id]);
   return candidates.length === 1 ? candidates[0].id : undefined;
 }
 
 function applyHealth(set: StoreApi<SessionStoreState>["setState"], envelope: Envelope) {
-  const dependency = healthKey(stringPayload(envelope.payload, "dependency"));
+  const dependency = envelope.kind === EventKind.AUDIO_HEALTH
+    ? audioHealthKey(stringPayload(envelope.payload, "source"))
+    : providerHealthKey(stringPayload(envelope.payload, "provider"));
+  if (!dependency) return;
   const status = healthStatus(stringPayload(envelope.payload, "status"));
-  if (!dependency || !status) {
-    return;
-  }
   const message = stringPayload(envelope.payload, "message");
   set((state) => ({
     health: { ...state.health, [dependency]: message ? { status, message } : { status } },
@@ -323,16 +455,13 @@ function applySessionState(
 ) {
   const current = get();
   const state = sessionStatus(stringPayload(envelope.payload, "state"));
-  const input = stringPayload(envelope.payload, "input_language");
-  const response = stringPayload(envelope.payload, "response_language");
-  const review = stringPayload(envelope.payload, "review_language");
   set({
     session: current.session && state ? { ...current.session, status: state } : current.session,
     languages: {
       ui: current.languages.ui,
-      input: input ?? current.languages.input,
-      response: response ?? current.languages.response,
-      review: review ?? current.languages.review,
+      input: stringPayload(envelope.payload, "input_language") ?? current.languages.input,
+      response: stringPayload(envelope.payload, "response_language") ?? current.languages.response,
+      review: stringPayload(envelope.payload, "review_language") ?? current.languages.review,
     },
   });
 }
@@ -355,21 +484,30 @@ function booleanPayload(payload: Record<string, unknown>, key: string): boolean 
   return payload[key] === true;
 }
 
-function healthKey(value: string | undefined): keyof RuntimeHealth | undefined {
-  switch (value) {
-    case "sidecar": return "sidecar";
-    case "microphone": return "microphone";
-    case "system_audio": return "systemAudio";
-    case "speech_provider": return "speechProvider";
-    case "model_provider": return "modelProvider";
-    default: return undefined;
-  }
+function audioHealthKey(value: string | undefined): keyof RuntimeHealth | undefined {
+  return value === "mic" ? "microphone" : value === "system" ? "systemAudio" : undefined;
 }
 
-function healthStatus(value: string | undefined): RuntimeHealthStatus | undefined {
-  return value === "unknown" || value === "pending" || value === "ready" || value === "degraded" || value === "error" || value === "offline"
-    ? value
-    : undefined;
+function providerHealthKey(value: string | undefined): keyof RuntimeHealth | undefined {
+  return value === "speech" ? "speechProvider" : value === "model" ? "modelProvider" : undefined;
+}
+
+function healthStatus(value: string | undefined): RuntimeHealthStatus {
+  switch (value) {
+    case "ready":
+    case "healthy":
+    case "ok": return "ready";
+    case "starting":
+    case "restarting":
+    case "pending": return "pending";
+    case "degraded": return "degraded";
+    case "failed":
+    case "error": return "error";
+    case "stopped":
+    case "offline":
+    case "unavailable": return "offline";
+    default: return "unknown";
+  }
 }
 
 function sessionStatus(value: string | undefined): SessionStatus | undefined {
@@ -389,13 +527,21 @@ function sidecarHealth(state: SidecarStatus["state"]): RuntimeHealthStatus {
 function compareChronologically(left: unknown, right: unknown): number {
   const leftTimestamp = timestampOf(left);
   const rightTimestamp = timestampOf(right);
-  return leftTimestamp - rightTimestamp;
+  return leftTimestamp === rightTimestamp ? sequenceOf(left) - sequenceOf(right) : leftTimestamp - rightTimestamp;
 }
 
 function timestampOf(value: unknown): number {
-  return typeof value === "object" && value !== null && "timestamp_ms" in value && typeof value.timestamp_ms === "number"
-    ? value.timestamp_ms
-    : Number.MAX_SAFE_INTEGER;
+  return objectNumber(value, "timestamp_ms") ?? Number.MAX_SAFE_INTEGER;
+}
+
+function sequenceOf(value: unknown): number {
+  return objectNumber(value, "sequence") ?? Number.MAX_SAFE_INTEGER;
+}
+
+function objectNumber(value: unknown, key: string): number | undefined {
+  if (typeof value !== "object" || value === null || !(key in value)) return undefined;
+  const candidate = (value as Record<string, unknown>)[key];
+  return typeof candidate === "number" ? candidate : undefined;
 }
 
 function errorMessage(error: unknown): string {
