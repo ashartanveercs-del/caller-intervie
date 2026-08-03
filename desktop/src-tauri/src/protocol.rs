@@ -144,20 +144,14 @@ pub enum EventKind {
     TranscriptUpdated,
     #[serde(rename = "suggestion.chunk")]
     SuggestionChunk,
-    #[serde(rename = "suggestion.started")]
-    SuggestionStarted,
     #[serde(rename = "suggestion.completed")]
     SuggestionCompleted,
-    #[serde(rename = "suggestion.error")]
-    SuggestionError,
     #[serde(rename = "audio.health")]
     AudioHealth,
     #[serde(rename = "provider.health")]
     ProviderHealth,
     #[serde(rename = "knowledge.state")]
     KnowledgeState,
-    #[serde(rename = "rag.status")]
-    RagStatus,
     #[serde(rename = "runtime.error")]
     RuntimeError,
 }
@@ -185,13 +179,10 @@ impl ProtocolKind {
             Self::Event(EventKind::SessionState) => "session.state",
             Self::Event(EventKind::TranscriptUpdated) => "transcript.updated",
             Self::Event(EventKind::SuggestionChunk) => "suggestion.chunk",
-            Self::Event(EventKind::SuggestionStarted) => "suggestion.started",
             Self::Event(EventKind::SuggestionCompleted) => "suggestion.completed",
-            Self::Event(EventKind::SuggestionError) => "suggestion.error",
             Self::Event(EventKind::AudioHealth) => "audio.health",
             Self::Event(EventKind::ProviderHealth) => "provider.health",
             Self::Event(EventKind::KnowledgeState) => "knowledge.state",
-            Self::Event(EventKind::RagStatus) => "rag.status",
             Self::Event(EventKind::RuntimeError) => "runtime.error",
         }
     }
@@ -239,13 +230,10 @@ impl<'de> Deserialize<'de> for ProtocolKind {
             "session.state" => EventKind::SessionState.into(),
             "transcript.updated" => EventKind::TranscriptUpdated.into(),
             "suggestion.chunk" => EventKind::SuggestionChunk.into(),
-            "suggestion.started" => EventKind::SuggestionStarted.into(),
             "suggestion.completed" => EventKind::SuggestionCompleted.into(),
-            "suggestion.error" => EventKind::SuggestionError.into(),
             "audio.health" => EventKind::AudioHealth.into(),
             "provider.health" => EventKind::ProviderHealth.into(),
             "knowledge.state" => EventKind::KnowledgeState.into(),
-            "rag.status" => EventKind::RagStatus.into(),
             "runtime.error" => EventKind::RuntimeError.into(),
             _ => return Err(de::Error::custom("kind must be a known namespaced string")),
         };
@@ -521,30 +509,11 @@ pub fn validate_event(event: &Envelope) -> Result<(), CommandValidationError> {
                 && required_safe_integer(&event.payload, "started_at_ms")
                 && required_safe_integer(&event.payload, "ended_at_ms")
         }
-        EventKind::SuggestionStarted => {
-            event.session_id.is_some()
-                && has_exact_keys(&event.payload, &["suggestion_id"])
-                && required_uuid_value(&event.payload, "suggestion_id")
-        }
         EventKind::SuggestionChunk | EventKind::SuggestionCompleted => {
             event.session_id.is_some()
                 && has_exact_keys(&event.payload, &["suggestion_id", "text"])
                 && required_uuid_value(&event.payload, "suggestion_id")
                 && required_bounded_string(&event.payload, "text")
-        }
-        EventKind::SuggestionError => {
-            event.session_id.is_some()
-                && has_exact_keys(
-                    &event.payload,
-                    &["suggestion_id", "code", "message", "recoverable"],
-                )
-                && required_uuid_value(&event.payload, "suggestion_id")
-                && required_bounded_string(&event.payload, "code")
-                && required_bounded_string(&event.payload, "message")
-                && event
-                    .payload
-                    .get("recoverable")
-                    .is_some_and(Value::is_boolean)
         }
         EventKind::AudioHealth => {
             has_exact_keys(&event.payload, &["source", "status", "message"])
@@ -558,7 +527,7 @@ pub fn validate_event(event: &Envelope) -> Result<(), CommandValidationError> {
                 && required_bounded_string(&event.payload, "status")
                 && optional_bounded_string(&event.payload, "message")
         }
-        EventKind::KnowledgeState | EventKind::RagStatus => {
+        EventKind::KnowledgeState => {
             event.session_id.is_some()
                 && has_exact_keys(
                     &event.payload,
@@ -640,10 +609,91 @@ fn required_safe_integer(payload: &Map<String, Value>, key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{
-        encode_frame, Envelope, EventKind, FrameDecoder, MAX_FRAME_BYTES, MAX_SAFE_INTEGER,
-        PROTOCOL_VERSION,
+        encode_frame, Envelope, EventKind, FrameDecoder, ProtocolKind, MAX_FRAME_BYTES,
+        MAX_SAFE_INTEGER, PROTOCOL_VERSION,
     };
+
+    fn enum_values(source: &str, enum_name: &str) -> BTreeSet<String> {
+        source
+            .split_once(enum_name)
+            .expect("enum must exist")
+            .1
+            .split_once('}')
+            .expect("enum must close")
+            .0
+            .lines()
+            .filter_map(|line| {
+                let value = line.split_once("= \"")?.1.split_once('"')?.0;
+                value.contains('.').then(|| value.to_owned())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn canonical_event_kinds_match_across_protocol_surfaces() {
+        let expected = BTreeSet::from([
+            "sidecar.ready".to_owned(),
+            "session.state".to_owned(),
+            "transcript.updated".to_owned(),
+            "suggestion.chunk".to_owned(),
+            "suggestion.completed".to_owned(),
+            "audio.health".to_owned(),
+            "provider.health".to_owned(),
+            "knowledge.state".to_owned(),
+            "runtime.error".to_owned(),
+        ]);
+        let typescript = enum_values(
+            include_str!("../../src/shared/protocol.ts"),
+            "export enum EventKind",
+        );
+        let python = enum_values(
+            include_str!("../../../ai_assistant/sidecar/protocol.py"),
+            "class EventKind",
+        );
+        let command_kinds = enum_values(
+            include_str!("../../src/shared/protocol.ts"),
+            "export enum CommandKind",
+        );
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../protocol/v1/envelope.schema.json"))
+                .unwrap();
+        let schema_kinds = schema["properties"]["kind"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_owned())
+            .collect::<BTreeSet<_>>();
+        let schema_events = schema_kinds
+            .difference(&command_kinds)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let rust = [
+            EventKind::SidecarReady,
+            EventKind::SessionState,
+            EventKind::TranscriptUpdated,
+            EventKind::SuggestionChunk,
+            EventKind::SuggestionCompleted,
+            EventKind::AudioHealth,
+            EventKind::ProviderHealth,
+            EventKind::KnowledgeState,
+            EventKind::RuntimeError,
+        ]
+        .into_iter()
+        .map(|kind| ProtocolKind::from(kind).as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+
+        assert_eq!(typescript, expected);
+        assert_eq!(python, expected);
+        assert_eq!(schema_events, expected);
+        assert_eq!(rust, expected);
+        assert_eq!(
+            schema_kinds,
+            command_kinds.union(&expected).cloned().collect()
+        );
+    }
 
     #[test]
     fn transcript_fixture_round_trips() {

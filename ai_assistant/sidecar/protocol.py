@@ -48,13 +48,10 @@ class EventKind(str, Enum):
     SESSION_STATE = "session.state"
     TRANSCRIPT_UPDATED = "transcript.updated"
     SUGGESTION_CHUNK = "suggestion.chunk"
-    SUGGESTION_STARTED = "suggestion.started"
     SUGGESTION_COMPLETED = "suggestion.completed"
-    SUGGESTION_ERROR = "suggestion.error"
     AUDIO_HEALTH = "audio.health"
     PROVIDER_HEALTH = "provider.health"
     KNOWLEDGE_STATE = "knowledge.state"
-    RAG_STATUS = "rag.status"
     RUNTIME_ERROR = "runtime.error"
 
 

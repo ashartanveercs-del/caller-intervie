@@ -871,25 +871,16 @@ mod tests {
         assert!(crate::protocol::validate_event(&invalid_transcript).is_err());
 
         let invalid_suggestion = session_event(
-            EventKind::SuggestionStarted,
-            Map::from_iter([("suggestion_id".into(), json!("not-a-uuid"))]),
+            EventKind::SuggestionChunk,
+            Map::from_iter([
+                ("suggestion_id".into(), json!("not-a-uuid")),
+                ("text".into(), json!("candidate answer")),
+            ]),
         );
         assert!(crate::protocol::validate_event(&invalid_suggestion).is_err());
 
-        let invalid_error = session_event(
-            EventKind::SuggestionError,
-            Map::from_iter([
-                (
-                    "suggestion_id".into(),
-                    json!("018f0000-0000-7000-8000-000000000009"),
-                ),
-                ("message".into(), json!(42)),
-            ]),
-        );
-        assert!(crate::protocol::validate_event(&invalid_error).is_err());
-
-        let invalid_rag = session_event(EventKind::RagStatus, Map::new());
-        assert!(crate::protocol::validate_event(&invalid_rag).is_err());
+        let invalid_knowledge_state = session_event(EventKind::KnowledgeState, Map::new());
+        assert!(crate::protocol::validate_event(&invalid_knowledge_state).is_err());
     }
 
     #[tokio::test]
