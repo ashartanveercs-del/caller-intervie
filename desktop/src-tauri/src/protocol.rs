@@ -4,6 +4,7 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u16 = 1;
+pub const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum CommandKind {
@@ -145,7 +146,9 @@ pub struct Envelope {
     pub id: String,
     #[serde(deserialize_with = "deserialize_optional_uuid_string")]
     pub session_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_safe_integer")]
     pub sequence: u64,
+    #[serde(deserialize_with = "deserialize_safe_integer")]
     pub timestamp_ms: u64,
     pub kind: ProtocolKind,
     pub payload: Map<String, Value>,
@@ -162,6 +165,17 @@ where
         return Err(de::Error::custom("unsupported protocol version"));
     }
     Ok(version)
+}
+
+fn deserialize_safe_integer<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    if value > MAX_SAFE_INTEGER {
+        return Err(de::Error::custom("must be a safe integer"));
+    }
+    Ok(value)
 }
 
 fn deserialize_uuid_string<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -194,7 +208,7 @@ fn validate_uuid(value: &str) -> Result<(), &'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Envelope, EventKind, PROTOCOL_VERSION};
+    use super::{Envelope, EventKind, MAX_SAFE_INTEGER, PROTOCOL_VERSION};
 
     #[test]
     fn transcript_fixture_round_trips() {
@@ -238,5 +252,30 @@ mod tests {
         let raw = include_str!("../../../protocol/v1/fixtures/sidecar-ready.json")
             .replace("\"version\": 1", "\"version\": 2");
         assert!(serde_json::from_str::<Envelope>(&raw).is_err());
+    }
+
+    #[test]
+    fn safe_integer_boundary_round_trips() {
+        let mut raw: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../protocol/v1/fixtures/sidecar-ready.json"
+        ))
+        .unwrap();
+        raw["sequence"] = serde_json::json!(MAX_SAFE_INTEGER);
+        raw["timestamp_ms"] = serde_json::json!(MAX_SAFE_INTEGER);
+
+        let value: Envelope = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(serde_json::to_value(value).unwrap(), raw);
+    }
+
+    #[test]
+    fn safe_integer_overflow_is_rejected() {
+        let mut raw: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../protocol/v1/fixtures/sidecar-ready.json"
+        ))
+        .unwrap();
+        raw["sequence"] = serde_json::json!(MAX_SAFE_INTEGER + 1);
+        raw["timestamp_ms"] = serde_json::json!(MAX_SAFE_INTEGER + 1);
+
+        assert!(serde_json::from_value::<Envelope>(raw).is_err());
     }
 }

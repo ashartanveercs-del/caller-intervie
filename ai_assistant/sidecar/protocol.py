@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 import re
+from types import MappingProxyType
 from typing import Any
 
 
 PROTOCOL_VERSION = 1
+MAX_SAFE_INTEGER = 9_007_199_254_740_991
 
 _UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -62,6 +65,24 @@ def _require_uuid(value: object, field: str) -> str:
 def _require_nonnegative_integer(value: object, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{field} must be a nonnegative integer")
+    if value > MAX_SAFE_INTEGER:
+        raise ValueError(f"{field} must be a safe integer")
+    return value
+
+
+def _freeze_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze_json(item) for item in value)
+    return value
+
+
+def _thaw_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json(item) for item in value]
     return value
 
 
@@ -85,7 +106,7 @@ class Envelope:
     sequence: int
     timestamp_ms: int
     kind: Kind
-    payload: dict[str, Any]
+    payload: Mapping[str, Any]
     correlation_id: str | None
 
     @classmethod
@@ -122,7 +143,7 @@ class Envelope:
             sequence=_require_nonnegative_integer(value["sequence"], "sequence"),
             timestamp_ms=_require_nonnegative_integer(value["timestamp_ms"], "timestamp_ms"),
             kind=_parse_kind(value["kind"]),
-            payload=dict(payload),
+            payload=_freeze_json(payload),
             correlation_id=correlation_id,
         )
 
@@ -134,6 +155,6 @@ class Envelope:
             "sequence": self.sequence,
             "timestamp_ms": self.timestamp_ms,
             "kind": self.kind.value,
-            "payload": self.payload,
+            "payload": _thaw_json(self.payload),
             "correlation_id": self.correlation_id,
         }

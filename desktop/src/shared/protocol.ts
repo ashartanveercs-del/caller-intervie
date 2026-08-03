@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 export const PROTOCOL_VERSION = 1 as const;
+export const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
 
 export enum CommandKind {
   HANDSHAKE_REQUEST = "handshake.request",
@@ -36,7 +37,11 @@ const versionSchema = z
     message: "unsupported protocol version",
   });
 const nonnegativeInteger = (field: string) =>
-  z.number().int().nonnegative({ message: `${field} must be a nonnegative integer` });
+  z
+    .number()
+    .int()
+    .nonnegative({ message: `${field} must be a nonnegative integer` })
+    .max(MAX_SAFE_INTEGER, { message: `${field} must be a safe integer` });
 const uuid = z
   .string()
   .regex(
