@@ -4,6 +4,9 @@ param(
     [string]$Mode = "healthcheck",
     [string]$TargetTriple = $env:SIDECAR_TARGET_TRIPLE,
     [string]$RustcPath = $env:SIDECAR_RUSTC,
+    [string]$PythonPath = $env:SIDECAR_PYTHON,
+    [string]$BinaryPath,
+    [string]$ProvenancePath,
     [int]$StartupBudgetMs = 30000
 )
 
@@ -23,6 +26,30 @@ function Resolve-Rustc([string]$configuredPath) {
     return $command.Source
 }
 
+function Resolve-Python([string]$configuredPath, [string]$projectRoot) {
+    if ($configuredPath) {
+        if (-not (Test-Path -LiteralPath $configuredPath -PathType Leaf)) {
+            throw "PYTHON override does not exist: $configuredPath"
+        }
+        return (Resolve-Path -LiteralPath $configuredPath).Path
+    }
+    foreach ($candidate in @(
+        (Join-Path $projectRoot ".venv\Scripts\python.exe"),
+        (Join-Path $projectRoot ".venv/bin/python")
+    )) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return (Resolve-Path -LiteralPath $candidate).Path
+        }
+    }
+    foreach ($commandName in @("python3", "python")) {
+        $command = Get-Command $commandName -CommandType Application -ErrorAction SilentlyContinue
+        if ($command) {
+            return $command.Source
+        }
+    }
+    throw "PYTHON was not found. Set SIDECAR_PYTHON or pass -PythonPath."
+}
+
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 if (-not $TargetTriple) {
     $rustc = Resolve-Rustc $RustcPath
@@ -37,26 +64,47 @@ $extension = if ($TargetTriple -match "-windows-") { ".exe" } else { "" }
 $binaryDirectory = Join-Path $projectRoot "desktop\src-tauri\binaries"
 $expectedName = "callerinterview-sidecar-$TargetTriple$extension"
 $expectedBinary = Join-Path $binaryDirectory $expectedName
-$binaries = if (Test-Path -LiteralPath $binaryDirectory -PathType Container) {
-    @(Get-ChildItem $binaryDirectory -Filter "callerinterview-sidecar-*" -File)
+$binary = if ($BinaryPath) {
+    if (-not (Test-Path -LiteralPath $BinaryPath -PathType Leaf)) {
+        throw "sidecar staged binary missing: $BinaryPath"
+    }
+    (Resolve-Path -LiteralPath $BinaryPath).Path
 }
 else {
-    @()
+    $binaries = if (Test-Path -LiteralPath $binaryDirectory -PathType Container) {
+        @(Get-ChildItem $binaryDirectory -Filter "callerinterview-sidecar-*" -File | Where-Object {
+            $_.Name -notlike "*.provenance.json" -and
+            $_.Name -notmatch "\.(staged|backup|restore-discard)-"
+        })
+    }
+    else {
+        @()
+    }
+    if ($binaries.Count -eq 0) {
+        throw "sidecar binary missing: $expectedName"
+    }
+    if ($binaries.Count -ne 1) {
+        throw "sidecar binary ambiguity: expected only $expectedName"
+    }
+    if ($binaries[0].Name -cne $expectedName -or -not (Test-Path -LiteralPath $expectedBinary -PathType Leaf)) {
+        throw "sidecar binary mismatch: expected $expectedName"
+    }
+    $expectedBinary
 }
-
-if ($binaries.Count -eq 0) {
-    throw "sidecar binary missing: $expectedName"
+$provenance = if ($ProvenancePath) { $ProvenancePath } else { "$binary.provenance.json" }
+if (-not (Test-Path -LiteralPath $provenance -PathType Leaf)) {
+    throw "sidecar provenance missing: $provenance"
 }
-if ($binaries.Count -ne 1) {
-    throw "sidecar binary ambiguity: expected only $expectedName"
-}
-if ($binaries[0].Name -cne $expectedName -or -not (Test-Path -LiteralPath $expectedBinary -PathType Leaf)) {
-    throw "sidecar binary mismatch: expected $expectedName"
+$python = Resolve-Python $PythonPath $projectRoot
+$provenanceHelper = Join-Path $projectRoot "sidecar\package_provenance.py"
+& $python $provenanceHelper validate --binary $binary --target-triple $TargetTriple --provenance $provenance
+if ($LASTEXITCODE -ne 0) {
+    throw "sidecar provenance validation failed"
 }
 
 $arguments = if ($Mode -eq "self-test") { "--self-test" } else { "--healthcheck" }
 $stopwatch = [Diagnostics.Stopwatch]::StartNew()
-$output = & $expectedBinary $arguments
+$output = & $binary $arguments
 $exitCode = $LASTEXITCODE
 $stopwatch.Stop()
 if ($exitCode -ne 0) {

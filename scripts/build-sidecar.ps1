@@ -45,7 +45,7 @@ $buildRoot = Join-Path $projectRoot "sidecar\build"
 $distRoot = Join-Path $buildRoot "dist"
 $modelAssets = Join-Path $buildRoot "rag-model"
 $modelFetcher = Join-Path $projectRoot "sidecar\fetch_model_assets.py"
-$binaryDirectory = Join-Path $projectRoot "desktop\src-tauri\binaries"
+$publisher = Join-Path $projectRoot "scripts\publish-sidecar-artifact.ps1"
 
 $python = Resolve-ToolPath $PythonPath @(
     (Join-Path $projectRoot ".venv\Scripts\python.exe"),
@@ -111,12 +111,7 @@ if (-not (Test-Path -LiteralPath $builtBinary -PathType Leaf)) {
     throw "PyInstaller output missing: $builtBinary"
 }
 
-New-Item -ItemType Directory -Force -Path $binaryDirectory | Out-Null
-$targetBinary = Join-Path $binaryDirectory "callerinterview-sidecar-$TargetTriple$extension"
-foreach ($staleBinary in @(Get-ChildItem $binaryDirectory -Filter "callerinterview-sidecar-*" -File)) {
-    Remove-Item -LiteralPath $staleBinary.FullName -Force
+& $publisher -SourceBinary $builtBinary -TargetTriple $TargetTriple -PythonPath $python
+if ($LASTEXITCODE -ne 0) {
+    throw "sidecar artifact publish failed with exit code $LASTEXITCODE"
 }
-$stagedBinary = "$targetBinary.staging-$PID"
-Copy-Item -LiteralPath $builtBinary -Destination $stagedBinary -Force
-Move-Item -LiteralPath $stagedBinary -Destination $targetBinary -Force
-Write-Output $targetBinary

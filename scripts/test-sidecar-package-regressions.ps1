@@ -8,7 +8,10 @@ $binaryDirectory = Join-Path $projectRoot "desktop\src-tauri\binaries"
 $smokeScript = Join-Path $PSScriptRoot "test-sidecar-package.ps1"
 $wrongBinary = Join-Path $binaryDirectory "callerinterview-sidecar-wrong-triple.exe"
 Remove-Item -LiteralPath $wrongBinary -Force -ErrorAction SilentlyContinue
-$binaries = @(Get-ChildItem $binaryDirectory -Filter "callerinterview-sidecar-*" -File)
+$binaries = @(Get-ChildItem $binaryDirectory -Filter "callerinterview-sidecar-*" -File | Where-Object {
+    $_.Name -notlike "*.provenance.json" -and
+    $_.Name -notmatch "\.(staged|backup|restore-discard)-"
+})
 
 if ($binaries.Count -ne 1) {
     throw "regression fixture requires exactly one packaged sidecar"
