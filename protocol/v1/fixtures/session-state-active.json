@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "id": "018f0000-0000-7000-8000-000000000012",
+  "session_id": "018f0000-0000-7000-8000-000000000003",
+  "sequence": 5,
+  "timestamp_ms": 1720000000500,
+  "kind": "session.state",
+  "payload": {
+    "state": "listening",
+    "mode": "interview",
+    "input_language": "auto",
+    "response_language": "en",
+    "review_language": "en",
+    "you_source": "mic",
+    "listening": true,
+    "system_audio_enabled": false
+  },
+  "correlation_id": "018f0000-0000-7000-8000-000000000002"
+}

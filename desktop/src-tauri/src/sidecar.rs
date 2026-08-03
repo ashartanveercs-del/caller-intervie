@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -30,83 +32,6 @@ pub fn packaged_sidecar_path(host_executable: &std::path::Path) -> std::path::Pa
         path.set_extension("exe");
     }
     path
-}
-
-pub fn smoke_packaged_sidecar() -> Result<(), SidecarError> {
-    use std::io::{Read, Write};
-    use std::sync::mpsc;
-    use std::time::Instant;
-
-    let host = std::env::current_exe()
-        .map_err(|error| SidecarError::new("sidecar_smoke_failed", error.to_string()))?;
-    let path = packaged_sidecar_path(&host);
-    let mut child = std::process::Command::new(path)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|error| SidecarError::new("sidecar_smoke_failed", error.to_string()))?;
-    let handshake = Envelope {
-        version: crate::protocol::PROTOCOL_VERSION,
-        id: uuid::Uuid::new_v4().to_string(),
-        session_id: None,
-        sequence: 0,
-        timestamp_ms: 0,
-        kind: CommandKind::HandshakeRequest.into(),
-        payload: Default::default(),
-        correlation_id: None,
-    };
-    child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| SidecarError::new("sidecar_smoke_failed", "sidecar stdin is unavailable"))?
-        .write_all(
-            &encode_frame(&handshake)
-                .map_err(|error| SidecarError::new(error.code(), error.to_string()))?,
-        )
-        .map_err(|error| SidecarError::new("sidecar_smoke_failed", error.to_string()))?;
-    let mut stdout = child.stdout.take().ok_or_else(|| {
-        SidecarError::new("sidecar_smoke_failed", "sidecar stdout is unavailable")
-    })?;
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut chunk = [0_u8; 8192];
-        while let Ok(length) = stdout.read(&mut chunk) {
-            if length == 0 {
-                break;
-            }
-            if sender.send(chunk[..length].to_vec()).is_err() {
-                break;
-            }
-        }
-    });
-    let deadline = Instant::now() + PRODUCTION_HANDSHAKE_TIMEOUT;
-    let mut decoder = FrameDecoder::new(MAX_FRAME_BYTES);
-    let result = 'ready: loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let chunk = receiver.recv_timeout(remaining).map_err(|_| {
-            SidecarError::new(
-                "sidecar_handshake_timeout",
-                "sidecar did not emit sidecar.ready within 45 seconds",
-            )
-        })?;
-        for event in decoder
-            .push(&chunk)
-            .map_err(|error| SidecarError::new(error.code(), error.to_string()))?
-        {
-            if matches!(
-                event.kind,
-                crate::protocol::ProtocolKind::Event(EventKind::SidecarReady)
-            ) {
-                validate_event(&event).map_err(|error| {
-                    SidecarError::new(error.code(), "sidecar emitted an invalid ready event")
-                })?;
-                break 'ready Ok(());
-            }
-        }
-    };
-    let _ = child.kill();
-    result
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -184,8 +109,17 @@ struct SupervisorData {
     restart_count: u8,
     generation: u64,
     explicit_shutdown: bool,
-    ignored_exit_events: u8,
     diagnostics: Vec<String>,
+    active: Option<ActiveSidecar>,
+    intentional_exit_generations: BTreeSet<u64>,
+}
+
+struct ActiveSidecar {
+    generation: u64,
+    port: Arc<dyn SidecarPort>,
+    decoder: FrameDecoder,
+    stderr: String,
+    handshake_id: Option<String>,
 }
 
 impl Default for SupervisorData {
@@ -195,17 +129,16 @@ impl Default for SupervisorData {
             restart_count: 0,
             generation: 0,
             explicit_shutdown: false,
-            ignored_exit_events: 0,
             diagnostics: Vec::new(),
+            active: None,
+            intentional_exit_generations: BTreeSet::new(),
         }
     }
 }
 
 struct SupervisorInner {
     data: AsyncMutex<SupervisorData>,
-    port: AsyncMutex<Option<Arc<dyn SidecarPort>>>,
-    decoder: AsyncMutex<FrameDecoder>,
-    stderr: AsyncMutex<(u64, String)>,
+    lifecycle: AsyncMutex<()>,
     launcher: Option<Arc<dyn SidecarLauncher>>,
     sink: Arc<dyn SidecarEventSink>,
     restart_delay: Duration,
@@ -221,10 +154,17 @@ impl SidecarSupervisor {
     pub fn with_port(port: Arc<dyn SidecarPort>) -> Self {
         Self {
             inner: Arc::new(SupervisorInner {
-                data: AsyncMutex::new(SupervisorData::default()),
-                port: AsyncMutex::new(Some(port)),
-                decoder: AsyncMutex::new(FrameDecoder::new(MAX_FRAME_BYTES)),
-                stderr: AsyncMutex::new((0, String::new())),
+                data: AsyncMutex::new(SupervisorData {
+                    active: Some(ActiveSidecar {
+                        generation: 0,
+                        port,
+                        decoder: FrameDecoder::new(MAX_FRAME_BYTES),
+                        stderr: String::new(),
+                        handshake_id: None,
+                    }),
+                    ..SupervisorData::default()
+                }),
+                lifecycle: AsyncMutex::new(()),
                 launcher: None,
                 sink: Arc::new(NoopEventSink),
                 restart_delay: Duration::ZERO,
@@ -246,9 +186,7 @@ impl SidecarSupervisor {
         Self {
             inner: Arc::new(SupervisorInner {
                 data: AsyncMutex::new(SupervisorData::default()),
-                port: AsyncMutex::new(None),
-                decoder: AsyncMutex::new(FrameDecoder::new(MAX_FRAME_BYTES)),
-                stderr: AsyncMutex::new((0, String::new())),
+                lifecycle: AsyncMutex::new(()),
                 launcher: Some(launcher),
                 sink,
                 restart_delay,
@@ -258,7 +196,8 @@ impl SidecarSupervisor {
     }
 
     pub async fn start(&self) -> Result<SidecarStatus, SidecarError> {
-        if let Err(error) = self.launch().await {
+        let _lifecycle = self.inner.lifecycle.lock().await;
+        if let Err(error) = self.launch_internal().await {
             self.fail(&error).await;
             return Err(error);
         }
@@ -278,39 +217,62 @@ impl SidecarSupervisor {
         validate_command(&command).map_err(|error| {
             SidecarError::new(error.code(), "sidecar command validation failed")
         })?;
-        if !matches!(self.inner.data.lock().await.state, SidecarState::Ready) {
-            return Err(SidecarError::new(
-                "sidecar_not_ready",
-                "sidecar has not completed its handshake",
-            ));
-        }
         let bytes = encode_frame(&command)
             .map_err(|error| SidecarError::new(error.code(), error.to_string()))?;
-        let port = self.inner.port.lock().await.clone().ok_or_else(|| {
-            SidecarError::new("sidecar_unavailable", "sidecar port is unavailable")
-        })?;
+        let port = {
+            let data = self.inner.data.lock().await;
+            if !matches!(data.state, SidecarState::Ready) {
+                return Err(SidecarError::new(
+                    "sidecar_not_ready",
+                    "sidecar has not completed its handshake",
+                ));
+            }
+            data.active
+                .as_ref()
+                .map(|active| active.port.clone())
+                .ok_or_else(|| {
+                    SidecarError::new("sidecar_unavailable", "sidecar port is unavailable")
+                })?
+        };
         port.write(bytes).await
     }
 
     pub async fn accept_stdout(&self, generation: u64, chunk: &[u8]) -> Result<(), SidecarError> {
-        if !self.is_current(generation).await {
+        let mut data = self.inner.data.lock().await;
+        if data.generation != generation {
             return Ok(());
         }
-        let envelopes = self
-            .inner
+        let Some(active) = data.active.as_mut() else {
+            return Ok(());
+        };
+        if active.generation != generation {
+            return Ok(());
+        }
+        let envelopes = active
             .decoder
-            .lock()
-            .await
             .push(chunk)
             .map_err(|error| SidecarError::new(error.code(), error.to_string()))?;
         for event in envelopes {
-            self.accept_event(generation, event).await?;
+            self.accept_event_locked(&mut data, generation, event)?;
         }
         Ok(())
     }
 
     pub async fn accept_event(&self, generation: u64, event: Envelope) -> Result<(), SidecarError> {
-        if !self.is_current(generation).await {
+        let mut data = self.inner.data.lock().await;
+        self.accept_event_locked(&mut data, generation, event)
+    }
+
+    fn accept_event_locked(
+        &self,
+        data: &mut SupervisorData,
+        generation: u64,
+        event: Envelope,
+    ) -> Result<(), SidecarError> {
+        let Some(active) = data.active.as_ref() else {
+            return Ok(());
+        };
+        if active.generation != generation || data.generation != generation {
             return Ok(());
         }
         validate_event(&event)
@@ -319,55 +281,68 @@ impl SidecarSupervisor {
             event.kind,
             crate::protocol::ProtocolKind::Event(EventKind::SidecarReady)
         );
-        {
-            let mut data = self.inner.data.lock().await;
-            if is_ready {
-                data.state = SidecarState::Ready;
-            } else if !matches!(data.state, SidecarState::Ready) {
-                return Err(SidecarError::new(
-                    "sidecar_not_ready",
-                    "sidecar emitted an event before sidecar.ready",
-                ));
+        if is_ready {
+            if active.handshake_id.as_deref() != event.correlation_id.as_deref() {
+                return Ok(());
             }
+            data.state = SidecarState::Ready;
+        } else if !matches!(data.state, SidecarState::Ready) {
+            return Err(SidecarError::new(
+                "sidecar_not_ready",
+                "sidecar emitted an event before sidecar.ready",
+            ));
         }
         self.inner.sink.emit(&event)
     }
 
     pub async fn accept_stderr(&self, generation: u64, stderr: &[u8]) {
-        if !self.is_current(generation).await {
+        let mut data = self.inner.data.lock().await;
+        if data.generation != generation {
             return;
         }
-        let mut pending = self.inner.stderr.lock().await;
-        if pending.0 != generation {
+        let Some(active) = data.active.as_mut() else {
+            return;
+        };
+        if active.generation != generation {
             return;
         }
-        pending.1.push_str(&String::from_utf8_lossy(stderr));
-        while let Some(end) = pending.1.find(['\n', '\r']) {
-            let line = pending.1.drain(..=end).collect::<String>();
-            self.push_diagnostic(format!("stderr: {line}")).await;
+        active.stderr.push_str(&String::from_utf8_lossy(stderr));
+        let mut lines = Vec::new();
+        while let Some(end) = active.stderr.find(['\n', '\r']) {
+            lines.push(active.stderr.drain(..=end).collect::<String>());
+        }
+        for line in lines {
+            self.push_diagnostic_locked(&mut data, &format!("stderr: {line}"));
         }
     }
 
     pub async fn handle_unexpected_exit(&self, generation: u64) {
-        self.flush_stderr(generation).await;
-        {
+        let _lifecycle = self.inner.lifecycle.lock().await;
+        let restart = {
             let mut data = self.inner.data.lock().await;
-            if data.generation != generation {
+            if data.intentional_exit_generations.remove(&generation) {
                 return;
             }
-            if data.ignored_exit_events > 0 {
-                data.ignored_exit_events -= 1;
+            let Some(active) = data.active.as_ref() else {
+                return;
+            };
+            if active.generation != generation || data.generation != generation {
                 return;
             }
             if data.explicit_shutdown {
                 data.state = SidecarState::Stopped;
                 return;
             }
+            self.flush_stderr_locked(&mut data, generation);
+            data.active = None;
+            true
+        };
+        if restart {
+            self.restart_after_unexpected_exit_internal().await;
         }
-        self.restart_after_unexpected_exit().await;
     }
 
-    async fn restart_after_unexpected_exit(&self) {
+    async fn restart_after_unexpected_exit_internal(&self) {
         {
             let mut data = self.inner.data.lock().await;
             if data.restart_count >= 1 {
@@ -383,7 +358,7 @@ impl SidecarSupervisor {
         if !self.inner.restart_delay.is_zero() {
             tokio::time::sleep(self.inner.restart_delay).await;
         }
-        if let Err(error) = self.launch().await {
+        if let Err(error) = self.launch_internal().await {
             let mut data = self.inner.data.lock().await;
             data.state = SidecarState::Failed;
             self.push_diagnostic_locked(&mut data, &error.to_string());
@@ -391,14 +366,15 @@ impl SidecarSupervisor {
     }
 
     pub async fn restart(&self) -> Result<SidecarStatus, SidecarError> {
-        self.stop_current_for_restart().await?;
+        let _lifecycle = self.inner.lifecycle.lock().await;
+        self.stop_current_for_restart_internal().await?;
         {
             let mut data = self.inner.data.lock().await;
             data.explicit_shutdown = false;
             data.state = SidecarState::Starting;
             data.restart_count = 0;
         }
-        if let Err(error) = self.launch().await {
+        if let Err(error) = self.launch_internal().await {
             self.fail(&error).await;
             return Err(error);
         }
@@ -406,42 +382,61 @@ impl SidecarSupervisor {
     }
 
     pub async fn shutdown(&self) -> Result<(), SidecarError> {
-        {
+        let _lifecycle = self.inner.lifecycle.lock().await;
+        let port = {
             let mut data = self.inner.data.lock().await;
             data.explicit_shutdown = true;
             data.state = SidecarState::Stopped;
-        }
-        if let Some(port) = self.inner.port.lock().await.take() {
+            data.active.take().map(|active| {
+                data.intentional_exit_generations.insert(active.generation);
+                active.port
+            })
+        };
+        if let Some(port) = port {
             port.kill().await?;
         }
         Ok(())
     }
 
-    async fn launch(&self) -> Result<(), SidecarError> {
+    async fn launch_internal(&self) -> Result<(), SidecarError> {
         let launcher = self.inner.launcher.as_ref().ok_or_else(|| {
             SidecarError::new("sidecar_unavailable", "sidecar launcher is unavailable")
         })?;
         let port = launcher.launch().await?;
-        *self.inner.port.lock().await = Some(port.clone());
+        let handshake_id = uuid::Uuid::new_v4().to_string();
         let generation = {
             let mut data = self.inner.data.lock().await;
             data.explicit_shutdown = false;
             data.state = SidecarState::Starting;
             data.generation += 1;
-            data.generation
+            let generation = data.generation;
+            data.active = Some(ActiveSidecar {
+                generation,
+                port: port.clone(),
+                decoder: FrameDecoder::new(MAX_FRAME_BYTES),
+                stderr: String::new(),
+                handshake_id: Some(handshake_id.clone()),
+            });
+            generation
         };
-        *self.inner.decoder.lock().await = FrameDecoder::new(MAX_FRAME_BYTES);
-        *self.inner.stderr.lock().await = (generation, String::new());
         port.observe(self.clone(), generation);
-        self.send_handshake().await?;
+        if let Err(error) = self.send_handshake(port.clone(), handshake_id).await {
+            self.discard_generation(generation).await;
+            let _ = port.kill().await;
+            return Err(error);
+        }
         self.arm_handshake_timeout(generation);
         Ok(())
     }
 
-    async fn send_handshake(&self) -> Result<(), SidecarError> {
+    async fn send_handshake(
+        &self,
+        port: Arc<dyn SidecarPort>,
+        handshake_id: String,
+    ) -> Result<(), SidecarError> {
         let command = Envelope {
             version: crate::protocol::PROTOCOL_VERSION,
-            id: uuid::Uuid::new_v4().to_string(),
+            id: handshake_id,
             session_id: None,
             sequence: 0,
             timestamp_ms: 0,
@@ -451,9 +446,6 @@ impl SidecarSupervisor {
         };
         let bytes = encode_frame(&command)
             .map_err(|error| SidecarError::new(error.code(), error.to_string()))?;
-        let port = self.inner.port.lock().await.clone().ok_or_else(|| {
-            SidecarError::new("sidecar_unavailable", "sidecar port is unavailable")
-        })?;
         port.write(bytes).await
     }
 
@@ -469,38 +461,40 @@ impl SidecarSupervisor {
     }
 
     async fn handle_handshake_timeout(&self, generation: u64) {
-        let timed_out = {
+        let _lifecycle = self.inner.lifecycle.lock().await;
+        let port = {
             let mut data = self.inner.data.lock().await;
-            if data.generation != generation || !matches!(data.state, SidecarState::Starting) {
-                false
-            } else {
-                data.state = SidecarState::Restarting;
-                true
+            let Some(active) = data.active.as_ref() else {
+                return;
+            };
+            if active.generation != generation
+                || data.generation != generation
+                || !matches!(data.state, SidecarState::Starting)
+            {
+                return;
             }
+            data.state = SidecarState::Restarting;
+            self.push_diagnostic_locked(&mut data, "sidecar handshake timed out");
+            data.active.take().map(|active| active.port)
         };
-        if !timed_out {
-            return;
-        }
-
-        self.push_diagnostic("sidecar handshake timed out").await;
-        let port = self.inner.port.lock().await.take();
         if let Some(port) = port {
-            self.inner.data.lock().await.ignored_exit_events += 1;
             let _ = port.kill().await;
         }
-        self.restart_after_unexpected_exit().await;
+        self.restart_after_unexpected_exit_internal().await;
     }
 
-    async fn stop_current_for_restart(&self) -> Result<(), SidecarError> {
-        if let Some(port) = self.inner.port.lock().await.take() {
-            self.inner.data.lock().await.ignored_exit_events += 1;
+    async fn stop_current_for_restart_internal(&self) -> Result<(), SidecarError> {
+        let port = {
+            let mut data = self.inner.data.lock().await;
+            data.active.take().map(|active| {
+                data.intentional_exit_generations.insert(active.generation);
+                active.port
+            })
+        };
+        if let Some(port) = port {
             port.kill().await?;
         }
         Ok(())
-    }
-
-    async fn is_current(&self, generation: u64) -> bool {
-        self.inner.data.lock().await.generation == generation
     }
 
     async fn push_diagnostic(&self, diagnostic: impl AsRef<str>) {
@@ -508,16 +502,27 @@ impl SidecarSupervisor {
         self.push_diagnostic_locked(&mut data, diagnostic.as_ref());
     }
 
-    async fn flush_stderr(&self, generation: u64) {
-        let line = {
-            let mut pending = self.inner.stderr.lock().await;
-            if pending.0 != generation {
-                return;
-            }
-            std::mem::take(&mut pending.1)
+    fn flush_stderr_locked(&self, data: &mut SupervisorData, generation: u64) {
+        let Some(active) = data.active.as_mut() else {
+            return;
         };
+        if active.generation != generation || data.generation != generation {
+            return;
+        }
+        let line = std::mem::take(&mut active.stderr);
         if !line.is_empty() {
-            self.push_diagnostic(format!("stderr: {line}")).await;
+            self.push_diagnostic_locked(data, &format!("stderr: {line}"));
+        }
+    }
+
+    async fn discard_generation(&self, generation: u64) {
+        let mut data = self.inner.data.lock().await;
+        if data
+            .active
+            .as_ref()
+            .is_some_and(|active| active.generation == generation)
+        {
+            data.active = None;
         }
     }
 
@@ -559,6 +564,32 @@ pub fn redact_diagnostic(value: &str) -> String {
     result
 }
 
+#[cfg(windows)]
+fn terminate_process_by_pid(pid: u32) -> Result<(), SidecarError> {
+    let status = std::process::Command::new("taskkill.exe")
+        .args(["/pid", &pid.to_string(), "/t", "/f"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|error| SidecarError::new("sidecar_kill_failed", error.to_string()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(SidecarError::new(
+            "sidecar_kill_failed",
+            "taskkill could not terminate the sidecar process",
+        ))
+    }
+}
+
+#[cfg(not(windows))]
+fn terminate_process_by_pid(_pid: u32) -> Result<(), SidecarError> {
+    Err(SidecarError::new(
+        "sidecar_kill_failed",
+        "independent sidecar termination is not available on this platform",
+    ))
+}
+
 pub struct TauriSidecarLauncher {
     app: AppHandle,
 }
@@ -580,8 +611,11 @@ impl SidecarLauncher for TauriSidecarLauncher {
             .set_raw_out(true)
             .spawn()
             .map_err(|error| SidecarError::new("sidecar_launch_failed", error.to_string()))?;
+        let pid = child.pid();
         Ok(Arc::new(TauriSidecarPort {
             child: Arc::new(Mutex::new(Some(child))),
+            pid,
+            terminated: Arc::new(AtomicBool::new(false)),
             events: Arc::new(AsyncMutex::new(Some(events))),
         }))
     }
@@ -589,12 +623,20 @@ impl SidecarLauncher for TauriSidecarLauncher {
 
 struct TauriSidecarPort {
     child: Arc<Mutex<Option<CommandChild>>>,
+    pid: u32,
+    terminated: Arc<AtomicBool>,
     events: Arc<AsyncMutex<Option<tauri::async_runtime::Receiver<CommandEvent>>>>,
 }
 
 #[async_trait]
 impl SidecarPort for TauriSidecarPort {
     async fn write(&self, bytes: Vec<u8>) -> Result<(), SidecarError> {
+        if self.terminated.load(Ordering::Acquire) {
+            return Err(SidecarError::new(
+                "sidecar_unavailable",
+                "sidecar child is unavailable",
+            ));
+        }
         let mut child = self
             .child
             .lock()
@@ -606,9 +648,12 @@ impl SidecarPort for TauriSidecarPort {
                 SidecarError::new("sidecar_unavailable", "sidecar child is unavailable")
             })?;
         let slot = self.child.clone();
+        let terminated = self.terminated.clone();
         let write = tokio::task::spawn_blocking(move || {
             let result = child.write(&bytes);
-            if let Ok(mut slot) = slot.lock() {
+            if terminated.load(Ordering::Acquire) {
+                let _ = child.kill();
+            } else if let Ok(mut slot) = slot.lock() {
                 *slot = Some(child);
             }
             result
@@ -626,19 +671,20 @@ impl SidecarPort for TauriSidecarPort {
     }
 
     async fn kill(&self) -> Result<(), SidecarError> {
+        self.terminated.store(true, Ordering::Release);
         let child = self
             .child
             .lock()
             .map_err(|_| {
                 SidecarError::new("sidecar_kill_failed", "sidecar child lock was poisoned")
             })?
-            .take()
-            .ok_or_else(|| {
-                SidecarError::new("sidecar_unavailable", "sidecar child is unavailable")
-            })?;
-        child
-            .kill()
-            .map_err(|error| SidecarError::new("sidecar_kill_failed", error.to_string()))
+            .take();
+        match child {
+            Some(child) => child
+                .kill()
+                .map_err(|error| SidecarError::new("sidecar_kill_failed", error.to_string())),
+            None => terminate_process_by_pid(self.pid),
+        }
     }
 
     fn observe(&self, supervisor: SidecarSupervisor, generation: u64) {
@@ -700,9 +746,12 @@ mod tests {
     };
 
     use super::{
-        packaged_sidecar_path, redact_diagnostic, SidecarError, SidecarLauncher, SidecarPort,
-        SidecarState, SidecarSupervisor, SIDECAR_PROGRAM,
+        packaged_sidecar_path, redact_diagnostic, SidecarError, SidecarEventSink, SidecarLauncher,
+        SidecarPort, SidecarState, SidecarSupervisor, SIDECAR_PROGRAM,
     };
+
+    #[cfg(windows)]
+    use super::terminate_process_by_pid;
 
     const SESSION_ID: &str = "018f0000-0000-7000-8000-000000000003";
 
@@ -729,6 +778,18 @@ mod tests {
         launches: Arc<Mutex<usize>>,
     }
 
+    #[derive(Default)]
+    struct CollectingEventSink {
+        events: Mutex<Vec<Envelope>>,
+    }
+
+    impl SidecarEventSink for CollectingEventSink {
+        fn emit(&self, event: &Envelope) -> Result<(), SidecarError> {
+            self.events.lock().unwrap().push(event.clone());
+            Ok(())
+        }
+    }
+
     #[async_trait]
     impl SidecarLauncher for FakeSidecarLauncher {
         async fn launch(&self) -> Result<Arc<dyn SidecarPort>, SidecarError> {
@@ -748,6 +809,24 @@ mod tests {
             payload: Map::from_iter([(String::from("status"), Value::String("ready".into()))]),
             correlation_id: None,
         }
+    }
+
+    fn ready_for(correlation_id: Option<&str>) -> Envelope {
+        Envelope {
+            correlation_id: correlation_id.map(str::to_owned),
+            ..fixture_envelope()
+        }
+    }
+
+    fn last_handshake_id(port: &FakeSidecarPort) -> String {
+        let writes = port.writes.lock().unwrap();
+        let mut decoder = FrameDecoder::new(MAX_FRAME_BYTES);
+        let command = decoder.push(writes.last().unwrap()).unwrap().pop().unwrap();
+        assert_eq!(
+            command.kind,
+            ProtocolKind::Command(CommandKind::HandshakeRequest)
+        );
+        command.id
     }
 
     fn fixture_command() -> Envelope {
@@ -894,10 +973,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn old_generation_bytes_and_ready_events_are_ignored_after_restart() {
+    async fn only_the_current_handshake_correlation_may_make_a_generation_ready() {
         let port = Arc::new(FakeSidecarPort::default());
         let launcher = FakeSidecarLauncher {
-            port,
+            port: port.clone(),
+            launches: Arc::new(Mutex::new(0)),
+        };
+        let supervisor = SidecarSupervisor::with_launcher(Arc::new(launcher), Duration::ZERO);
+
+        supervisor.start().await.unwrap();
+        let first_handshake = last_handshake_id(&port);
+        supervisor.accept_event(1, ready_for(None)).await.unwrap();
+        supervisor
+            .accept_event(1, ready_for(Some("018f0000-0000-7000-8000-000000000099")))
+            .await
+            .unwrap();
+        assert_eq!(supervisor.status().await.state, SidecarState::Starting);
+
+        supervisor.restart().await.unwrap();
+        let current_handshake = last_handshake_id(&port);
+        supervisor
+            .accept_event(1, ready_for(Some(&first_handshake)))
+            .await
+            .unwrap();
+        supervisor
+            .accept_event(2, ready_for(Some(&first_handshake)))
+            .await
+            .unwrap();
+        assert_eq!(supervisor.status().await.state, SidecarState::Starting);
+
+        supervisor
+            .accept_event(2, ready_for(Some(&current_handshake)))
+            .await
+            .unwrap();
+        assert_eq!(supervisor.status().await.state, SidecarState::Ready);
+    }
+
+    #[tokio::test]
+    async fn stale_chunks_cannot_poison_the_current_generation_decoder() {
+        let port = Arc::new(FakeSidecarPort::default());
+        let launcher = FakeSidecarLauncher {
+            port: port.clone(),
             launches: Arc::new(Mutex::new(0)),
         };
         let supervisor = SidecarSupervisor::with_launcher(Arc::new(launcher), Duration::ZERO);
@@ -914,10 +1030,48 @@ mod tests {
 
         assert_eq!(supervisor.status().await.state, SidecarState::Starting);
         supervisor
-            .accept_event(2, fixture_envelope())
+            .accept_stdout(
+                2,
+                &encode_frame(&ready_for(Some(&last_handshake_id(&port)))).unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(supervisor.status().await.state, SidecarState::Ready);
+    }
+
+    #[tokio::test]
+    async fn stale_ready_cannot_emit_or_transition_a_new_generation() {
+        let port = Arc::new(FakeSidecarPort::default());
+        let launcher = FakeSidecarLauncher {
+            port: port.clone(),
+            launches: Arc::new(Mutex::new(0)),
+        };
+        let sink = Arc::new(CollectingEventSink::default());
+        let supervisor = SidecarSupervisor::with_launcher_and_sink(
+            Arc::new(launcher),
+            sink.clone(),
+            Duration::ZERO,
+            None,
+        );
+
+        supervisor.start().await.unwrap();
+        let first_handshake = last_handshake_id(&port);
+        supervisor.restart().await.unwrap();
+        let current_handshake = last_handshake_id(&port);
+
+        supervisor
+            .accept_event(1, ready_for(Some(&first_handshake)))
+            .await
+            .unwrap();
+        assert_eq!(supervisor.status().await.state, SidecarState::Starting);
+        assert!(sink.events.lock().unwrap().is_empty());
+
+        supervisor
+            .accept_event(2, ready_for(Some(&current_handshake)))
+            .await
+            .unwrap();
+        assert_eq!(supervisor.status().await.state, SidecarState::Ready);
+        assert_eq!(sink.events.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -930,13 +1084,14 @@ mod tests {
         let supervisor =
             SidecarSupervisor::with_launcher(Arc::new(launcher.clone()), Duration::ZERO);
 
-        supervisor.handle_unexpected_exit(0).await;
-        assert_eq!(supervisor.status().await.state, SidecarState::Starting);
-        assert_eq!(*launcher.launches.lock().unwrap(), 1);
-
+        supervisor.start().await.unwrap();
         supervisor.handle_unexpected_exit(1).await;
+        assert_eq!(supervisor.status().await.state, SidecarState::Starting);
+        assert_eq!(*launcher.launches.lock().unwrap(), 2);
+
+        supervisor.handle_unexpected_exit(2).await;
         assert_eq!(supervisor.status().await.state, SidecarState::Failed);
-        assert_eq!(*launcher.launches.lock().unwrap(), 1);
+        assert_eq!(*launcher.launches.lock().unwrap(), 2);
     }
 
     #[tokio::test]
@@ -948,11 +1103,32 @@ mod tests {
         };
         let supervisor = SidecarSupervisor::with_launcher(Arc::new(launcher), Duration::ZERO);
 
-        supervisor.handle_unexpected_exit(0).await;
+        supervisor.start().await.unwrap();
+        supervisor.handle_unexpected_exit(1).await;
         assert_eq!(supervisor.status().await.restart_count, 1);
         supervisor.restart().await.unwrap();
 
         assert_eq!(supervisor.status().await.restart_count, 0);
+    }
+
+    #[tokio::test]
+    async fn intentional_old_exit_does_not_suppress_a_new_child_exit() {
+        let port = Arc::new(FakeSidecarPort::default());
+        let launcher = FakeSidecarLauncher {
+            port,
+            launches: Arc::new(Mutex::new(0)),
+        };
+        let supervisor =
+            SidecarSupervisor::with_launcher(Arc::new(launcher.clone()), Duration::ZERO);
+
+        supervisor.start().await.unwrap();
+        supervisor.restart().await.unwrap();
+        supervisor.handle_unexpected_exit(1).await;
+        supervisor.handle_unexpected_exit(2).await;
+
+        assert_eq!(supervisor.status().await.restart_count, 1);
+        assert_eq!(supervisor.status().await.state, SidecarState::Starting);
+        assert_eq!(*launcher.launches.lock().unwrap(), 3);
     }
 
     #[tokio::test]
@@ -1114,5 +1290,77 @@ mod tests {
         assert!(!diagnostic.contains("api-token"));
         assert!(!diagnostic.contains("sk-abcdefghijklmnop"));
         assert!(diagnostic.contains("<redacted>"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn forced_pid_termination_reaps_a_real_blocked_child() {
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "ping -n 30 127.0.0.1 > nul"])
+            .spawn()
+            .unwrap();
+
+        terminate_process_by_pid(child.id()).unwrap();
+        assert!(!child.wait().unwrap().success());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn blocked_write_timeout_keeps_an_actual_child_killable() {
+        #[derive(Clone)]
+        struct RealBlockingPort {
+            pid: u32,
+            started: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait]
+        impl SidecarPort for RealBlockingPort {
+            async fn write(&self, _bytes: Vec<u8>) -> Result<(), SidecarError> {
+                self.started.notify_waiters();
+                self.release.notified().await;
+                Err(SidecarError::new(
+                    "sidecar_write_timeout",
+                    "simulated blocked stdin write timed out",
+                ))
+            }
+
+            async fn kill(&self) -> Result<(), SidecarError> {
+                terminate_process_by_pid(self.pid)
+            }
+        }
+
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "ping -n 30 127.0.0.1 > nul"])
+            .spawn()
+            .unwrap();
+        let port = RealBlockingPort {
+            pid: child.id(),
+            started: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        let supervisor = SidecarSupervisor::with_port(Arc::new(port.clone()));
+        supervisor
+            .accept_event(0, fixture_envelope())
+            .await
+            .unwrap();
+
+        let started = port.started.notified();
+        let send = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.send(fixture_command()).await }
+        });
+        started.await;
+
+        tokio::time::timeout(Duration::from_millis(100), supervisor.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        port.release.notify_waiters();
+        assert_eq!(
+            send.await.unwrap().unwrap_err().code(),
+            "sidecar_write_timeout"
+        );
+        assert!(!child.wait().unwrap().success());
     }
 }

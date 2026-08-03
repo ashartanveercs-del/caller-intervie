@@ -5,6 +5,8 @@ import readyFixture from "../../../protocol/v1/fixtures/sidecar-ready.json";
 import sessionStartFixture from "../../../protocol/v1/fixtures/session-start.json";
 import transcriptFixture from "../../../protocol/v1/fixtures/transcript-final.json";
 import suggestionFixture from "../../../protocol/v1/fixtures/suggestion-complete.json";
+import activeSessionStateFixture from "../../../protocol/v1/fixtures/session-state-active.json";
+import idleSessionStateFixture from "../../../protocol/v1/fixtures/session-state-idle.json";
 
 describe("Protocol V1", () => {
   it("pins the JSON Schema to protocol version one", () => {
@@ -20,7 +22,13 @@ describe("Protocol V1", () => {
   });
 
   it("round trips the event fixtures", () => {
-    for (const fixture of [readyFixture, transcriptFixture, suggestionFixture]) {
+    for (const fixture of [
+      readyFixture,
+      transcriptFixture,
+      suggestionFixture,
+      idleSessionStateFixture,
+      activeSessionStateFixture,
+    ]) {
       expect(decodeEnvelope(fixture)).toEqual(fixture);
     }
   });

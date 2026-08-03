@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "id": "018f0000-0000-7000-8000-000000000011",
+  "session_id": null,
+  "sequence": 4,
+  "timestamp_ms": 1720000000400,
+  "kind": "session.state",
+  "payload": {
+    "state": "idle",
+    "mode": null,
+    "input_language": null,
+    "response_language": null,
+    "review_language": null,
+    "you_source": "mic",
+    "listening": false,
+    "system_audio_enabled": false
+  },
+  "correlation_id": "018f0000-0000-7000-8000-000000000002"
+}

@@ -376,9 +376,9 @@ pub fn validate_command(command: &Envelope) -> Result<(), CommandValidationError
                     "brief_id",
                 ],
             ) && required_string(payload, "mode")
-                && required_string(payload, "input_language")
-                && required_string(payload, "response_language")
-                && required_string(payload, "review_language")
+                && required_language(payload, "input_language")
+                && required_language(payload, "response_language")
+                && required_language(payload, "review_language")
                 && required_source(payload, "you_source")
                 && required_string(payload, "brief_id")
         }
@@ -442,25 +442,19 @@ pub fn validate_event(event: &Envelope) -> Result<(), CommandValidationError> {
                 && event.payload.get("status") == Some(&Value::String("ready".into()))
         }
         EventKind::SessionState => {
-            event.session_id.is_some()
-                && has_exact_keys(
-                    &event.payload,
-                    &[
-                        "state",
-                        "mode",
-                        "input_language",
-                        "response_language",
-                        "review_language",
-                        "you_source",
-                        "listening",
-                        "system_audio_enabled",
-                    ],
-                )
-                && required_bounded_string(&event.payload, "state")
-                && required_bounded_string(&event.payload, "mode")
-                && required_bounded_string(&event.payload, "input_language")
-                && required_bounded_string(&event.payload, "response_language")
-                && required_bounded_string(&event.payload, "review_language")
+            has_exact_keys(
+                &event.payload,
+                &[
+                    "state",
+                    "mode",
+                    "input_language",
+                    "response_language",
+                    "review_language",
+                    "you_source",
+                    "listening",
+                    "system_audio_enabled",
+                ],
+            ) && required_runtime_state(&event.payload, "state")
                 && required_source(&event.payload, "you_source")
                 && event
                     .payload
@@ -470,6 +464,7 @@ pub fn validate_event(event: &Envelope) -> Result<(), CommandValidationError> {
                     .payload
                     .get("system_audio_enabled")
                     .is_some_and(Value::is_boolean)
+                && valid_session_snapshot(event)
         }
         EventKind::TranscriptUpdated => {
             event.session_id.is_some()
@@ -500,7 +495,7 @@ pub fn validate_event(event: &Envelope) -> Result<(), CommandValidationError> {
                     Some("interviewee" | "interviewer")
                 )
                 && required_source(&event.payload, "source")
-                && required_bounded_string(&event.payload, "language")
+                && required_language(&event.payload, "language")
                 && event
                     .payload
                     .get("confidence")
@@ -533,7 +528,7 @@ pub fn validate_event(event: &Envelope) -> Result<(), CommandValidationError> {
                     &event.payload,
                     &["state", "chunks", "files", "chunks_added"],
                 )
-                && required_bounded_string(&event.payload, "state")
+                && required_knowledge_state(&event.payload, "state")
                 && required_safe_integer(&event.payload, "chunks")
                 && required_safe_integer(&event.payload, "files")
                 && required_safe_integer(&event.payload, "chunks_added")
@@ -575,6 +570,45 @@ fn required_source(payload: &Map<String, Value>, key: &str) -> bool {
     )
 }
 
+fn required_runtime_state(payload: &Map<String, Value>, key: &str) -> bool {
+    matches!(
+        payload.get(key).and_then(Value::as_str),
+        Some("idle" | "starting" | "listening" | "paused" | "stopping" | "stopped" | "error")
+    )
+}
+
+fn required_knowledge_state(payload: &Map<String, Value>, key: &str) -> bool {
+    matches!(
+        payload.get(key).and_then(Value::as_str),
+        Some("disabled" | "loading" | "ready" | "error")
+    )
+}
+
+fn valid_session_snapshot(event: &Envelope) -> bool {
+    let payload = &event.payload;
+    let state = payload.get("state").and_then(Value::as_str);
+    if state == Some("idle") {
+        return event.session_id.is_none()
+            && [
+                "mode",
+                "input_language",
+                "response_language",
+                "review_language",
+            ]
+            .iter()
+            .all(|key| payload.get(*key).is_some_and(Value::is_null))
+            && payload.get("you_source") == Some(&Value::String("mic".into()))
+            && payload.get("listening") == Some(&Value::Bool(false));
+    }
+
+    event.session_id.is_some()
+        && required_bounded_string(payload, "mode")
+        && required_language(payload, "input_language")
+        && required_language(payload, "response_language")
+        && required_language(payload, "review_language")
+        && payload.get("listening") == Some(&Value::Bool(matches!(state, Some("listening"))))
+}
+
 const MAX_EVENT_STRING_BYTES: usize = 64 * 1024;
 
 fn required_bounded_string(payload: &Map<String, Value>, key: &str) -> bool {
@@ -582,6 +616,30 @@ fn required_bounded_string(payload: &Map<String, Value>, key: &str) -> bool {
         .get(key)
         .and_then(Value::as_str)
         .is_some_and(|value| !value.is_empty() && value.len() <= MAX_EVENT_STRING_BYTES)
+}
+
+fn required_language(payload: &Map<String, Value>, key: &str) -> bool {
+    payload
+        .get(key)
+        .and_then(Value::as_str)
+        .is_some_and(is_language_tag)
+}
+
+fn is_language_tag(value: &str) -> bool {
+    if matches!(value, "auto" | "und") {
+        return true;
+    }
+    let mut parts = value.split('-');
+    let Some(primary) = parts.next() else {
+        return false;
+    };
+    if !(2..=8).contains(&primary.len()) || !primary.bytes().all(|byte| byte.is_ascii_alphabetic())
+    {
+        return false;
+    }
+    parts.all(|part| {
+        (1..=8).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    })
 }
 
 fn optional_bounded_string(payload: &Map<String, Value>, key: &str) -> bool {
@@ -612,8 +670,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        encode_frame, Envelope, EventKind, FrameDecoder, ProtocolKind, MAX_FRAME_BYTES,
-        MAX_SAFE_INTEGER, PROTOCOL_VERSION,
+        encode_frame, validate_event, Envelope, EventKind, FrameDecoder, ProtocolKind,
+        MAX_FRAME_BYTES, MAX_SAFE_INTEGER, PROTOCOL_VERSION,
     };
 
     fn enum_values(source: &str, enum_name: &str) -> BTreeSet<String> {
@@ -704,6 +762,35 @@ mod tests {
             serde_json::to_value(value).unwrap(),
             serde_json::from_str::<serde_json::Value>(raw).unwrap()
         );
+    }
+
+    #[test]
+    fn session_state_fixtures_match_adapter_semantics_and_reject_semantic_garbage() {
+        for fixture in [
+            include_str!("../../../protocol/v1/fixtures/session-state-idle.json"),
+            include_str!("../../../protocol/v1/fixtures/session-state-active.json"),
+        ] {
+            let event: Envelope = serde_json::from_str(fixture).unwrap();
+            assert!(validate_event(&event).is_ok());
+        }
+
+        let mut unknown_state: Envelope = serde_json::from_str(include_str!(
+            "../../../protocol/v1/fixtures/session-state-active.json"
+        ))
+        .unwrap();
+        unknown_state
+            .payload
+            .insert("state".into(), "teleporting".into());
+        assert!(validate_event(&unknown_state).is_err());
+
+        let mut invalid_language: Envelope = serde_json::from_str(include_str!(
+            "../../../protocol/v1/fixtures/session-state-active.json"
+        ))
+        .unwrap();
+        invalid_language
+            .payload
+            .insert("response_language".into(), "not a language".into());
+        assert!(validate_event(&invalid_language).is_err());
     }
 
     #[test]
