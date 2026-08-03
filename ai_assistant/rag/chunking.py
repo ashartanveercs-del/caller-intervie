@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+from ai_assistant.rag.model_assets import resolve_model_source
 from ai_assistant.rag.models import Chunk
 
 logger = logging.getLogger(__name__)
@@ -35,8 +36,9 @@ class RecursiveTextSplitter:
             from transformers import AutoTokenizer
 
             logger.info("Loading tokenizer for token counting…")
+            source = resolve_model_source()
             self._tokenizer = AutoTokenizer.from_pretrained(
-                "sentence-transformers/all-MiniLM-L6-v2"
+                str(source.path), local_files_only=source.local_files_only
             )
         return self._tokenizer
 

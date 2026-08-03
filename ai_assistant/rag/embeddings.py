@@ -6,11 +6,13 @@ import logging
 
 import numpy as np
 
+from ai_assistant.rag.model_assets import MODEL_REPOSITORY, resolve_model_source
+
 logger = logging.getLogger(__name__)
 
 
 class LocalEmbedder:
-    """Wraps a SentenceTransformer model for encoding text into dense vectors."""
+    """Wrap a SentenceTransformer model for dense-vector encoding."""
 
     def __init__(
         self,
@@ -19,18 +21,22 @@ class LocalEmbedder:
     ) -> None:
         from sentence_transformers import SentenceTransformer
 
-        logger.info("Loading embedding model %s on %s", model_name, device)
-        # Prefer the local cache: local_files_only skips the HuggingFace Hub
-        # revision check, which otherwise adds ~40s of network round-trips to
-        # every startup once the model is already downloaded. Fall back to a
-        # network download only on first run (or if the cache is missing).
+        source = resolve_model_source()
+        logger.info("Loading embedding model %s on %s", source.path, device)
+        if source.bundled:
+            self._model = SentenceTransformer(
+                str(source.path), device=device, local_files_only=True
+            )
+            return
+
+        # Development remains cache-first, with an explicit initial-download path.
         try:
             self._model = SentenceTransformer(
                 model_name, device=device, local_files_only=True
             )
         except Exception:
-            logger.info("Model not in local cache — downloading %s…", model_name)
-            self._model = SentenceTransformer(model_name, device=device)
+            logger.info("Model not in local cache; downloading %s", MODEL_REPOSITORY)
+            self._model = SentenceTransformer(MODEL_REPOSITORY, device=device)
 
     @property
     def dimension(self) -> int:
@@ -43,7 +49,7 @@ class LocalEmbedder:
         batch_size: int = 64,
         show_progress: bool = False,
     ) -> np.ndarray:
-        """Encode *texts* and return a (N, dim) float32 array of unit vectors."""
+        """Encode texts into a (N, dim) float32 array of unit vectors."""
         embeddings = self._model.encode(
             texts,
             batch_size=batch_size,

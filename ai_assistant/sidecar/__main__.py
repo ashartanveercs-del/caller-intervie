@@ -34,10 +34,16 @@ async def _run_transport() -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--healthcheck", action="store_true")
+    parser.add_argument("--self-test", action="store_true")
     arguments = parser.parse_args(argv)
 
     if arguments.healthcheck:
         print(json.dumps({"status": "ok", "protocol_version": PROTOCOL_VERSION}, separators=(",", ":")))
+        return 0
+    if arguments.self_test:
+        from ai_assistant.sidecar.self_test import run
+
+        print(json.dumps(run(), separators=(",", ":")))
         return 0
 
     _configure_logging()
