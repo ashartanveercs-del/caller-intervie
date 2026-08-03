@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "id": "018f0000-0000-7000-8000-000000000006",
+  "session_id": "018f0000-0000-7000-8000-000000000003",
+  "sequence": 3,
+  "timestamp_ms": 1720000000300,
+  "kind": "suggestion.completed",
+  "payload": {
+    "suggestion_id": "018f0000-0000-7000-8000-000000000007",
+    "text": "State the trade-off, then give the decision criterion."
+  },
+  "correlation_id": "018f0000-0000-7000-8000-000000000004"
+}

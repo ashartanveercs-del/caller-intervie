@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "id": "018f0000-0000-7000-8000-000000000004",
+  "session_id": "018f0000-0000-7000-8000-000000000003",
+  "sequence": 2,
+  "timestamp_ms": 1720000000200,
+  "kind": "transcript.updated",
+  "payload": {
+    "turn_id": "018f0000-0000-7000-8000-000000000005",
+    "text": "I would begin by defining the service boundary.",
+    "is_final": true,
+    "speech_final": true,
+    "speaker_role": "interviewee",
+    "source": "mic",
+    "language": "en",
+    "confidence": 0.98,
+    "started_at_ms": 1720000000100,
+    "ended_at_ms": 1720000000200
+  },
+  "correlation_id": "018f0000-0000-7000-8000-000000000002"
+}

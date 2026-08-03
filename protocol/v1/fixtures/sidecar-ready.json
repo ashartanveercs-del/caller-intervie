@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "id": "018f0000-0000-7000-8000-000000000001",
+  "session_id": null,
+  "sequence": 0,
+  "timestamp_ms": 1720000000000,
+  "kind": "sidecar.ready",
+  "payload": {
+    "status": "ready"
+  },
+  "correlation_id": null
+}

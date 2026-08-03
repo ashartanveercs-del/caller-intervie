@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "id": "018f0000-0000-7000-8000-000000000002",
+  "session_id": "018f0000-0000-7000-8000-000000000003",
+  "sequence": 1,
+  "timestamp_ms": 1720000000100,
+  "kind": "session.start",
+  "payload": {
+    "mode": "interview",
+    "input_language": "auto",
+    "response_language": "en",
+    "review_language": "en",
+    "you_source": "mic",
+    "brief_id": "018f0000-0000-7000-8000-000000000010"
+  },
+  "correlation_id": null
+}

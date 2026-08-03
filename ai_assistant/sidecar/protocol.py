@@ -1,0 +1,139 @@
+"""Versioned sidecar protocol envelope models."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+import re
+from typing import Any
+
+
+PROTOCOL_VERSION = 1
+
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+_ENVELOPE_FIELDS = {
+    "version",
+    "id",
+    "session_id",
+    "sequence",
+    "timestamp_ms",
+    "kind",
+    "payload",
+    "correlation_id",
+}
+
+
+class CommandKind(str, Enum):
+    HANDSHAKE_REQUEST = "handshake.request"
+    SESSION_START = "session.start"
+    SESSION_STOP = "session.stop"
+    LISTENING_SET = "listening.set"
+    YOU_SOURCE_SET = "you_source.set"
+    QUERY_TRIGGER = "query.trigger"
+    AUDIO_SYSTEM_SET = "audio.system.set"
+    AUDIO_DEVICE_SET = "audio.device.set"
+    KNOWLEDGE_INGEST = "knowledge.ingest"
+    SESSION_SNAPSHOT_REQUEST = "session.snapshot.request"
+
+
+class EventKind(str, Enum):
+    SIDECAR_READY = "sidecar.ready"
+    SESSION_STATE = "session.state"
+    TRANSCRIPT_UPDATED = "transcript.updated"
+    SUGGESTION_CHUNK = "suggestion.chunk"
+    SUGGESTION_COMPLETED = "suggestion.completed"
+    AUDIO_HEALTH = "audio.health"
+    PROVIDER_HEALTH = "provider.health"
+    KNOWLEDGE_STATE = "knowledge.state"
+    RUNTIME_ERROR = "runtime.error"
+
+
+Kind = CommandKind | EventKind
+
+
+def _require_uuid(value: object, field: str) -> str:
+    if not isinstance(value, str) or not _UUID_RE.fullmatch(value):
+        raise ValueError(f"{field} must be a UUID string")
+    return value
+
+
+def _require_nonnegative_integer(value: object, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field} must be a nonnegative integer")
+    return value
+
+
+def _parse_kind(value: object) -> Kind:
+    if not isinstance(value, str):
+        raise ValueError("kind must be a known namespaced string")
+    try:
+        return CommandKind(value)
+    except ValueError:
+        try:
+            return EventKind(value)
+        except ValueError as error:
+            raise ValueError("kind must be a known namespaced string") from error
+
+
+@dataclass(frozen=True)
+class Envelope:
+    version: int
+    id: str
+    session_id: str | None
+    sequence: int
+    timestamp_ms: int
+    kind: Kind
+    payload: dict[str, Any]
+    correlation_id: str | None
+
+    @classmethod
+    def from_dict(cls, value: object) -> "Envelope":
+        if not isinstance(value, dict):
+            raise ValueError("envelope must be an object")
+
+        fields = set(value)
+        if fields != _ENVELOPE_FIELDS:
+            missing = _ENVELOPE_FIELDS - fields
+            unknown = fields - _ENVELOPE_FIELDS
+            raise ValueError(f"invalid envelope fields: missing={missing}, unknown={unknown}")
+
+        version = _require_nonnegative_integer(value["version"], "version")
+        if version != PROTOCOL_VERSION:
+            raise ValueError(f"unsupported protocol version: {version}")
+
+        session_id = value["session_id"]
+        if session_id is not None:
+            session_id = _require_uuid(session_id, "session_id")
+
+        correlation_id = value["correlation_id"]
+        if correlation_id is not None:
+            correlation_id = _require_uuid(correlation_id, "correlation_id")
+
+        payload = value["payload"]
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be an object")
+
+        return cls(
+            version=version,
+            id=_require_uuid(value["id"], "id"),
+            session_id=session_id,
+            sequence=_require_nonnegative_integer(value["sequence"], "sequence"),
+            timestamp_ms=_require_nonnegative_integer(value["timestamp_ms"], "timestamp_ms"),
+            kind=_parse_kind(value["kind"]),
+            payload=dict(payload),
+            correlation_id=correlation_id,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "id": self.id,
+            "session_id": self.session_id,
+            "sequence": self.sequence,
+            "timestamp_ms": self.timestamp_ms,
+            "kind": self.kind.value,
+            "payload": self.payload,
+            "correlation_id": self.correlation_id,
+        }
