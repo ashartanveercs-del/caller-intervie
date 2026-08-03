@@ -12,3 +12,7 @@ build/
 .mypy_cache/
 .pytest_cache/
 .worktrees/
+node_modules/
+desktop/dist/
+desktop/src-tauri/target/
+desktop/src-tauri/binaries/
