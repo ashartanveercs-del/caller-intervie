@@ -32,7 +32,7 @@ try {
     if ($smokeExitCode -eq 0) {
         throw "smoke accepted an old exact-name binary after a packaging input changed"
     }
-    if (($failureOutput | Out-String) -notmatch "provenance packaging inputs do not match") {
+    if (($failureOutput | Out-String) -notmatch "build receipt packaging inputs do not match") {
         throw "smoke failed for an unexpected reason: $failureOutput"
     }
 }

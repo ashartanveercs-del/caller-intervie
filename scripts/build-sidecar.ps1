@@ -46,6 +46,7 @@ $distRoot = Join-Path $buildRoot "dist"
 $modelAssets = Join-Path $buildRoot "rag-model"
 $modelFetcher = Join-Path $projectRoot "sidecar\fetch_model_assets.py"
 $publisher = Join-Path $projectRoot "scripts\publish-sidecar-artifact.ps1"
+$provenanceHelper = Join-Path $projectRoot "sidecar\package_provenance.py"
 
 $python = Resolve-ToolPath $PythonPath @(
     (Join-Path $projectRoot ".venv\Scripts\python.exe"),
@@ -101,17 +102,34 @@ if ($PrepareOnly) {
     return
 }
 
+$preBuildInputHash = (& $python $provenanceHelper fingerprint).Trim()
+if ($LASTEXITCODE -ne 0 -or -not $preBuildInputHash) {
+    throw "Unable to capture sidecar packaging input hash before PyInstaller"
+}
 & $python -m PyInstaller --noconfirm --clean --workpath (Join-Path $buildRoot "work") --distpath $distRoot $spec
 if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller failed with exit code $LASTEXITCODE"
+}
+
+$postBuildInputHash = (& $python $provenanceHelper fingerprint).Trim()
+if ($LASTEXITCODE -ne 0 -or -not $postBuildInputHash) {
+    throw "Unable to capture sidecar packaging input hash after PyInstaller"
+}
+if ($preBuildInputHash -cne $postBuildInputHash) {
+    throw "Sidecar packaging inputs changed during PyInstaller build"
 }
 
 $builtBinary = Join-Path $distRoot "callerinterview-sidecar$extension"
 if (-not (Test-Path -LiteralPath $builtBinary -PathType Leaf)) {
     throw "PyInstaller output missing: $builtBinary"
 }
+$buildReceipt = "$builtBinary.receipt.json"
+& $python $provenanceHelper write-receipt --binary $builtBinary --target-triple $TargetTriple --receipt $buildReceipt --packaging-input-sha256 $preBuildInputHash
+if ($LASTEXITCODE -ne 0) {
+    throw "Unable to write sidecar build receipt"
+}
 
-& $publisher -SourceBinary $builtBinary -TargetTriple $TargetTriple -PythonPath $python
+& $publisher -SourceBinary $builtBinary -ReceiptPath $buildReceipt -TargetTriple $TargetTriple -PythonPath $python
 if ($LASTEXITCODE -ne 0) {
     throw "sidecar artifact publish failed with exit code $LASTEXITCODE"
 }

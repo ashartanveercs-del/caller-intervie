@@ -17,18 +17,20 @@ $targetTriple = $binaries[0].BaseName -replace '^callerinterview-sidecar-', ''
 $provenance = "$binary.provenance.json"
 $publisher = Join-Path $PSScriptRoot "publish-sidecar-artifact.ps1"
 $smokeScript = Join-Path $PSScriptRoot "test-sidecar-package.ps1"
+$distBinary = Join-Path $projectRoot "sidecar\build\dist\callerinterview-sidecar$($binaries[0].Extension)"
+$distReceipt = "$distBinary.receipt.json"
 
-if (-not (Test-Path -LiteralPath $provenance -PathType Leaf)) {
-    throw "publish regression requires a valid current sidecar and provenance"
+if (-not (Test-Path -LiteralPath $provenance -PathType Leaf) -or -not (Test-Path -LiteralPath $distBinary -PathType Leaf) -or -not (Test-Path -LiteralPath $distReceipt -PathType Leaf)) {
+    throw "publish regression requires a valid current sidecar and build receipt"
 }
 
-foreach ($fault in @("copy", "replace")) {
+foreach ($fault in @("copy", "after-both-swap")) {
     $binaryHash = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash
     $provenanceHash = (Get-FileHash -LiteralPath $provenance -Algorithm SHA256).Hash
     $previousErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        $failureOutput = & powershell -ExecutionPolicy Bypass -File $publisher -SourceBinary $binary -TargetTriple $targetTriple -FaultInjection $fault 2>&1
+        $failureOutput = & powershell -ExecutionPolicy Bypass -File $publisher -SourceBinary $distBinary -ReceiptPath $distReceipt -TargetTriple $targetTriple -FaultInjection $fault 2>&1
         $publishExitCode = $LASTEXITCODE
     }
     finally {

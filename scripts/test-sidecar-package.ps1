@@ -97,7 +97,7 @@ if (-not (Test-Path -LiteralPath $provenance -PathType Leaf)) {
 }
 $python = Resolve-Python $PythonPath $projectRoot
 $provenanceHelper = Join-Path $projectRoot "sidecar\package_provenance.py"
-& $python $provenanceHelper validate --binary $binary --target-triple $TargetTriple --provenance $provenance
+& $python $provenanceHelper validate-receipt --binary $binary --target-triple $TargetTriple --receipt $provenance
 if ($LASTEXITCODE -ne 0) {
     throw "sidecar provenance validation failed"
 }

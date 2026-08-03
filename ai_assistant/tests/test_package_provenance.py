@@ -63,3 +63,47 @@ def test_written_provenance_is_relative_and_canonical(monkeypatch, tmp_path) -> 
     manifest = json.loads(provenance.read_text(encoding="utf-8"))
     assert set(manifest) == package_provenance.REQUIRED_FIELDS
     assert str(project_root) not in provenance.read_text(encoding="utf-8")
+
+
+def test_build_receipt_rejects_changed_packaging_input(monkeypatch, tmp_path) -> None:
+    project_root = _fixture_project(tmp_path)
+    binary = tmp_path / "callerinterview-sidecar.exe"
+    receipt = tmp_path / "callerinterview-sidecar.exe.receipt.json"
+    binary.write_bytes(b"built-sidecar")
+    monkeypatch.setattr(package_provenance, "PROJECT_ROOT", project_root)
+
+    package_provenance.write_build_receipt(
+        binary, "x86_64-pc-windows-msvc", receipt
+    )
+    _write(project_root / "sidecar" / "sidecar.spec", "spec = 2\n")
+
+    with pytest.raises(ValueError, match="packaging inputs"):
+        package_provenance.validate_build_receipt(
+            binary, "x86_64-pc-windows-msvc", receipt
+        )
+
+
+def test_build_receipt_uses_captured_input_hash(monkeypatch, tmp_path) -> None:
+    project_root = _fixture_project(tmp_path)
+    binary = tmp_path / "callerinterview-sidecar.exe"
+    receipt = tmp_path / "callerinterview-sidecar.exe.receipt.json"
+    binary.write_bytes(b"built-sidecar")
+    monkeypatch.setattr(package_provenance, "PROJECT_ROOT", project_root)
+    captured_hash = package_provenance.packaging_input_sha256()
+
+    package_provenance.write_build_receipt(
+        binary, "x86_64-pc-windows-msvc", receipt, captured_hash
+    )
+    manifest = json.loads(receipt.read_text(encoding="utf-8"))
+
+    assert manifest["packaging_input_sha256"] == captured_hash
+
+
+def test_packaging_input_hash_includes_pair_transaction_helper(tmp_path) -> None:
+    project_root = _fixture_project(tmp_path)
+    transaction_helper = project_root / "scripts" / "sidecar-artifact-transaction.psm1"
+    _write(transaction_helper, "function Publish { 'old' }\n")
+    first = package_provenance.packaging_input_sha256(project_root)
+    _write(transaction_helper, "function Publish { 'new' }\n")
+
+    assert first != package_provenance.packaging_input_sha256(project_root)

@@ -43,6 +43,7 @@ def _input_paths(project_root: Path) -> Iterable[Path]:
         "sidecar/**/*.spec",
         "scripts/build-sidecar.ps1",
         "scripts/publish-sidecar-artifact.ps1",
+        "scripts/sidecar-artifact-transaction.psm1",
         "scripts/test-sidecar-package.ps1",
     )
     paths = {
@@ -67,64 +68,90 @@ def packaging_input_sha256(project_root: Path | None = None) -> str:
     return digest.hexdigest()
 
 
-def create_provenance(binary: Path, target_triple: str) -> dict[str, int | str]:
-    """Return the sidecar manifest with no machine-specific path information."""
+def create_build_receipt(
+    binary: Path, target_triple: str, packaging_input_hash: str | None = None
+) -> dict[str, int | str]:
+    """Return a receipt bound to the source inputs observed for this build."""
+    current_input_hash = packaging_input_sha256()
+    if packaging_input_hash is None:
+        packaging_input_hash = current_input_hash
+    if packaging_input_hash != current_input_hash:
+        raise ValueError("build receipt packaging inputs do not match")
     return {
         "schema_version": SCHEMA_VERSION,
         "target_triple": target_triple,
         "model_revision": MODEL_REVISION,
         "binary_sha256": sha256_file(binary),
-        "packaging_input_sha256": packaging_input_sha256(),
+        "packaging_input_sha256": packaging_input_hash,
     }
 
 
-def write_provenance(binary: Path, target_triple: str, output: Path) -> dict[str, int | str]:
-    """Write canonical provenance next to a staged or final sidecar."""
-    provenance = create_provenance(binary, target_triple)
+def write_build_receipt(
+    binary: Path,
+    target_triple: str,
+    output: Path,
+    packaging_input_hash: str | None = None,
+) -> dict[str, int | str]:
+    """Write canonical build receipt next to the PyInstaller output."""
+    receipt = create_build_receipt(binary, target_triple, packaging_input_hash)
     output.write_text(
-        json.dumps(provenance, sort_keys=True, separators=(",", ":")) + "\n",
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n",
         encoding="utf-8",
     )
-    return provenance
+    return receipt
 
 
-def validate_provenance(binary: Path, target_triple: str, provenance_path: Path) -> None:
-    """Reject binary, source-input, target, revision, and schema mismatches."""
+def validate_build_receipt(binary: Path, target_triple: str, receipt_path: Path) -> None:
+    """Reject receipt, binary, target, revision, and source-input mismatches."""
     try:
-        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
-        raise ValueError("sidecar provenance is unreadable") from error
+        raise ValueError("sidecar build receipt is unreadable") from error
 
-    if not isinstance(provenance, dict) or set(provenance) != REQUIRED_FIELDS:
-        raise ValueError("sidecar provenance schema is invalid")
-    if provenance["schema_version"] != SCHEMA_VERSION:
-        raise ValueError("sidecar provenance schema version is invalid")
-    if provenance["target_triple"] != target_triple:
-        raise ValueError("sidecar provenance target triple is invalid")
-    if provenance["model_revision"] != MODEL_REVISION:
-        raise ValueError("sidecar provenance model revision is invalid")
-    if provenance["binary_sha256"] != sha256_file(binary):
-        raise ValueError("sidecar provenance binary hash does not match")
-    if provenance["packaging_input_sha256"] != packaging_input_sha256():
-        raise ValueError("sidecar provenance packaging inputs do not match")
+    if not isinstance(receipt, dict) or set(receipt) != REQUIRED_FIELDS:
+        raise ValueError("sidecar build receipt schema is invalid")
+    if receipt["schema_version"] != SCHEMA_VERSION:
+        raise ValueError("sidecar build receipt schema version is invalid")
+    if receipt["target_triple"] != target_triple:
+        raise ValueError("sidecar build receipt target triple is invalid")
+    if receipt["model_revision"] != MODEL_REVISION:
+        raise ValueError("sidecar build receipt model revision is invalid")
+    if receipt["binary_sha256"] != sha256_file(binary):
+        raise ValueError("sidecar build receipt binary hash does not match")
+    if receipt["packaging_input_sha256"] != packaging_input_sha256():
+        raise ValueError("sidecar build receipt packaging inputs do not match")
+
+
+# Compatibility aliases keep the smoke contract readable while publication only
+# accepts receipts produced by the build flow.
+create_provenance = create_build_receipt
+write_provenance = write_build_receipt
+validate_provenance = validate_build_receipt
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     command = parser.add_subparsers(dest="command", required=True)
-    for name in ("write", "validate"):
+    for name in ("write-receipt", "validate-receipt"):
         subparser = command.add_parser(name)
         subparser.add_argument("--binary", required=True, type=Path)
         subparser.add_argument("--target-triple", required=True)
-        subparser.add_argument("--provenance", required=True, type=Path)
+        subparser.add_argument("--receipt", required=True, type=Path)
+        if name == "write-receipt":
+            subparser.add_argument("--packaging-input-sha256", required=True)
     fingerprint = command.add_parser("fingerprint")
     fingerprint.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
     arguments = parser.parse_args()
 
-    if arguments.command == "write":
-        write_provenance(arguments.binary, arguments.target_triple, arguments.provenance)
-    elif arguments.command == "validate":
-        validate_provenance(arguments.binary, arguments.target_triple, arguments.provenance)
+    if arguments.command == "write-receipt":
+        write_build_receipt(
+            arguments.binary,
+            arguments.target_triple,
+            arguments.receipt,
+            arguments.packaging_input_sha256,
+        )
+    elif arguments.command == "validate-receipt":
+        validate_build_receipt(arguments.binary, arguments.target_triple, arguments.receipt)
     else:
         print(packaging_input_sha256(arguments.project_root))
     return 0
