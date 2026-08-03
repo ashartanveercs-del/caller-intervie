@@ -37,6 +37,7 @@ class TranscriptEvent:
     language: Optional[str] = None
     started_at_ms: Optional[int] = None
     ended_at_ms: Optional[int] = None
+    turn_id: Optional[str] = None
 
 
 @dataclass

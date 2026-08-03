@@ -17,7 +17,7 @@ from ai_assistant.core.events import (
 )
 from ai_assistant.runtime import SessionConfig
 
-from .protocol import CommandKind, Envelope, EventKind, PROTOCOL_VERSION
+from .protocol import CommandKind, Envelope, EventKind, PROTOCOL_VERSION, WireEnvelope
 
 
 EventOutput = Callable[[Envelope], Awaitable[None] | None]
@@ -34,14 +34,18 @@ class RuntimeProtocolAdapter:
     def __init__(self, runtime, output: EventOutput) -> None:
         self._runtime = runtime
         self._output = output
+        self._turn_ids: dict[str, str] = {}
+        self._suggestion_ids: dict[str, str] = {}
+        self._response_correlations: dict[str, str | None] = {}
+        self._pending_response_correlation_id: str | None = None
         runtime.event_bus.on(EventType.TRANSCRIPT_UPDATE, self.on_transcript)
         runtime.event_bus.on(EventType.RESPONSE_CHUNK, self.on_response_chunk)
         runtime.event_bus.on(EventType.RESPONSE_COMPLETE, self.on_response_complete)
         runtime.event_bus.on(EventType.ERROR, self.on_runtime_error)
 
-    async def handle(self, command: Envelope) -> None:
+    async def handle(self, command: Envelope | WireEnvelope) -> None:
         """Execute one command and emit its protocol result directly to the transport."""
-        correlation_id = command.correlation_id or command.id
+        correlation_id = command.id
         if command.version != PROTOCOL_VERSION:
             await self._error(
                 "unsupported_version",
@@ -76,16 +80,22 @@ class RuntimeProtocolAdapter:
                 correlation_id=correlation_id,
             )
 
-    async def emit_ready(self) -> None:
-        await self._emit(EventKind.SIDECAR_READY, {"status": "ready"})
+    async def emit_ready(self, correlation_id: str | None = None) -> None:
+        await self._emit(
+            EventKind.SIDECAR_READY,
+            {"status": "ready"},
+            correlation_id=correlation_id,
+        )
 
     async def on_transcript(self, event: TranscriptEvent) -> None:
         timestamp_ms = int(event.timestamp * 1000)
         snapshot = self._runtime.snapshot()
-        await self._emit(
+        turn_id = event.turn_id or self._turn_ids.get(event.source) or str(uuid4())
+        self._turn_ids[event.source] = turn_id
+        envelope = await self._emit(
             EventKind.TRANSCRIPT_UPDATED,
             {
-                "turn_id": str(uuid4()),
+                "turn_id": turn_id,
                 "text": event.text,
                 "is_final": event.is_final,
                 "speech_final": event.speech_final,
@@ -100,19 +110,27 @@ class RuntimeProtocolAdapter:
             },
             session_id=snapshot.session_id,
         )
+        if event.is_final:
+            self._pending_response_correlation_id = envelope.id
+        if event.speech_final:
+            self._turn_ids.pop(event.source, None)
 
     async def on_response_chunk(self, event: ResponseChunkEvent) -> None:
+        suggestion_id, correlation_id = self._response_identity(event.request_id)
         await self._emit(
             EventKind.SUGGESTION_CHUNK,
-            {"suggestion_id": event.request_id, "text": event.text},
+            {"suggestion_id": suggestion_id, "text": event.text},
             session_id=self._runtime.snapshot().session_id,
+            correlation_id=correlation_id,
         )
 
     async def on_response_complete(self, event: ResponseCompleteEvent) -> None:
+        suggestion_id, correlation_id = self._response_identity(event.request_id)
         await self._emit(
             EventKind.SUGGESTION_COMPLETED,
-            {"suggestion_id": event.request_id, "text": event.full_text},
+            {"suggestion_id": suggestion_id, "text": event.full_text},
             session_id=self._runtime.snapshot().session_id,
+            correlation_id=correlation_id,
         )
 
     async def on_runtime_error(self, _event: object) -> None:
@@ -125,11 +143,11 @@ class RuntimeProtocolAdapter:
 
     async def _handle_command(self, command: Envelope) -> None:
         payload = command.payload
-        correlation_id = command.correlation_id or command.id
+        correlation_id = command.id
         kind = command.kind
 
         if kind is CommandKind.HANDSHAKE_REQUEST:
-            await self.emit_ready()
+            await self.emit_ready(correlation_id)
             return
         if kind is CommandKind.SESSION_START:
             await self._runtime.start_session(self._session_config(command))
@@ -151,6 +169,7 @@ class RuntimeProtocolAdapter:
             await self._runtime.trigger_query(
                 self._string(payload, "text"), self._string(payload, "answer_format")
             )
+            self._pending_response_correlation_id = command.id
             await self._emit_snapshot(correlation_id)
             return
         if kind is CommandKind.AUDIO_SYSTEM_SET:
@@ -262,7 +281,7 @@ class RuntimeProtocolAdapter:
         *,
         session_id: str | None = None,
         correlation_id: str | None = None,
-    ) -> None:
+    ) -> Envelope:
         event = Envelope(
             version=PROTOCOL_VERSION,
             id=str(uuid4()),
@@ -276,3 +295,11 @@ class RuntimeProtocolAdapter:
         result = self._output(event)
         if inspect.isawaitable(result):
             await result
+        return event
+
+    def _response_identity(self, request_id: str) -> tuple[str, str | None]:
+        suggestion_id = self._suggestion_ids.setdefault(request_id, str(uuid4()))
+        correlation_id = self._response_correlations.setdefault(
+            request_id, self._pending_response_correlation_id
+        )
+        return suggestion_id, correlation_id

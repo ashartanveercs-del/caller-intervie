@@ -99,18 +99,20 @@ def _parse_kind(value: object) -> Kind:
 
 
 @dataclass(frozen=True)
-class Envelope:
+class WireEnvelope:
+    """Structurally valid inbound envelope whose version or kind may be unsupported."""
+
     version: int
     id: str
     session_id: str | None
     sequence: int
     timestamp_ms: int
-    kind: Kind
+    kind: str
     payload: Mapping[str, Any]
     correlation_id: str | None
 
     @classmethod
-    def from_dict(cls, value: object) -> "Envelope":
+    def from_dict(cls, value: object) -> "WireEnvelope":
         if not isinstance(value, dict):
             raise ValueError("envelope must be an object")
 
@@ -119,10 +121,6 @@ class Envelope:
             missing = _ENVELOPE_FIELDS - fields
             unknown = fields - _ENVELOPE_FIELDS
             raise ValueError(f"invalid envelope fields: missing={missing}, unknown={unknown}")
-
-        version = _require_nonnegative_integer(value["version"], "version")
-        if version != PROTOCOL_VERSION:
-            raise ValueError(f"unsupported protocol version: {version}")
 
         session_id = value["session_id"]
         if session_id is not None:
@@ -136,15 +134,60 @@ class Envelope:
         if not isinstance(payload, dict):
             raise ValueError("payload must be an object")
 
+        kind = value["kind"]
+        if not isinstance(kind, str):
+            raise ValueError("kind must be a string")
+
         return cls(
-            version=version,
+            version=_require_nonnegative_integer(value["version"], "version"),
             id=_require_uuid(value["id"], "id"),
             session_id=session_id,
             sequence=_require_nonnegative_integer(value["sequence"], "sequence"),
             timestamp_ms=_require_nonnegative_integer(value["timestamp_ms"], "timestamp_ms"),
-            kind=_parse_kind(value["kind"]),
+            kind=kind,
             payload=_freeze_json(payload),
             correlation_id=correlation_id,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "id": self.id,
+            "session_id": self.session_id,
+            "sequence": self.sequence,
+            "timestamp_ms": self.timestamp_ms,
+            "kind": self.kind,
+            "payload": _thaw_json(self.payload),
+            "correlation_id": self.correlation_id,
+        }
+
+
+@dataclass(frozen=True)
+class Envelope:
+    version: int
+    id: str
+    session_id: str | None
+    sequence: int
+    timestamp_ms: int
+    kind: Kind
+    payload: Mapping[str, Any]
+    correlation_id: str | None
+
+    @classmethod
+    def from_dict(cls, value: object) -> "Envelope":
+        wire = WireEnvelope.from_dict(value)
+        if wire.version != PROTOCOL_VERSION:
+            raise ValueError(f"unsupported protocol version: {wire.version}")
+
+        return cls(
+            version=wire.version,
+            id=wire.id,
+            session_id=wire.session_id,
+            sequence=wire.sequence,
+            timestamp_ms=wire.timestamp_ms,
+            kind=_parse_kind(wire.kind),
+            payload=wire.payload,
+            correlation_id=wire.correlation_id,
         )
 
     def to_dict(self) -> dict[str, Any]:

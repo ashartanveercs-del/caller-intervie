@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import functools
+from io import BytesIO
 import json
+import struct
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import UUID
 
+import msgpack
 import pytest
 
 from ai_assistant.core.events import (
@@ -19,11 +23,14 @@ from ai_assistant.runtime import DocumentIngestionResult, RuntimeSnapshot
 from ai_assistant.sidecar import __main__ as sidecar_main
 from ai_assistant.sidecar.adapter import RuntimeProtocolAdapter
 from ai_assistant.sidecar.protocol import CommandKind, Envelope, EventKind, PROTOCOL_VERSION
+from ai_assistant.sidecar.framing import read_frame
+from ai_assistant.sidecar.transport import SidecarTransport
 
 
 FIXTURES = Path(__file__).resolve().parents[3] / "protocol" / "v1" / "fixtures"
 SESSION_ID = "018f0000-0000-7000-8000-000000000003"
 COMMAND_ID = "018f0000-0000-7000-8000-000000000002"
+PARENT_CORRELATION_ID = "018f0000-0000-7000-8000-000000000099"
 
 
 def load_fixture(name: str) -> Envelope:
@@ -49,6 +56,14 @@ def command(kind: CommandKind, payload: dict, *, correlation_id: str | None = No
         payload=payload,
         correlation_id=correlation_id,
     )
+
+
+def framed_wire_command(*, version: int = PROTOCOL_VERSION, kind: str = "session.stop") -> bytes:
+    raw = load_fixture("session-start.json").to_dict()
+    raw["version"] = version
+    raw["kind"] = kind
+    payload = msgpack.packb(raw, use_bin_type=True)
+    return struct.pack(">I", len(payload)) + payload
 
 
 class CollectingOutput:
@@ -199,6 +214,7 @@ async def test_handshake_stop_snapshot_and_knowledge_commands_emit_protocol_stat
 
     assert output.events[0].kind == EventKind.SIDECAR_READY
     assert output.events[0].payload == {"status": "ready"}
+    assert output.events[0].correlation_id == COMMAND_ID
     assert runtime.paths == ["resume.pdf", "role.txt"]
     assert output.events[1].kind == EventKind.KNOWLEDGE_STATE
     assert output.events[1].payload == {"state": "ready", "chunks": 7, "files": 2, "chunks_added": 4}
@@ -237,16 +253,25 @@ async def test_response_events_keep_request_as_correlation_id() -> None:
     output = CollectingOutput()
     adapter = RuntimeProtocolAdapter(FakeRuntimeService(), output.write)
 
+    await adapter.on_transcript(
+        TranscriptEvent(text="Question", is_final=True, speech_final=True, source="system")
+    )
+    transcript = output.last
     await adapter.on_response_chunk(ResponseChunkEvent(text="First", request_id="request-1"))
     await adapter.on_response_complete(
         ResponseCompleteEvent(full_text="First answer", request_id="request-1", input_tokens=12, output_tokens=8)
     )
 
-    assert output.events[0].kind == EventKind.SUGGESTION_CHUNK
-    assert output.events[0].payload == {"text": "First", "suggestion_id": "request-1"}
-    assert output.events[0].correlation_id is None
-    assert output.events[1].kind == EventKind.SUGGESTION_COMPLETED
-    assert output.events[1].payload == {"text": "First answer", "suggestion_id": "request-1"}
+    chunk, completed = output.events[-2:]
+    assert chunk.kind == EventKind.SUGGESTION_CHUNK
+    assert completed.kind == EventKind.SUGGESTION_COMPLETED
+    assert chunk.payload["text"] == "First"
+    assert completed.payload["text"] == "First answer"
+    assert chunk.payload["suggestion_id"] == completed.payload["suggestion_id"]
+    assert chunk.payload["suggestion_id"] != "request-1"
+    assert str(UUID(chunk.payload["suggestion_id"])) == chunk.payload["suggestion_id"]
+    assert chunk.correlation_id == transcript.id
+    assert completed.correlation_id == transcript.id
 
 
 @_async_test
@@ -258,7 +283,7 @@ async def test_invalid_command_and_runtime_exception_emit_sanitized_errors() -> 
 
     await adapter.handle(invalid)
     runtime.error = RuntimeError("secret prompt: do not disclose")
-    failure = command(CommandKind.SESSION_STOP, {}, correlation_id=COMMAND_ID)
+    failure = command(CommandKind.SESSION_STOP, {}, correlation_id=PARENT_CORRELATION_ID)
     await adapter.handle(failure)
 
     assert output.events[0].kind == EventKind.RUNTIME_ERROR
@@ -274,7 +299,7 @@ async def test_invalid_command_and_runtime_exception_emit_sanitized_errors() -> 
     assert output.events[1].payload["recoverable"] is True
     assert output.events[1].payload["source"] == "runtime"
     assert "secret prompt" not in output.events[1].payload["message"]
-    assert output.events[1].correlation_id == failure.correlation_id
+    assert output.events[1].correlation_id == failure.id
 
 
 @_async_test
@@ -291,6 +316,83 @@ async def test_unknown_kind_and_wrong_version_do_not_touch_runtime() -> None:
 
     assert runtime.started_with is None
     assert [event.payload["code"] for event in output.events] == ["unknown_command", "unsupported_version"]
+
+
+@_async_test
+async def test_immediate_command_result_uses_command_id_not_parent_correlation() -> None:
+    runtime = FakeRuntimeService()
+    output = CollectingOutput()
+    adapter = RuntimeProtocolAdapter(runtime, output.write)
+    received = command(
+        CommandKind.LISTENING_SET,
+        {"enabled": False},
+        correlation_id=PARENT_CORRELATION_ID,
+    )
+
+    await adapter.handle(received)
+
+    assert output.last.kind == EventKind.SESSION_STATE
+    assert output.last.correlation_id == received.id
+
+
+@_async_test
+async def test_framed_wrong_version_reaches_adapter_as_sanitized_error_without_runtime_mutation() -> None:
+    runtime = FakeRuntimeService()
+    transport_output = BytesIO()
+    transport = SidecarTransport(BytesIO(framed_wire_command(version=2)), transport_output)
+    adapter = RuntimeProtocolAdapter(runtime, transport.send)
+
+    await transport.run(adapter.handle)
+
+    transport_output.seek(0)
+    error = read_frame(transport_output)
+    assert error is not None
+    assert error.kind == EventKind.RUNTIME_ERROR
+    assert error.payload["code"] == "unsupported_version"
+    assert error.correlation_id == COMMAND_ID
+    assert runtime.started_with is None
+    assert runtime.stopped is False
+
+
+@_async_test
+async def test_framed_unknown_kind_reaches_adapter_as_sanitized_error_without_runtime_mutation() -> None:
+    runtime = FakeRuntimeService()
+    transport_output = BytesIO()
+    transport = SidecarTransport(
+        BytesIO(framed_wire_command(kind="future.command")), transport_output
+    )
+    adapter = RuntimeProtocolAdapter(runtime, transport.send)
+
+    await transport.run(adapter.handle)
+
+    transport_output.seek(0)
+    error = read_frame(transport_output)
+    assert error is not None
+    assert error.kind == EventKind.RUNTIME_ERROR
+    assert error.payload["code"] == "unknown_command"
+    assert error.correlation_id == COMMAND_ID
+    assert runtime.started_with is None
+    assert runtime.stopped is False
+
+
+@_async_test
+async def test_transcript_updates_share_turn_id_until_the_utterance_completes() -> None:
+    output = CollectingOutput()
+    adapter = RuntimeProtocolAdapter(FakeRuntimeService(), output.write)
+
+    await adapter.on_transcript(
+        TranscriptEvent(text="Hello", is_final=False, speech_final=False, source="mic")
+    )
+    await adapter.on_transcript(
+        TranscriptEvent(text="Hello there", is_final=True, speech_final=True, source="mic")
+    )
+    await adapter.on_transcript(
+        TranscriptEvent(text="Next", is_final=False, speech_final=False, source="mic")
+    )
+
+    interim, final, next_turn = output.events
+    assert interim.payload["turn_id"] == final.payload["turn_id"]
+    assert next_turn.payload["turn_id"] != final.payload["turn_id"]
 
 
 @_async_test

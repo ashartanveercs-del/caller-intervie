@@ -6,11 +6,11 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any, BinaryIO
 
-from .framing import read_frame, write_frame
-from .protocol import Envelope
+from .framing import read_command, write_frame
+from .protocol import Envelope, WireEnvelope
 
 
-CommandHandler = Callable[[Envelope], Awaitable[Envelope | None]]
+CommandHandler = Callable[[Envelope | WireEnvelope], Awaitable[Envelope | None]]
 
 
 class SidecarTransport:
@@ -20,7 +20,7 @@ class SidecarTransport:
         self._input_stream = input_stream
         self._output_stream = output_stream
         self._write_lock = asyncio.Lock()
-        self._active_read: asyncio.Task[Envelope | None] | None = None
+        self._active_read: asyncio.Task[Envelope | WireEnvelope | None] | None = None
         self._input_closed = False
 
     async def run(self, handler: CommandHandler) -> None:
@@ -51,8 +51,8 @@ class SidecarTransport:
         if workers:
             await self._drain_workers(workers)
 
-    async def _read_command(self) -> Envelope | None:
-        read_task = asyncio.create_task(asyncio.to_thread(read_frame, self._input_stream))
+    async def _read_command(self) -> Envelope | WireEnvelope | None:
+        read_task = asyncio.create_task(asyncio.to_thread(read_command, self._input_stream))
         self._active_read = read_task
         try:
             return (await self._drain_workers([read_task], on_cancel=self._start_close_input))[0]

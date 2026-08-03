@@ -7,7 +7,7 @@ from typing import BinaryIO
 
 import msgpack
 
-from .protocol import Envelope
+from .protocol import Envelope, WireEnvelope
 
 
 MAX_FRAME_SIZE = 16 * 1024 * 1024
@@ -43,8 +43,7 @@ def _read_exact(stream: BinaryIO, size: int, *, section: str, allow_clean_eof: b
     return bytes(data)
 
 
-def read_frame(stream: BinaryIO) -> Envelope | None:
-    """Read one frame, returning ``None`` only for a clean end of stream."""
+def _read_frame_value(stream: BinaryIO) -> object | None:
     header = _read_exact(
         stream, _LENGTH_PREFIX_SIZE, section="header", allow_clean_eof=True
     )
@@ -63,10 +62,32 @@ def read_frame(stream: BinaryIO) -> Envelope | None:
     except (msgpack.ExtraData, msgpack.FormatError, msgpack.StackError, ValueError) as error:
         raise FrameError("invalid MessagePack payload") from error
 
+    return value
+
+
+def read_frame(stream: BinaryIO) -> Envelope | None:
+    """Read one strict Protocol V1 envelope, returning ``None`` at clean EOF."""
+    value = _read_frame_value(stream)
+    if value is None:
+        return None
     try:
         return Envelope.from_dict(value)
     except ValueError as error:
         raise FrameError(f"invalid envelope: {error}") from error
+
+
+def read_command(stream: BinaryIO) -> Envelope | WireEnvelope | None:
+    """Read a structurally safe command while retaining version/kind mismatch metadata."""
+    value = _read_frame_value(stream)
+    if value is None:
+        return None
+    try:
+        return Envelope.from_dict(value)
+    except ValueError:
+        try:
+            return WireEnvelope.from_dict(value)
+        except ValueError as error:
+            raise FrameError(f"invalid envelope: {error}") from error
 
 
 def write_frame(stream: BinaryIO, envelope: Envelope) -> None:
