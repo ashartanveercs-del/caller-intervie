@@ -1,4 +1,4 @@
-"""Application entrypoint — wires all modules and starts the event loop."""
+"""Application entrypoint - wires the runtime to the legacy PySide6 UI."""
 
 from __future__ import annotations
 
@@ -6,19 +6,18 @@ import asyncio
 import logging
 import sys
 from pathlib import Path
+from uuid import uuid4
 
 from dotenv import load_dotenv
 
 from ai_assistant.config import Config
-from ai_assistant.core.events import EventBus, EventType
-from ai_assistant.core.orchestrator import Mode, Orchestrator
-from ai_assistant.audio.mic_capture import DualMicCapture
-from ai_assistant.audio.deepgram_client import DeepgramTranscriber
-from ai_assistant.llm.anthropic_client import AnthropicLLM
-from ai_assistant.llm.prompt_builder import PromptBuilder
-from ai_assistant.rag.embeddings import LocalEmbedder
-from ai_assistant.rag.vector_store import FAISSVectorStore
-from ai_assistant.rag.retriever import RAGRetriever
+from ai_assistant.core.events import EventType
+from ai_assistant.runtime import (
+    RuntimeConfigurationError,
+    RuntimeStateError,
+    SessionConfig,
+    build_runtime,
+)
 from ai_assistant.ui.app import AssistantApp
 
 logger = logging.getLogger(__name__)
@@ -28,11 +27,11 @@ def _setup_logging() -> None:
     import os
 
     # pythonw.exe (double-click / start.bat launch) has no console, so
-    # sys.stdout and sys.stderr are None. Any write to them — including a
-    # default logging StreamHandler or a third-party library — raises and can
+    # sys.stdout and sys.stderr are None. Any write to them - including a
+    # default logging StreamHandler or a third-party library - raises and can
     # kill the process. Redirect them to devnull so nothing can crash on write.
     # UTF-8 with errors ignored: a cp1252 devnull still RAISES on characters
-    # like "→" in log lines, and that exception killed the app under pythonw.
+    # like arrows in log lines, and that exception killed the app under pythonw.
     if sys.stdout is None:
         sys.stdout = open(os.devnull, "w", encoding="utf-8", errors="ignore")
     if sys.stderr is None:
@@ -44,7 +43,7 @@ def _setup_logging() -> None:
     handlers: list[logging.Handler] = [
         logging.FileHandler(log_path, encoding="utf-8")
     ]
-    # Add a console handler only when a REAL console/pipe is attached —
+    # Add a console handler only when a REAL console/pipe is attached -
     # never route logging through the devnull stub above.
     if sys.__stderr__ is not None:
         try:
@@ -93,42 +92,6 @@ def _setup_logging() -> None:
     )
 
 
-def _compute_level(pcm_bytes: bytes) -> float:
-    """Compute RMS level from 16-bit PCM audio, normalized to 0.0–1.0."""
-    import struct
-    n_samples = len(pcm_bytes) // 2
-    if n_samples == 0:
-        return 0.0
-    samples = struct.unpack(f"<{n_samples}h", pcm_bytes)
-    rms = (sum(s * s for s in samples) / n_samples) ** 0.5
-    # Normalize: 32768 is max for int16, but speech rarely hits that
-    level = min(1.0, rms / 8000.0)
-    return level
-
-
-async def audio_pump(
-    mic: DualMicCapture,
-    transcriber: DeepgramTranscriber,
-    signals: object,
-) -> None:
-    """Read tagged audio chunks, route to Deepgram, and emit level signals."""
-    frame_count = 0
-    async for source, chunk in mic:
-        if source == "mic":
-            await transcriber.send_mic_audio(chunk)
-        elif source == "system":
-            await transcriber.send_system_audio(chunk)
-
-        # Update level meters every 4th frame (~16ms * 4 = ~64ms) to avoid UI spam
-        frame_count += 1
-        if frame_count % 4 == 0:
-            level = _compute_level(chunk)
-            if source == "mic":
-                signals.mic_level.emit(level)
-            else:
-                signals.system_level.emit(level)
-
-
 async def async_main() -> None:
     # Logging + dotenv are initialised once in main() before the loop starts.
     config = Config.from_env()
@@ -140,174 +103,95 @@ async def async_main() -> None:
         logger.error("DEEPSEEK_API_KEY not set — exiting")
         sys.exit(1)
 
-    # ---- Event bus ----
-    bus = EventBus()
+    runtime = build_runtime(config)
 
-    # ---- Audio (dual capture: your mic + system audio for interviewer) ----
-    mic = DualMicCapture(
-        sample_rate=config.sample_rate,
-        blocksize=config.audio_blocksize,
-        dtype=config.audio_dtype,
-        mic_device=None,    # default mic, changed via UI dropdown
-        system_device=None, # set via UI dropdown (e.g. Stereomix)
-    )
-    transcriber = DeepgramTranscriber(config, bus)
-
-    # ---- LLM ----
-    prompt_builder = PromptBuilder(config)
-    llm = AnthropicLLM(config, bus)
-
-    # ---- RAG ----
-    # The embedding model takes ~30s to load, so build it on a background
-    # thread and show the UI immediately; RAG features light up when ready.
-    index_dir = config.rag_db_path
-    retriever_holder: dict[str, RAGRetriever] = {}
-
-    def _build_rag() -> RAGRetriever:
-        embedder = LocalEmbedder()
-        vector_store = FAISSVectorStore(dimension=embedder.dimension)
-        retriever = RAGRetriever(
-            embedder,
-            vector_store,
-            relevance_threshold=config.rag_relevance_threshold,
-            default_k=config.rag_top_k,
-        )
-        if Path(index_dir).exists() and (Path(index_dir) / "index.faiss").exists():
-            try:
-                retriever.load_index(index_dir)
-                logger.info("Loaded RAG index from %s", index_dir)
-            except Exception:
-                logger.warning("Failed to load RAG index — starting fresh")
-        docs_dir = Path("documents")
-        if docs_dir.exists():
-            results = retriever.ingest_directory(str(docs_dir))
-            if results:
-                logger.info("Auto-ingested %d documents from ./documents/", len(results))
-                retriever.save_index(index_dir)
-        return retriever
-
-    # ---- Orchestrator (RAG attaches later) ----
-    orchestrator = Orchestrator(
-        config=config,
-        event_bus=bus,
-        llm=llm,
-        prompt_builder=prompt_builder,
-        retriever=None,
-    )
-
-    # ---- UI ----
+    # Qt remains an adapter: it creates widgets and translates runtime events.
     ui_app = AssistantApp()
-    ui_app.setup()  # creates overlay, tray, shortcuts (QApplication already exists)
+    ui_app.setup()
 
-    # Bridge EventBus → Qt signals
-    async def _on_transcript(event):
+    async def _on_transcript(event) -> None:
         if ui_app.overlay is not None:
             ui_app.overlay.transcript_panel.add_transcript(
                 event.text, event.speaker, event.is_final, event.source
             )
 
-    async def _on_response_chunk(event):
+    async def _on_response_chunk(event) -> None:
         ui_app.signals.response_chunk.emit(event.text)
 
-    async def _on_response_complete(event):
+    async def _on_response_complete(event) -> None:
         ui_app.signals.response_complete.emit(event.full_text)
-        prompt_builder.add_to_history("assistant", event.full_text)
 
-    async def _on_mode_change(event):
+    async def _on_mode_change(event) -> None:
+        if event.old_mode == event.new_mode:
+            return
         ui_app.signals.mode_changed.emit(event.new_mode)
 
-    bus.on(EventType.TRANSCRIPT_UPDATE, _on_transcript)
-    bus.on(EventType.RESPONSE_CHUNK, _on_response_chunk)
-    bus.on(EventType.RESPONSE_COMPLETE, _on_response_complete)
-    bus.on(EventType.MODE_CHANGE, _on_mode_change)
+    runtime.event_bus.on(EventType.TRANSCRIPT_UPDATE, _on_transcript)
+    runtime.event_bus.on(EventType.RESPONSE_CHUNK, _on_response_chunk)
+    runtime.event_bus.on(EventType.RESPONSE_COMPLETE, _on_response_complete)
+    runtime.event_bus.on(EventType.MODE_CHANGE, _on_mode_change)
 
-    # Bridge Qt signals → orchestrator
-    def _on_ui_mode_change(mode_str: str) -> None:
+    async def _set_mode(mode_str: str) -> None:
         try:
-            mode = Mode(mode_str)
-            asyncio.create_task(orchestrator.set_mode(mode))
+            await runtime.set_mode(mode_str)
         except ValueError:
             logger.warning("Unknown mode: %s", mode_str)
 
+    def _on_ui_mode_change(mode_str: str) -> None:
+        asyncio.create_task(_set_mode(mode_str))
+
     def _on_ui_toggle_listening() -> None:
-        new_state = not orchestrator.listening
-        orchestrator.set_listening(new_state)
+        new_state = runtime.snapshot().state != "listening"
+        runtime.set_listening(new_state)
         ui_app.signals.listening_changed.emit(new_state)
         ui_app.signals.assistant_state.emit("listening" if new_state else "paused")
 
-    # Mic device change
     def _on_mic_changed(device_index: int) -> None:
-        dev = None if device_index == -1 else device_index
-        asyncio.create_task(mic.change_mic_device(dev))
+        device = None if device_index == -1 else device_index
+        asyncio.create_task(runtime.set_audio_device("mic", device))
 
-    # System audio toggle (WASAPI loopback for interviewer)
-    def _on_sys_audio_changed(signal_val: int) -> None:
-        if signal_val > 0:
-            mic.start_system_capture()
-            asyncio.create_task(transcriber.start_system_stream())
-        else:
-            mic.stop_system_capture()
-            asyncio.create_task(transcriber.stop_system_stream())
+    def _on_sys_audio_changed(signal_value: int) -> None:
+        asyncio.create_task(runtime.set_system_audio(signal_value > 0))
 
     ui_app.signals.mode_changed.connect(_on_ui_mode_change)
     ui_app.signals.toggle_listening.connect(_on_ui_toggle_listening)
-    # Quick action triggers
+
     def _on_summarize() -> None:
         ui_app.signals.response_clear.emit()
-        asyncio.create_task(orchestrator.trigger_query(
+        asyncio.create_task(runtime.trigger_query(
             "Summarize the ENTIRE conversation from the very beginning to now. "
             "Cover every topic and question discussed, in order — do not skip "
             "the earlier parts. Use as many concise bullet points as needed.",
-            full_transcript=True,
+            "summary",
         ))
 
     def _on_detail() -> None:
         ui_app.signals.response_clear.emit()
-        asyncio.create_task(orchestrator.trigger_query(
+        asyncio.create_task(runtime.trigger_query(
             "Write a detailed word-for-word script answering the most recent question. "
             "Make it thorough with specific examples and technical depth. "
-            "Just the script, ready to read out loud."
+            "Just the script, ready to read out loud.",
+            "detail",
         ))
 
     def _on_suggest() -> None:
         ui_app.signals.response_clear.emit()
-        asyncio.create_task(orchestrator.trigger_query(
+        asyncio.create_task(runtime.trigger_query(
             "Write a short word-for-word script for what I should say next. "
-            "One natural-sounding response, 2-3 sentences. Just the words to speak."
+            "One natural-sounding response, 2-3 sentences. Just the words to speak.",
+            "suggestion",
         ))
 
     def _on_take_notes() -> None:
         asyncio.create_task(_generate_notes())
 
     async def _generate_notes() -> None:
-        """Ask AI to extract key notes from recent conversation."""
-        buf = orchestrator._transcript_buffer
-        full = buf.get_full_text()
-        if not full:
+        if not runtime.full_transcript():
             ui_app.signals.note_added.emit("No conversation to take notes from yet.")
             return
-
-        note_prompt = await prompt_builder.build(
-            mode="active",
-            transcript_buffer=buf,
-            use_full_transcript=True,
-            query=(
-                "Extract the KEY POINTS from the ENTIRE conversation, from the very "
-                "beginning to now. Go through it in order and do not skip the earlier "
-                "parts. Focus on: questions asked, answers given, decisions made, "
-                "action items, and important topics. "
-                "Format: one bullet per point, in chronological order, as many "
-                "bullets as it takes to cover everything. Be concise per bullet. "
-                "Use plain text, no markdown."
-            ),
-        )
         try:
-            response = await llm.stream_generate(note_prompt)
-            # Split into individual notes
-            for line in response.strip().split("\n"):
-                line = line.strip().lstrip("•-* ")
-                if line:
-                    ui_app.signals.note_added.emit(line)
+            for note in await runtime.generate_notes():
+                ui_app.signals.note_added.emit(note)
         except Exception:
             logger.exception("Note generation failed")
 
@@ -316,51 +200,41 @@ async def async_main() -> None:
     ui_app.signals.trigger_suggest.connect(_on_suggest)
     ui_app.signals.trigger_notes.connect(_on_take_notes)
 
-    # Chat input — user types a message to AI
     def _on_chat_message(text: str) -> None:
         ui_app.signals.response_clear.emit()
-        prompt_builder.add_to_history("user", text)
-        asyncio.create_task(orchestrator.trigger_query(text))
+        asyncio.create_task(runtime.trigger_query(text, "chat"))
 
-    # System prompt — user customizes the AI behavior
     def _on_system_prompt_changed(text: str) -> None:
-        prompt_builder.custom_system_prompt = text
+        runtime.set_system_prompt(text)
         logger.info("System prompt updated (%d chars)", len(text))
 
     ui_app.signals.chat_message_sent.connect(_on_chat_message)
     ui_app.signals.system_prompt_changed.connect(_on_system_prompt_changed)
 
-    # Role assignment — which audio source is "you" vs the interviewer
     def _on_you_source_changed(source: str) -> None:
-        orchestrator.set_you_source(source)
+        runtime.set_you_source(source)
         if ui_app.overlay is not None:
             ui_app.overlay.transcript_panel.set_you_source(source)
         logger.info("You-source set to %s", source)
 
     ui_app.signals.you_source_changed.connect(_on_you_source_changed)
 
-    # File drop — ingest documents into RAG
-    def _on_files_dropped(paths: list) -> None:
-        retriever = retriever_holder.get("r")
-        if retriever is None:
-            if ui_app.overlay is not None:
-                ui_app.overlay.update_doc_status("Knowledge base still warming up — try again shortly")
-            return
-        total_chunks = 0
-        for path in paths:
-            try:
-                count = retriever.ingest_file(path)
-                total_chunks += count
-                logger.info("Ingested %s — %d chunks", path, count)
-            except Exception:
-                logger.exception("Failed to ingest %s", path)
+    def _on_files_dropped(paths: list[str]) -> None:
+        asyncio.create_task(_ingest_files(paths))
+
+    async def _ingest_files(paths: list[str]) -> None:
         try:
-            retriever.save_index(index_dir)
-        except Exception:
-            pass
+            result = await runtime.ingest_documents(paths)
+        except RuntimeStateError:
+            if ui_app.overlay is not None:
+                ui_app.overlay.update_doc_status(
+                    "Knowledge base still warming up — try again shortly"
+                )
+            return
         if ui_app.overlay is not None:
             ui_app.overlay.update_doc_status(
-                f"Loaded {len(paths)} file(s), {total_chunks} chunks · {retriever.vector_store.size} total"
+                f"Loaded {result.files} file(s), {result.chunks_added} chunks · "
+                f"{result.total_chunks} total"
             )
 
     ui_app.signals.files_dropped.connect(_on_files_dropped)
@@ -369,52 +243,56 @@ async def async_main() -> None:
         ui_app.overlay.mic_changed.connect(_on_mic_changed)
         ui_app.overlay.system_audio_changed.connect(_on_sys_audio_changed)
 
-    # ---- Start audio ----
-    await transcriber.start()
-    await mic.start()
+    def _on_audio_level(source: str, level: float) -> None:
+        signal = (
+            ui_app.signals.mic_level
+            if source == "mic"
+            else ui_app.signals.system_level
+        )
+        signal.emit(level)
+
+    runtime.set_audio_level_handler(_on_audio_level)
+
+    try:
+        await runtime.start_session(
+            SessionConfig(
+                session_id=str(uuid4()),
+                mode="interview",
+                input_language=config.deepgram_language,
+                response_language=config.response_language,
+                review_language=config.review_language,
+                you_source="mic",
+                brief_id="",
+            )
+        )
+    except RuntimeConfigurationError as error:
+        logger.error("Runtime configuration missing: %s", ", ".join(error.missing))
+        ui_app.shutdown()
+        sys.exit(1)
 
     logger.info("AI Assistant running. Press Ctrl+C to exit.")
     logger.info("  Alt+Space       → toggle overlay")
     logger.info("  Ctrl+Shift+L    → toggle listening")
 
-    # Audio is live now, so the assistant is already listening. The knowledge
-    # base (RAG) loads separately in the background and reports via doc status.
     ui_app.signals.assistant_state.emit("listening")
     if ui_app.overlay is not None:
         ui_app.overlay.update_doc_status("Loading knowledge base…")
-        # Capture the interviewer's audio too (WASAPI loopback on the default
-        # output — headphones or speakers, whichever is active). Toggling the
-        # switch cascades through the normal signal wiring.
         ui_app.overlay._sys_switch.setChecked(True)
 
-    import threading
-
-    def _load_rag_worker() -> None:
-        try:
-            retriever_holder["r"] = _build_rag()
-        except Exception:
-            logger.exception("Background RAG load failed — running without documents")
-            retriever_holder["error"] = True
-
-    threading.Thread(target=_load_rag_worker, daemon=True).start()
-
-    # Poll from the GUI thread so retriever attach + label updates are thread-safe.
     from PySide6.QtCore import QTimer
 
     def _check_rag() -> None:
-        if "r" in retriever_holder:
-            retriever = retriever_holder["r"]
-            orchestrator.set_retriever(retriever)
-            size = retriever.vector_store.size
+        snapshot = runtime.snapshot()
+        if snapshot.knowledge_state == "ready":
+            size = snapshot.knowledge_chunks
             if ui_app.overlay is not None:
                 ui_app.overlay.update_doc_status(
                     f"Knowledge base ready · {size} chunks"
                     if size else "Drop PDF · DOCX · TXT · MD onto the window"
                 )
             ui_app.signals.rag_ready.emit(True)
-            logger.info("RAG ready (%d chunks)", size)
             _rag_timer.stop()
-        elif retriever_holder.get("error"):
+        elif snapshot.knowledge_state == "error":
             if ui_app.overlay is not None:
                 ui_app.overlay.update_doc_status("Running without documents")
             _rag_timer.stop()
@@ -424,31 +302,18 @@ async def async_main() -> None:
     _rag_timer.timeout.connect(_check_rag)
     _rag_timer.start()
 
-    # Start audio pump as background task
-    pump_task = asyncio.create_task(audio_pump(mic, transcriber, ui_app.signals))
-
-    # Run forever (qasync event loop is already active from main())
     try:
         await asyncio.Event().wait()
     finally:
-        pump_task.cancel()
         _rag_timer.stop()
-        await mic.stop()
-        await transcriber.stop()
-        ui_app.shutdown()
-
-        # Save RAG index if it finished loading
-        retriever = retriever_holder.get("r")
-        if retriever is not None:
-            try:
-                retriever.save_index(index_dir)
-                logger.info("Saved RAG index to %s", index_dir)
-            except Exception:
-                logger.warning("Failed to save RAG index")
+        try:
+            await runtime.stop_session()
+        finally:
+            ui_app.shutdown()
 
 
 def main() -> None:
-    """Entry point — sets up qasync event loop and runs."""
+    """Entry point - sets up qasync event loop and runs."""
     _setup_logging()
     load_dotenv()
 

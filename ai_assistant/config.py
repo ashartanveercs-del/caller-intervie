@@ -18,6 +18,8 @@ class Config:
     deepgram_api_key: str = ""
     deepgram_model: str = "nova-3"
     deepgram_language: str = "en"
+    response_language: str = "en"
+    review_language: str = "en"
     diarize: bool = True
     interim_results: bool = True
     utterance_end_ms: int = 1000
@@ -56,6 +58,9 @@ class Config:
     def from_env(cls) -> Config:
         return cls(
             deepgram_api_key=os.environ.get("DEEPGRAM_API_KEY", ""),
+            deepgram_language=os.environ.get("DEEPGRAM_LANGUAGE", cls.deepgram_language),
+            response_language=os.environ.get("RESPONSE_LANGUAGE", cls.response_language),
+            review_language=os.environ.get("REVIEW_LANGUAGE", cls.review_language),
             llm_api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
             llm_base_url=os.environ.get("LLM_BASE_URL", cls.llm_base_url),
             llm_model=os.environ.get("LLM_MODEL", cls.llm_model),
