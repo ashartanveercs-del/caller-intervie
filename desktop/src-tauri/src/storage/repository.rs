@@ -135,10 +135,11 @@ impl SessionRepository {
             .lock()
             .map_err(|_| RepositoryError::ConnectionUnavailable)?;
         let mut statement = connection.prepare("SELECT workspace_id, session_id, title, language, started_at_ms, completed_at_ms FROM sessions WHERE workspace_id = ?1 ORDER BY started_at_ms DESC")?;
-        statement
+        let sessions = statement
             .query_map([workspace_id], session_from_row)?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(Into::into)
+            .map_err(RepositoryError::from)?;
+        Ok(sessions)
     }
 
     pub fn get_session(
@@ -163,10 +164,11 @@ impl SessionRepository {
             .lock()
             .map_err(|_| RepositoryError::ConnectionUnavailable)?;
         let mut statement = connection.prepare("SELECT workspace_id, session_id, event_id, host_sequence, source_generation, source_sequence, timestamp_ms, kind, correlation_id, request_id, turn_id, payload_json FROM timeline_events WHERE workspace_id = ?1 AND session_id = ?2 ORDER BY host_sequence")?;
-        statement
+        let timeline = statement
             .query_map(params![workspace_id, session_id], event_from_row)?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(Into::into)
+            .map_err(RepositoryError::from)?;
+        Ok(timeline)
     }
 
     pub fn restore_active_session(
@@ -502,5 +504,19 @@ mod tests {
             .restore_active_session(WORKSPACE_B)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn list_sessions_and_timeline_materialize_rows_before_connection_unlock() {
+        let (_temp, _path, repository) = repository();
+        repository.create_session(&session(WORKSPACE_A)).unwrap();
+        let note = event("list-and-timeline", TimelineEventKind::Note);
+        repository.append_event(&note).unwrap();
+
+        assert_eq!(repository.list_sessions(WORKSPACE_A).unwrap().len(), 1);
+        assert_eq!(
+            repository.get_timeline(WORKSPACE_A, SESSION).unwrap().len(),
+            1
+        );
     }
 }
