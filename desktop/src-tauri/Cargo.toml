@@ -27,3 +27,21 @@ uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
 rmp-serde = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+iota_stronghold = "=2.1.0"
+keyring = "=4.1.6"
+getrandom = "0.3"
+zeroize = "1"
+thiserror = "2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+rusqlite = { version = "=0.40.1", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rusqlite = { version = "=0.40.1", default-features = false, features = ["bundled-sqlcipher"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[test]]
+name = "storage"
+path = "src/storage/mod.rs"
