@@ -3,13 +3,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use iota_stronghold::{KeyProvider, Location, SnapshotPath, Stronghold};
+use iota_stronghold::{KeyProvider, SnapshotPath, Stronghold};
 use zeroize::Zeroizing;
 
 pub type DatabaseKey = Zeroizing<Vec<u8>>;
 
 const CLIENT_PATH: &[u8] = b"interview-assistant";
-const VAULT_PATH: &[u8] = b"database-keys";
 const RECORD_PATH: &[u8] = b"sqlcipher-v1";
 
 #[derive(Debug, thiserror::Error)]
@@ -152,11 +151,8 @@ fn write_database_key(
         .create_client(CLIENT_PATH)
         .map_err(|_| KeyManagerError::Stronghold)?;
     client
-        .vault(VAULT_PATH)
-        .write_secret(
-            Location::generic(VAULT_PATH.to_vec(), RECORD_PATH.to_vec()),
-            database_key,
-        )
+        .store()
+        .insert(RECORD_PATH.to_vec(), database_key.to_vec(), None)
         .map_err(|_| KeyManagerError::Stronghold)?;
     let provider = KeyProvider::try_from(unlock_secret).map_err(|_| KeyManagerError::Stronghold)?;
     stronghold
@@ -183,9 +179,13 @@ fn read_database_key(
         .load_client(CLIENT_PATH)
         .map_err(|_| KeyManagerError::RecoveryRequired("vault client is unavailable"))?;
     client
-        .vault(VAULT_PATH)
-        .read_secret(RECORD_PATH)
-        .map_err(|_| KeyManagerError::RecoveryRequired("database key record is unavailable"))
+        .store()
+        .get(RECORD_PATH)
+        .map_err(|_| KeyManagerError::RecoveryRequired("database key record is unavailable"))?
+        .map(Zeroizing::new)
+        .ok_or(KeyManagerError::RecoveryRequired(
+            "database key record is unavailable",
+        ))
 }
 
 #[cfg(test)]
