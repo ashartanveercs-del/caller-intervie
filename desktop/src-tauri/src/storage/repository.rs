@@ -39,7 +39,7 @@ impl SessionRepository {
         }
         let mut connection = Connection::open(path)?;
         apply_cipher_key(&mut connection, key)?;
-        connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA cipher_memory_security = ON; PRAGMA journal_mode = DELETE;")?;
+        connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = DELETE;")?;
         migrate(&mut connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -358,6 +358,21 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn repositories_can_open_and_close_sequentially_in_one_process() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sequential.db");
+
+        {
+            let repository = SessionRepository::open(&path, &key(0x41)).unwrap();
+            repository.create_session(&session(WORKSPACE_A)).unwrap();
+        }
+
+        let reopened = SessionRepository::open(&path, &key(0x41)).unwrap();
+        assert_eq!(reopened.list_sessions(WORKSPACE_A).unwrap().len(), 1);
+    }
+
     #[test]
     fn duplicate_event_is_idempotent_but_changed_content_collides() {
         let (_temp, _path, repository) = repository();
