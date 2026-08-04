@@ -375,7 +375,7 @@ pub fn validate_command(command: &Envelope) -> Result<(), CommandValidationError
                     "you_source",
                     "brief_id",
                 ],
-            ) && required_string(payload, "mode")
+            ) && required_supported_mode(payload, "mode")
                 && required_language(payload, "input_language")
                 && required_language(payload, "response_language")
                 && required_language(payload, "review_language")
@@ -577,6 +577,13 @@ fn required_runtime_state(payload: &Map<String, Value>, key: &str) -> bool {
     )
 }
 
+fn required_supported_mode(payload: &Map<String, Value>, key: &str) -> bool {
+    matches!(
+        payload.get(key).and_then(Value::as_str),
+        Some("interview" | "sales" | "meeting" | "presentation")
+    )
+}
+
 fn required_knowledge_state(payload: &Map<String, Value>, key: &str) -> bool {
     matches!(
         payload.get(key).and_then(Value::as_str),
@@ -598,11 +605,12 @@ fn valid_session_snapshot(event: &Envelope) -> bool {
             .iter()
             .all(|key| payload.get(*key).is_some_and(Value::is_null))
             && payload.get("you_source") == Some(&Value::String("mic".into()))
-            && payload.get("listening") == Some(&Value::Bool(false));
+            && payload.get("listening") == Some(&Value::Bool(false))
+            && payload.get("system_audio_enabled") == Some(&Value::Bool(false));
     }
 
     event.session_id.is_some()
-        && required_bounded_string(payload, "mode")
+        && required_supported_mode(payload, "mode")
         && required_language(payload, "input_language")
         && required_language(payload, "response_language")
         && required_language(payload, "review_language")
@@ -670,8 +678,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        encode_frame, validate_event, Envelope, EventKind, FrameDecoder, ProtocolKind,
-        MAX_FRAME_BYTES, MAX_SAFE_INTEGER, PROTOCOL_VERSION,
+        encode_frame, validate_command, validate_event, Envelope, EventKind, FrameDecoder,
+        ProtocolKind, MAX_FRAME_BYTES, MAX_SAFE_INTEGER, PROTOCOL_VERSION,
     };
 
     fn enum_values(source: &str, enum_name: &str) -> BTreeSet<String> {
@@ -791,6 +799,45 @@ mod tests {
             .payload
             .insert("response_language".into(), "not a language".into());
         assert!(validate_event(&invalid_language).is_err());
+    }
+
+    #[test]
+    fn session_state_idle_and_modes_match_the_closed_v1_contract() {
+        let idle_fixture = include_str!("../../../protocol/v1/fixtures/session-state-idle.json");
+        let active_fixture =
+            include_str!("../../../protocol/v1/fixtures/session-state-active.json");
+
+        let mut contradictory_idle: Envelope = serde_json::from_str(idle_fixture).unwrap();
+        contradictory_idle
+            .payload
+            .insert("system_audio_enabled".into(), true.into());
+        assert!(validate_event(&contradictory_idle).is_err());
+
+        for invalid_mode in ["", "   ", "Classroom", "unknown"] {
+            let mut active: Envelope = serde_json::from_str(active_fixture).unwrap();
+            active.payload.insert("mode".into(), invalid_mode.into());
+            assert!(validate_event(&active).is_err(), "{invalid_mode:?}");
+
+            let mut command: Envelope = serde_json::from_str(include_str!(
+                "../../../protocol/v1/fixtures/session-start.json"
+            ))
+            .unwrap();
+            command.payload.insert("mode".into(), invalid_mode.into());
+            assert!(validate_command(&command).is_err(), "{invalid_mode:?}");
+        }
+
+        for supported_mode in ["interview", "sales", "meeting", "presentation"] {
+            let mut active: Envelope = serde_json::from_str(active_fixture).unwrap();
+            active.payload.insert("mode".into(), supported_mode.into());
+            assert!(validate_event(&active).is_ok(), "{supported_mode}");
+
+            let mut command: Envelope = serde_json::from_str(include_str!(
+                "../../../protocol/v1/fixtures/session-start.json"
+            ))
+            .unwrap();
+            command.payload.insert("mode".into(), supported_mode.into());
+            assert!(validate_command(&command).is_ok(), "{supported_mode}");
+        }
     }
 
     #[test]
