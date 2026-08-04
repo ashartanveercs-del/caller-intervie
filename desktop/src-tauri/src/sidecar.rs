@@ -744,25 +744,68 @@ impl TokioSidecarPort {
     }
 
     async fn request_termination(&self) -> Result<(), SidecarError> {
+        let mut exit = self.exit.clone();
+        if matches!(*exit.borrow_and_update(), ProcessExit::Reaped) {
+            return Ok(());
+        }
+
         let (result_sender, result_receiver) = oneshot::channel();
-        tokio::time::timeout(
+        let send_error = match tokio::time::timeout(
             CLEANUP_TIMEOUT,
             self.control.send(ProcessRequest::Terminate(result_sender)),
         )
         .await
-        .map_err(|_| SidecarError::new("sidecar_cleanup_failed", "sidecar control task is busy"))?
-        .map_err(|_| SidecarError::new("sidecar_cleanup_failed", "sidecar control task stopped"))?;
-        tokio::time::timeout(CLEANUP_TIMEOUT, result_receiver)
-            .await
-            .map_err(|_| {
-                SidecarError::new(
-                    "sidecar_cleanup_failed",
-                    "sidecar did not exit before cleanup deadline",
-                )
-            })?
-            .map_err(|_| {
-                SidecarError::new("sidecar_cleanup_failed", "sidecar control task stopped")
-            })?
+        {
+            Ok(Ok(())) => None,
+            Ok(Err(_)) => Some(SidecarError::new(
+                "sidecar_cleanup_failed",
+                "sidecar control task stopped",
+            )),
+            Err(_) => Some(SidecarError::new(
+                "sidecar_cleanup_failed",
+                "sidecar control task is busy",
+            )),
+        };
+        if let Some(error) = send_error {
+            return if matches!(*exit.borrow_and_update(), ProcessExit::Reaped) {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+
+        let mut exit_wait = exit.clone();
+        let termination = tokio::time::timeout(CLEANUP_TIMEOUT, async move {
+            tokio::select! {
+                result = result_receiver => result.map_err(|_| {
+                    SidecarError::new("sidecar_cleanup_failed", "sidecar control task stopped")
+                })?,
+                reaped = exit_wait.wait_for(|state| matches!(state, ProcessExit::Reaped)) => {
+                    reaped
+                        .map(|_| ())
+                        .map_err(|_| SidecarError::new(
+                            "sidecar_cleanup_failed",
+                            "sidecar exit observer stopped",
+                        ))
+                }
+            }
+        })
+        .await;
+        match termination {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                if matches!(*exit.borrow_and_update(), ProcessExit::Reaped) {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
+            Err(_) if matches!(*exit.borrow_and_update(), ProcessExit::Reaped) => Ok(()),
+            Err(_) => Err(SidecarError::new(
+                "sidecar_cleanup_failed",
+                "sidecar did not exit before cleanup deadline",
+            )),
+        }
     }
 
     async fn poison_and_terminate(&self) -> Result<(), SidecarError> {
@@ -971,11 +1014,16 @@ impl SidecarEventSink for TauriEventSink {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
+    use std::task::Poll;
     use std::time::Duration;
 
     use async_trait::async_trait;
     use serde_json::{json, Map, Value};
+    use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex};
 
     use crate::protocol::{
         encode_frame, CommandKind, Envelope, EventKind, FrameDecoder, ProtocolKind,
@@ -983,9 +1031,9 @@ mod tests {
     };
 
     use super::{
-        packaged_sidecar_path, redact_diagnostic, SidecarError, SidecarEventSink, SidecarLauncher,
-        SidecarPort, SidecarState, SidecarSupervisor, TokioCommand, TokioSidecarPort,
-        SIDECAR_PROGRAM,
+        packaged_sidecar_path, redact_diagnostic, ProcessExit, ProcessRequest, SidecarError,
+        SidecarEventSink, SidecarLauncher, SidecarPort, SidecarState, SidecarSupervisor,
+        TokioCommand, TokioSidecarPort, SIDECAR_PROGRAM,
     };
 
     const SESSION_ID: &str = "018f0000-0000-7000-8000-000000000003";
@@ -1031,6 +1079,55 @@ mod tests {
             *self.launches.lock().unwrap() += 1;
             Ok(self.port.clone())
         }
+    }
+
+    #[derive(Clone)]
+    struct SequencedSidecarLauncher {
+        ports: Arc<Mutex<VecDeque<Arc<dyn SidecarPort>>>>,
+    }
+
+    #[async_trait]
+    impl SidecarLauncher for SequencedSidecarLauncher {
+        async fn launch(&self) -> Result<Arc<dyn SidecarPort>, SidecarError> {
+            self.ports.lock().unwrap().pop_front().ok_or_else(|| {
+                SidecarError::new("sidecar_launch_failed", "no sidecar port is available")
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct ReadyControlPort {
+        inner: Arc<TokioSidecarPort>,
+    }
+
+    #[async_trait]
+    impl SidecarPort for ReadyControlPort {
+        async fn write(&self, _bytes: Vec<u8>) -> Result<(), SidecarError> {
+            Ok(())
+        }
+
+        async fn kill(&self) -> Result<(), SidecarError> {
+            self.inner.kill().await
+        }
+
+        fn observe(&self, supervisor: SidecarSupervisor, generation: u64) {
+            self.inner.observe(supervisor, generation);
+        }
+    }
+
+    fn controlled_tokio_port(
+        control: mpsc::Sender<ProcessRequest>,
+        exit: watch::Receiver<ProcessExit>,
+    ) -> Arc<TokioSidecarPort> {
+        Arc::new(TokioSidecarPort {
+            writer: AsyncMutex::new(None),
+            control,
+            stdout: Arc::new(AsyncMutex::new(None)),
+            stderr: Arc::new(AsyncMutex::new(None)),
+            exit,
+            poisoned: Arc::new(AtomicBool::new(false)),
+            write_timeout: Duration::from_secs(1),
+        })
     }
 
     fn fixture_envelope() -> Envelope {
@@ -1457,6 +1554,58 @@ mod tests {
         assert_eq!(*launcher.launches.lock().unwrap(), 1);
         assert!(status.diagnostics.join(" ").contains("<redacted>"));
         assert!(!status.diagnostics.join(" ").contains("cleanup-secret"));
+    }
+
+    #[tokio::test]
+    async fn reaped_while_termination_send_is_blocked_allows_a_fresh_explicit_restart() {
+        let (control_sender, control_receiver) = mpsc::channel(1);
+        let (queued_result, _queued_result_receiver) = oneshot::channel();
+        control_sender
+            .try_send(ProcessRequest::Terminate(queued_result))
+            .unwrap();
+        let (exit_sender, exit_receiver) = watch::channel(ProcessExit::Pending);
+        let reaped_port = controlled_tokio_port(control_sender, exit_receiver);
+        let fresh_port = Arc::new(FakeSidecarPort::default());
+        let launcher = SequencedSidecarLauncher {
+            ports: Arc::new(Mutex::new(VecDeque::from([
+                Arc::new(ReadyControlPort { inner: reaped_port }) as Arc<dyn SidecarPort>,
+                fresh_port.clone() as Arc<dyn SidecarPort>,
+            ]))),
+        };
+        let supervisor = SidecarSupervisor::with_launcher(Arc::new(launcher), Duration::ZERO);
+        supervisor.start().await.unwrap();
+
+        let restart = supervisor.restart();
+        tokio::pin!(restart);
+        std::future::poll_fn(|context| {
+            assert!(matches!(restart.as_mut().poll(context), Poll::Pending));
+            Poll::Ready(())
+        })
+        .await;
+
+        exit_sender.send(ProcessExit::Reaped).unwrap();
+        drop(control_receiver);
+        restart.await.unwrap();
+
+        let fresh_handshake = last_handshake_id(&fresh_port);
+        supervisor
+            .accept_event(2, ready_for(Some(&fresh_handshake)))
+            .await
+            .unwrap();
+        assert_eq!(supervisor.status().await.state, SidecarState::Ready);
+    }
+
+    #[tokio::test]
+    async fn closed_control_channel_without_reaped_exit_is_cleanup_failure() {
+        let (control_sender, control_receiver) = mpsc::channel(1);
+        drop(control_receiver);
+        let (_exit_sender, exit_receiver) = watch::channel(ProcessExit::Pending);
+        let port = controlled_tokio_port(control_sender, exit_receiver);
+
+        let error = port.kill().await.unwrap_err();
+
+        assert_eq!(error.code(), "sidecar_cleanup_failed");
+        assert_eq!(*port.exit.borrow(), ProcessExit::Pending);
     }
 
     #[tokio::test]
