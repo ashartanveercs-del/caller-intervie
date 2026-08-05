@@ -1,6 +1,7 @@
-use std::{path::Path, sync::Mutex};
+use std::{fmt::Write as _, path::Path, sync::Mutex};
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use zeroize::Zeroizing;
 
 use super::{
     migrations::{migrate, MigrationError},
@@ -34,7 +35,7 @@ pub struct SessionRepository {
 
 impl SessionRepository {
     pub fn open(path: impl AsRef<Path>, key: &[u8]) -> Result<Self, RepositoryError> {
-        if key.is_empty() {
+        if key.len() != 32 {
             return Err(RepositoryError::CipherUnavailable);
         }
         let mut connection = Connection::open(path)?;
@@ -100,7 +101,7 @@ impl SessionRepository {
             }
         })?;
         if let Some((host_sequence, existing)) = existing_event(&transaction, &event.event_id)? {
-            if existing == event_fingerprint(event, &payload_json) {
+            if existing == event_content(event, &payload_json) {
                 return Ok(AppendEventResult::Duplicate { host_sequence });
             }
             return Err(RepositoryError::EventContentCollision {
@@ -199,8 +200,8 @@ impl SessionRepository {
 }
 
 fn apply_cipher_key(connection: &mut Connection, key: &[u8]) -> Result<(), RepositoryError> {
-    let hex_key: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
-    connection.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))?;
+    let pragma = cipher_key_pragma(key);
+    connection.execute_batch(&pragma)?;
     connection.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
         row.get::<_, i64>(0)
     })?;
@@ -209,6 +210,23 @@ fn apply_cipher_key(connection: &mut Connection, key: &[u8]) -> Result<(), Repos
         return Err(RepositoryError::CipherUnavailable);
     }
     Ok(())
+}
+
+fn cipher_key_hex(key: &[u8]) -> Zeroizing<String> {
+    let mut hex = Zeroizing::new(String::with_capacity(key.len() * 2));
+    for byte in key {
+        write!(&mut *hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    hex
+}
+
+fn cipher_key_pragma(key: &[u8]) -> Zeroizing<String> {
+    let hex = cipher_key_hex(key);
+    let mut pragma = Zeroizing::new(String::with_capacity(hex.len() + 20));
+    pragma.push_str("PRAGMA key = \"x'");
+    pragma.push_str(&hex);
+    pragma.push_str("'\";");
+    pragma
 }
 
 fn ensure_session(
@@ -228,28 +246,53 @@ fn ensure_session(
     }
 }
 
-fn event_fingerprint(event: &NewTimelineEvent, payload_json: &str) -> String {
-    format!(
-        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
-        event.workspace_id,
-        event.session_id,
-        event.source_generation,
-        event.source_sequence,
-        event.timestamp_ms,
-        event.kind.as_db(),
-        event.correlation_id.as_deref().unwrap_or_default(),
-        event.request_id.as_deref().unwrap_or_default(),
-        event.turn_id.as_deref().unwrap_or_default()
-    ) + payload_json
+#[derive(Debug, PartialEq)]
+struct EventContent {
+    workspace_id: String,
+    session_id: String,
+    source_generation: i64,
+    source_sequence: i64,
+    timestamp_ms: i64,
+    kind: String,
+    correlation_id: Option<String>,
+    request_id: Option<String>,
+    turn_id: Option<String>,
+    payload_json: String,
+}
+
+fn event_content(event: &NewTimelineEvent, payload_json: &str) -> EventContent {
+    EventContent {
+        workspace_id: event.workspace_id.clone(),
+        session_id: event.session_id.clone(),
+        source_generation: event.source_generation,
+        source_sequence: event.source_sequence,
+        timestamp_ms: event.timestamp_ms,
+        kind: event.kind.as_db().to_owned(),
+        correlation_id: event.correlation_id.clone(),
+        request_id: event.request_id.clone(),
+        turn_id: event.turn_id.clone(),
+        payload_json: payload_json.to_owned(),
+    }
 }
 
 fn existing_event(
     transaction: &Transaction<'_>,
     event_id: &str,
-) -> Result<Option<(i64, String)>, RepositoryError> {
+) -> Result<Option<(i64, EventContent)>, RepositoryError> {
     transaction.query_row("SELECT host_sequence, workspace_id, session_id, source_generation, source_sequence, timestamp_ms, kind, correlation_id, request_id, turn_id, payload_json FROM timeline_events WHERE event_id = ?1", [event_id], |row| {
-        let fingerprint = format!("{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}", row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?, row.get::<_, i64>(5)?, row.get::<_, String>(6)?, row.get::<_, Option<String>>(7)?.as_deref().unwrap_or_default(), row.get::<_, Option<String>>(8)?.as_deref().unwrap_or_default(), row.get::<_, Option<String>>(9)?.as_deref().unwrap_or_default()) + &row.get::<_, String>(10)?;
-        Ok((row.get(0)?, fingerprint))
+        let content = EventContent {
+            workspace_id: row.get(1)?,
+            session_id: row.get(2)?,
+            source_generation: row.get(3)?,
+            source_sequence: row.get(4)?,
+            timestamp_ms: row.get(5)?,
+            kind: row.get(6)?,
+            correlation_id: row.get(7)?,
+            request_id: row.get(8)?,
+            turn_id: row.get(9)?,
+            payload_json: row.get(10)?,
+        };
+        Ok((row.get(0)?, content))
     }).optional().map_err(Into::into)
 }
 
@@ -303,6 +346,32 @@ mod tests {
         let repository = SessionRepository::open(&path, &key(0x41)).unwrap();
         (temp, path, repository)
     }
+
+    #[test]
+    fn database_key_must_be_exactly_32_bytes() {
+        let temp = tempdir().unwrap();
+        for length in [0, 1, 16, 31, 33, 64] {
+            let path = temp.path().join(format!("invalid-key-{length}.db"));
+            assert!(SessionRepository::open(&path, &vec![0x41; length]).is_err());
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn sqlcipher_key_derived_strings_have_zeroizing_types() {
+        let production = include_str!("repository.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+
+        assert!(production.contains("use zeroize::Zeroizing;"));
+        assert!(production.contains("fn cipher_key_hex"));
+        assert!(production.contains("fn cipher_key_pragma"));
+        assert_eq!(production.matches("-> Zeroizing<String>").count(), 2);
+        assert!(!production.contains("map(|byte| format!"));
+        assert!(!production.contains("execute_batch(&format!(\"PRAGMA key"));
+    }
+
     fn session(workspace_id: &str) -> NewSession {
         NewSession {
             workspace_id: workspace_id.into(),
@@ -396,6 +465,25 @@ mod tests {
             repository.get_timeline(WORKSPACE_A, SESSION).unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn control_delimiters_cannot_alias_distinct_event_content() {
+        let (_temp, _path, repository) = repository();
+        repository.create_session(&session(WORKSPACE_A)).unwrap();
+        let mut first = event("delimiter-event", TimelineEventKind::Note);
+        first.correlation_id = Some("association\u{1f}request".into());
+        first.request_id = None;
+        repository.append_event(&first).unwrap();
+
+        let mut aliased_by_old_fingerprint = first.clone();
+        aliased_by_old_fingerprint.correlation_id = Some("association".into());
+        aliased_by_old_fingerprint.request_id = Some("request".into());
+        aliased_by_old_fingerprint.turn_id = Some("\u{1f}".into());
+        assert!(matches!(
+            repository.append_event(&aliased_by_old_fingerprint),
+            Err(RepositoryError::EventContentCollision { .. })
+        ));
     }
     #[test]
     fn host_order_remains_monotonic_when_source_sequence_resets() {
