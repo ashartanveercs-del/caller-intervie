@@ -1,12 +1,14 @@
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 
+use super::models::{NewSession, NewSessionBrief, NewTimelineEvent, TimelineEventKind};
+
 pub const SCHEMA_VERSION: i64 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MigrationError {
     #[error("database schema requires ownership recovery")]
     OwnershipRecoveryRequired { table: String },
-    #[error("database schema version is newer than this application supports")]
+    #[error("database schema version is not supported by this application")]
     UnsupportedSchemaVersion { found: i64 },
     #[error("database schema integrity check failed: {reason}")]
     SchemaIntegrity { reason: String },
@@ -17,7 +19,7 @@ pub enum MigrationError {
 pub fn migrate(connection: &mut Connection) -> Result<(), MigrationError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let version: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version > SCHEMA_VERSION {
+    if version != 0 && version != SCHEMA_VERSION {
         return Err(MigrationError::UnsupportedSchemaVersion { found: version });
     }
     for table in ["sessions", "session_briefs", "timeline_events", "settings"] {
@@ -76,47 +78,83 @@ fn validate_current_schema(transaction: &Transaction<'_>) -> Result<(), Migratio
         transaction,
         "sessions",
         &[
-            "workspace_id",
-            "session_id",
-            "title",
-            "language",
-            "started_at_ms",
-            "completed_at_ms",
+            ColumnSpec::new("workspace_id", "TEXT", true, 1).with_binary_collation(),
+            ColumnSpec::new("session_id", "TEXT", true, 2).with_binary_collation(),
+            ColumnSpec::new("title", "TEXT", false, 0),
+            ColumnSpec::new("language", "TEXT", true, 0),
+            ColumnSpec::new("started_at_ms", "INTEGER", true, 0),
+            ColumnSpec::new("completed_at_ms", "INTEGER", false, 0),
         ],
-        &["workspace_id", "session_id"],
     )?;
     validate_table(
         transaction,
         "session_briefs",
-        &["workspace_id", "session_id", "summary", "updated_at_ms"],
-        &["workspace_id", "session_id"],
+        &[
+            ColumnSpec::new("workspace_id", "TEXT", true, 1).with_binary_collation(),
+            ColumnSpec::new("session_id", "TEXT", true, 2).with_binary_collation(),
+            ColumnSpec::new("summary", "TEXT", true, 0),
+            ColumnSpec::new("updated_at_ms", "INTEGER", true, 0),
+        ],
     )?;
     validate_table(
         transaction,
         "timeline_events",
         &[
-            "event_id",
-            "workspace_id",
-            "session_id",
-            "host_sequence",
-            "source_generation",
-            "source_sequence",
-            "timestamp_ms",
-            "kind",
-            "correlation_id",
-            "request_id",
-            "turn_id",
-            "payload_json",
+            ColumnSpec::new("event_id", "TEXT", true, 1),
+            ColumnSpec::new("workspace_id", "TEXT", true, 0).with_binary_collation(),
+            ColumnSpec::new("session_id", "TEXT", true, 0).with_binary_collation(),
+            ColumnSpec::new("host_sequence", "INTEGER", true, 0),
+            ColumnSpec::new("source_generation", "INTEGER", true, 0),
+            ColumnSpec::new("source_sequence", "INTEGER", true, 0),
+            ColumnSpec::new("timestamp_ms", "INTEGER", true, 0),
+            ColumnSpec::new("kind", "TEXT", true, 0),
+            ColumnSpec::new("correlation_id", "TEXT", false, 0),
+            ColumnSpec::new("request_id", "TEXT", false, 0),
+            ColumnSpec::new("turn_id", "TEXT", false, 0),
+            ColumnSpec::new("payload_json", "TEXT", true, 0),
         ],
-        &["event_id"],
     )?;
     validate_table(
         transaction,
         "settings",
-        &["workspace_id", "setting_key", "value_json"],
-        &["workspace_id", "setting_key"],
+        &[
+            ColumnSpec::new("workspace_id", "TEXT", true, 1).with_binary_collation(),
+            ColumnSpec::new("setting_key", "TEXT", true, 2),
+            ColumnSpec::new("value_json", "TEXT", true, 0),
+        ],
     )?;
 
+    validate_unique_indexes(
+        transaction,
+        "sessions",
+        &[UniqueIndexSpec::new("pk", &["workspace_id", "session_id"])],
+    )?;
+    validate_unique_indexes(
+        transaction,
+        "session_briefs",
+        &[UniqueIndexSpec::new("pk", &["workspace_id", "session_id"])],
+    )?;
+    validate_unique_indexes(
+        transaction,
+        "timeline_events",
+        &[
+            UniqueIndexSpec::new("pk", &["event_id"]),
+            UniqueIndexSpec::new("u", &["workspace_id", "session_id", "host_sequence"]),
+        ],
+    )?;
+    validate_unique_indexes(
+        transaction,
+        "settings",
+        &[UniqueIndexSpec::new("pk", &["workspace_id", "setting_key"])],
+    )?;
+
+    for table in ["sessions", "settings"] {
+        if !foreign_keys(transaction, table)?.is_empty() {
+            return Err(MigrationError::SchemaIntegrity {
+                reason: format!("{table} has unexpected foreign keys"),
+            });
+        }
+    }
     for table in ["session_briefs", "timeline_events"] {
         if !has_workspace_session_cascade(transaction, table)? {
             return Err(MigrationError::SchemaIntegrity {
@@ -126,24 +164,60 @@ fn validate_current_schema(transaction: &Transaction<'_>) -> Result<(), Migratio
             });
         }
     }
-    if !has_unique_index(
-        transaction,
-        "timeline_events",
-        &["workspace_id", "session_id", "host_sequence"],
-    )? {
+    let mut foreign_key_check = transaction.prepare("PRAGMA foreign_key_check")?;
+    if foreign_key_check.query([])?.next()?.is_some() {
         return Err(MigrationError::SchemaIntegrity {
-            reason: "timeline_events must uniquely order events within a workspace session"
-                .to_owned(),
+            reason: "the database contains rows that violate ownership relationships".to_owned(),
         });
     }
+    validate_current_rows(transaction)?;
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct ColumnSpec {
+    name: &'static str,
+    affinity: &'static str,
+    not_null: bool,
+    primary_key_position: i64,
+    binary_collation: bool,
+}
+
+impl ColumnSpec {
+    const fn new(
+        name: &'static str,
+        affinity: &'static str,
+        not_null: bool,
+        primary_key_position: i64,
+    ) -> Self {
+        Self {
+            name,
+            affinity,
+            not_null,
+            primary_key_position,
+            binary_collation: false,
+        }
+    }
+
+    const fn with_binary_collation(mut self) -> Self {
+        self.binary_collation = true;
+        self
+    }
+}
+
+struct TableColumn {
+    name: String,
+    affinity: String,
+    not_null: bool,
+    default_value: Option<String>,
+    primary_key_position: i64,
+    hidden: i64,
 }
 
 fn validate_table(
     transaction: &Transaction<'_>,
     table: &str,
-    required_columns: &[&str],
-    expected_primary_key: &[&str],
+    required_columns: &[ColumnSpec],
 ) -> Result<(), MigrationError> {
     let exists: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
@@ -156,30 +230,84 @@ fn validate_table(
         });
     }
 
-    let mut statement = transaction.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut statement = transaction.prepare(&format!("PRAGMA table_xinfo({table})"))?;
     let columns = statement
         .query_map([], |row| {
-            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+            Ok(TableColumn {
+                name: row.get(1)?,
+                affinity: row.get(2)?,
+                not_null: row.get(3)?,
+                default_value: row.get(4)?,
+                primary_key_position: row.get(5)?,
+                hidden: row.get(6)?,
+            })
         })?
         .collect::<Result<Vec<_>, _>>()?;
     for required in required_columns {
-        if !columns.iter().any(|(column, _)| column == required) {
+        let Some(column) = columns.iter().find(|column| column.name == required.name) else {
             return Err(MigrationError::SchemaIntegrity {
-                reason: format!("required column {table}.{required} is missing"),
+                reason: format!("required column {table}.{} is missing", required.name),
+            });
+        };
+        if !column.affinity.eq_ignore_ascii_case(required.affinity)
+            || column.not_null != required.not_null
+            || column.primary_key_position != required.primary_key_position
+            || column.hidden != 0
+        {
+            return Err(MigrationError::SchemaIntegrity {
+                reason: format!(
+                    "column {table}.{} has an incompatible definition",
+                    required.name
+                ),
+            });
+        }
+        if required.binary_collation {
+            let (_, collation, _, _, _) =
+                transaction.column_metadata(None::<&str>, table, required.name)?;
+            if !collation.is_some_and(|value| value.to_bytes().eq_ignore_ascii_case(b"BINARY")) {
+                return Err(MigrationError::SchemaIntegrity {
+                    reason: format!(
+                        "ownership column {table}.{} must use BINARY collation",
+                        required.name
+                    ),
+                });
+            }
+        }
+    }
+    for column in &columns {
+        let required = required_columns
+            .iter()
+            .any(|required| required.name == column.name);
+        if !required && column.hidden == 0 && column.not_null && column.default_value.is_none() {
+            return Err(MigrationError::SchemaIntegrity {
+                reason: format!(
+                    "extra column {table}.{} cannot be populated by current writes",
+                    column.name
+                ),
             });
         }
     }
-    let mut primary_key = columns
+    let mut primary_key = required_columns
         .iter()
-        .filter(|(_, position)| *position > 0)
-        .map(|(column, position)| (*position, column.as_str()))
+        .filter(|column| column.primary_key_position > 0)
+        .map(|column| (column.primary_key_position, column.name))
         .collect::<Vec<_>>();
     primary_key.sort_by_key(|(position, _)| *position);
     let primary_key = primary_key
         .into_iter()
         .map(|(_, column)| column)
         .collect::<Vec<_>>();
-    if primary_key != expected_primary_key {
+    let mut actual_primary_key = columns
+        .iter()
+        .filter(|column| column.primary_key_position > 0)
+        .map(|column| (column.primary_key_position, column.name.as_str()))
+        .collect::<Vec<_>>();
+    actual_primary_key.sort_by_key(|(position, _)| *position);
+    let actual_primary_key = actual_primary_key
+        .into_iter()
+        .map(|(_, column)| column)
+        .collect::<Vec<_>>();
+    if actual_primary_key != primary_key {
         return Err(MigrationError::SchemaIntegrity {
             reason: format!("{table} has an unexpected primary key"),
         });
@@ -191,67 +319,276 @@ fn has_workspace_session_cascade(
     transaction: &Transaction<'_>,
     table: &str,
 ) -> Result<bool, MigrationError> {
-    let mut statement = transaction.prepare(&format!("PRAGMA foreign_key_list({table})"))?;
-    let foreign_keys = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(6)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(foreign_keys.iter().any(|first| {
-        first.1 == 0
-            && first.2 == "sessions"
-            && first.3 == "workspace_id"
-            && first.4 == "workspace_id"
-            && first.5.eq_ignore_ascii_case("CASCADE")
-            && foreign_keys.iter().any(|second| {
-                second.0 == first.0
-                    && second.1 == 1
-                    && second.2 == "sessions"
-                    && second.3 == "session_id"
-                    && second.4 == "session_id"
-                    && second.5.eq_ignore_ascii_case("CASCADE")
-            })
-    }))
+    let foreign_keys = foreign_keys(transaction, table)?;
+    Ok(foreign_keys.len() == 2
+        && foreign_keys[0].id == foreign_keys[1].id
+        && foreign_keys[0].sequence == 0
+        && foreign_keys[1].sequence == 1
+        && foreign_keys.iter().all(|foreign_key| {
+            foreign_key.parent_table == "sessions"
+                && foreign_key.on_update.eq_ignore_ascii_case("NO ACTION")
+                && foreign_key.on_delete.eq_ignore_ascii_case("CASCADE")
+                && foreign_key.match_rule.eq_ignore_ascii_case("NONE")
+        })
+        && foreign_keys[0].from == "workspace_id"
+        && foreign_keys[0].to == "workspace_id"
+        && foreign_keys[1].from == "session_id"
+        && foreign_keys[1].to == "session_id")
 }
 
-fn has_unique_index(
+#[derive(Debug, PartialEq, Eq)]
+struct ForeignKey {
+    id: i64,
+    sequence: i64,
+    parent_table: String,
+    from: String,
+    to: String,
+    on_update: String,
+    on_delete: String,
+    match_rule: String,
+}
+
+fn foreign_keys(
     transaction: &Transaction<'_>,
     table: &str,
-    expected_columns: &[&str],
-) -> Result<bool, MigrationError> {
+) -> Result<Vec<ForeignKey>, MigrationError> {
+    let mut statement = transaction.prepare(&format!("PRAGMA foreign_key_list({table})"))?;
+    let mut foreign_keys = statement
+        .query_map([], |row| {
+            Ok(ForeignKey {
+                id: row.get(0)?,
+                sequence: row.get(1)?,
+                parent_table: row.get(2)?,
+                from: row.get(3)?,
+                to: row.get(4)?,
+                on_update: row.get(5)?,
+                on_delete: row.get(6)?,
+                match_rule: row.get(7)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    foreign_keys.sort_by_key(|foreign_key| (foreign_key.id, foreign_key.sequence));
+    Ok(foreign_keys)
+}
+
+#[derive(Clone, Copy)]
+struct UniqueIndexSpec {
+    origin: &'static str,
+    columns: &'static [&'static str],
+}
+
+impl UniqueIndexSpec {
+    const fn new(origin: &'static str, columns: &'static [&'static str]) -> Self {
+        Self { origin, columns }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct UniqueIndex {
+    origin: String,
+    partial: bool,
+    columns: Vec<String>,
+}
+
+fn validate_unique_indexes(
+    transaction: &Transaction<'_>,
+    table: &str,
+    expected: &[UniqueIndexSpec],
+) -> Result<(), MigrationError> {
     let mut statement = transaction.prepare(&format!("PRAGMA index_list({table})"))?;
     let indexes = statement
         .query_map([], |row| {
-            Ok((row.get::<_, String>(1)?, row.get::<_, bool>(2)?))
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, bool>(4)?,
+            ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    for (index, unique) in indexes {
+    let mut actual = Vec::new();
+    for (index, unique, origin, partial) in indexes {
         if !unique {
             continue;
         }
         let quoted = index.replace('"', "\"\"");
         let mut index_statement =
-            transaction.prepare(&format!("PRAGMA index_info(\"{quoted}\")"))?;
-        let columns = index_statement
-            .query_map([], |row| row.get::<_, String>(2))?
+            transaction.prepare(&format!("PRAGMA index_xinfo(\"{quoted}\")"))?;
+        let mut columns = index_statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, bool>(5)?,
+                ))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
-        if columns.iter().map(String::as_str).collect::<Vec<_>>() == expected_columns {
-            return Ok(true);
+        columns.retain(|(_, _, _, _, key)| *key);
+        columns.sort_by_key(|(sequence, _, _, _, _)| *sequence);
+        let mut names = Vec::with_capacity(columns.len());
+        for (_, name, descending, collation, _) in columns {
+            let Some(name) = name else {
+                return Err(MigrationError::SchemaIntegrity {
+                    reason: format!("{table} has an expression-based unique index"),
+                });
+            };
+            if descending
+                || !collation
+                    .as_deref()
+                    .is_some_and(|value| value.eq_ignore_ascii_case("BINARY"))
+            {
+                return Err(MigrationError::SchemaIntegrity {
+                    reason: format!("{table} has an incompatible unique index"),
+                });
+            }
+            names.push(name);
+        }
+        actual.push(UniqueIndex {
+            origin,
+            partial,
+            columns: names,
+        });
+    }
+    actual.sort();
+    let mut expected = expected
+        .iter()
+        .map(|index| UniqueIndex {
+            origin: index.origin.to_owned(),
+            partial: false,
+            columns: index
+                .columns
+                .iter()
+                .map(|column| (*column).to_owned())
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    expected.sort();
+    if actual != expected {
+        return Err(MigrationError::SchemaIntegrity {
+            reason: format!("{table} has unexpected unique index topology"),
+        });
+    }
+    Ok(())
+}
+
+fn validate_current_rows(transaction: &Transaction<'_>) -> Result<(), MigrationError> {
+    let mut sessions = transaction
+        .prepare("SELECT workspace_id, session_id, title, language, started_at_ms FROM sessions")?;
+    for session in sessions.query_map([], |row| {
+        Ok(NewSession {
+            workspace_id: row.get(0)?,
+            session_id: row.get(1)?,
+            title: row.get(2)?,
+            language: row.get(3)?,
+            started_at_ms: row.get(4)?,
+        })
+    })? {
+        session?
+            .validate()
+            .map_err(|error| MigrationError::SchemaIntegrity {
+                reason: format!("sessions contains an invalid row: {error}"),
+            })?;
+    }
+
+    let mut briefs = transaction
+        .prepare("SELECT workspace_id, session_id, summary, updated_at_ms FROM session_briefs")?;
+    for brief in briefs.query_map([], |row| {
+        Ok(NewSessionBrief {
+            workspace_id: row.get(0)?,
+            session_id: row.get(1)?,
+            summary: row.get(2)?,
+            updated_at_ms: row.get(3)?,
+        })
+    })? {
+        brief?
+            .validate()
+            .map_err(|error| MigrationError::SchemaIntegrity {
+                reason: format!("session_briefs contains an invalid row: {error}"),
+            })?;
+    }
+
+    let mut events = transaction.prepare(
+        "SELECT workspace_id, session_id, event_id, source_generation, source_sequence,
+                timestamp_ms, kind, correlation_id, request_id, turn_id, payload_json
+         FROM timeline_events",
+    )?;
+    for event in events.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<String>>(8)?,
+            row.get::<_, Option<String>>(9)?,
+            row.get::<_, String>(10)?,
+        ))
+    })? {
+        let (
+            workspace_id,
+            session_id,
+            event_id,
+            source_generation,
+            source_sequence,
+            timestamp_ms,
+            kind,
+            correlation_id,
+            request_id,
+            turn_id,
+            payload_json,
+        ) = event?;
+        let kind =
+            TimelineEventKind::from_db(&kind).map_err(|error| MigrationError::SchemaIntegrity {
+                reason: format!("timeline_events contains an invalid row: {error}"),
+            })?;
+        if !kind.is_durable() {
+            return Err(MigrationError::SchemaIntegrity {
+                reason: "timeline_events contains a non-durable event".to_owned(),
+            });
+        }
+        let payload = serde_json::from_str(&payload_json).map_err(|error| {
+            MigrationError::SchemaIntegrity {
+                reason: format!("timeline_events contains invalid JSON: {error}"),
+            }
+        })?;
+        NewTimelineEvent {
+            workspace_id,
+            session_id,
+            event_id,
+            source_generation,
+            source_sequence,
+            timestamp_ms,
+            kind,
+            correlation_id,
+            request_id,
+            turn_id,
+            payload,
+        }
+        .validate()
+        .map_err(|error| MigrationError::SchemaIntegrity {
+            reason: format!("timeline_events contains an invalid row: {error}"),
+        })?;
+    }
+
+    let mut settings = transaction.prepare("SELECT workspace_id FROM settings")?;
+    for workspace_id in settings.query_map([], |row| row.get::<_, String>(0))? {
+        if workspace_id?.is_empty() {
+            return Err(MigrationError::SchemaIntegrity {
+                reason: "settings contains an empty workspace id".to_owned(),
+            });
         }
     }
-    Ok(false)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{migrate, MigrationError, SCHEMA_VERSION};
+    use super::{has_workspace_session_cascade, migrate, MigrationError, SCHEMA_VERSION};
     use rusqlite::Connection;
     #[test]
     fn empty_database_migrates_to_current_owned_schema() {
@@ -317,6 +654,191 @@ mod tests {
                     timestamp_ms INTEGER NOT NULL, kind TEXT NOT NULL, correlation_id TEXT,
                     request_id TEXT, turn_id TEXT, payload_json TEXT NOT NULL
                 );",
+            )
+            .unwrap();
+
+        assert!(migrate(&mut connection).is_err());
+    }
+
+    #[test]
+    fn partial_timeline_uniqueness_does_not_satisfy_current_schema() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE timeline_events;
+                CREATE TABLE timeline_events (
+                    event_id TEXT PRIMARY KEY NOT NULL, workspace_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL, host_sequence INTEGER NOT NULL,
+                    source_generation INTEGER NOT NULL, source_sequence INTEGER NOT NULL,
+                    timestamp_ms INTEGER NOT NULL, kind TEXT NOT NULL, correlation_id TEXT,
+                    request_id TEXT, turn_id TEXT, payload_json TEXT NOT NULL,
+                    FOREIGN KEY (workspace_id, session_id)
+                        REFERENCES sessions(workspace_id, session_id) ON DELETE CASCADE
+                );
+                CREATE UNIQUE INDEX partial_timeline_order
+                    ON timeline_events(workspace_id, session_id, host_sequence)
+                    WHERE host_sequence > 0;",
+            )
+            .unwrap();
+
+        assert!(migrate(&mut connection).is_err());
+    }
+
+    #[test]
+    fn nullable_ownership_column_does_not_satisfy_current_schema() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE settings;
+                CREATE TABLE settings (
+                    workspace_id TEXT, setting_key TEXT NOT NULL, value_json TEXT NOT NULL,
+                    PRIMARY KEY (workspace_id, setting_key)
+                );",
+            )
+            .unwrap();
+
+        assert!(migrate(&mut connection).is_err());
+    }
+
+    #[test]
+    fn unknown_lower_schema_version_fails_closed() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection).unwrap();
+        connection.pragma_update(None, "user_version", -1).unwrap();
+
+        assert!(matches!(
+            migrate(&mut connection),
+            Err(MigrationError::UnsupportedSchemaVersion { found: -1 })
+        ));
+    }
+
+    #[test]
+    fn existing_foreign_key_violations_fail_closed() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                INSERT INTO timeline_events (
+                    event_id, workspace_id, session_id, host_sequence, source_generation,
+                    source_sequence, timestamp_ms, kind, payload_json
+                ) VALUES ('orphan', 'workspace', 'missing', 1, 1, 1, 1, 'note', '{}');",
+            )
+            .unwrap();
+
+        assert!(migrate(&mut connection).is_err());
+    }
+
+    #[test]
+    fn oversized_composite_foreign_key_is_not_accepted_as_ownership_cascade() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        let transaction = connection.transaction().unwrap();
+        transaction
+            .execute_batch(
+                "CREATE TABLE sessions (
+                    workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, tenant_id TEXT,
+                    PRIMARY KEY (workspace_id, session_id),
+                    UNIQUE (workspace_id, session_id, tenant_id)
+                );
+                CREATE TABLE timeline_events (
+                    workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, tenant_id TEXT,
+                    FOREIGN KEY (workspace_id, session_id, tenant_id)
+                        REFERENCES sessions(workspace_id, session_id, tenant_id)
+                        ON DELETE CASCADE
+                );",
+            )
+            .unwrap();
+
+        assert!(!has_workspace_session_cascade(&transaction, "timeline_events").unwrap());
+    }
+
+    #[test]
+    fn current_schema_rejects_nocase_workspace_ownership() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE settings;
+                CREATE TABLE settings (
+                    workspace_id TEXT COLLATE NOCASE NOT NULL,
+                    setting_key TEXT NOT NULL,
+                    value_json TEXT NOT NULL,
+                    PRIMARY KEY (workspace_id, setting_key)
+                );",
+            )
+            .unwrap();
+
+        assert!(migrate(&mut connection).is_err());
+    }
+
+    #[test]
+    fn current_schema_rejects_extra_required_column() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE settings;
+                CREATE TABLE settings (
+                    workspace_id TEXT NOT NULL,
+                    setting_key TEXT NOT NULL,
+                    value_json TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    PRIMARY KEY (workspace_id, setting_key)
+                );",
+            )
+            .unwrap();
+
+        assert!(migrate(&mut connection).is_err());
+    }
+
+    #[test]
+    fn current_schema_rejects_extra_uniqueness() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection).unwrap();
+        connection
+            .execute_batch(
+                "CREATE UNIQUE INDEX settings_value_unique
+                    ON settings(workspace_id, value_json);",
+            )
+            .unwrap();
+
+        assert!(migrate(&mut connection).is_err());
+    }
+
+    #[test]
+    fn current_schema_rejects_malformed_extra_foreign_key() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE settings;
+                CREATE TABLE settings (
+                    workspace_id TEXT NOT NULL,
+                    setting_key TEXT NOT NULL,
+                    value_json TEXT NOT NULL,
+                    PRIMARY KEY (workspace_id, setting_key),
+                    FOREIGN KEY (workspace_id, setting_key)
+                        REFERENCES sessions(workspace_id, session_id)
+                        ON DELETE CASCADE
+                );",
+            )
+            .unwrap();
+
+        assert!(migrate(&mut connection).is_err());
+    }
+
+    #[test]
+    fn current_schema_rejects_rows_with_empty_session_identity_or_language() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions (
+                    workspace_id, session_id, title, language, started_at_ms
+                ) VALUES ('', '', NULL, '', 1)",
+                [],
             )
             .unwrap();
 

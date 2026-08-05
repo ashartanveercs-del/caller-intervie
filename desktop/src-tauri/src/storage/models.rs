@@ -56,6 +56,8 @@ pub enum ModelError {
     MissingWorkspaceId,
     #[error("session id is required")]
     MissingSessionId,
+    #[error("session language is required")]
+    MissingLanguage,
     #[error("event id is required")]
     MissingEventId,
     #[error("a final transcript requires a turn id")]
@@ -73,6 +75,16 @@ pub struct NewSession {
     pub title: Option<String>,
     pub language: String,
     pub started_at_ms: i64,
+}
+
+impl NewSession {
+    pub fn validate(&self) -> Result<(), ModelError> {
+        validate_ownership(&self.workspace_id, &self.session_id)?;
+        if self.language.is_empty() {
+            return Err(ModelError::MissingLanguage);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,6 +105,12 @@ pub struct NewSessionBrief {
     pub updated_at_ms: i64,
 }
 
+impl NewSessionBrief {
+    pub fn validate(&self) -> Result<(), ModelError> {
+        validate_ownership(&self.workspace_id, &self.session_id)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct NewTimelineEvent {
     pub workspace_id: String,
@@ -110,12 +128,7 @@ pub struct NewTimelineEvent {
 
 impl NewTimelineEvent {
     pub fn validate(&self) -> Result<(), ModelError> {
-        if self.workspace_id.is_empty() {
-            return Err(ModelError::MissingWorkspaceId);
-        }
-        if self.session_id.is_empty() {
-            return Err(ModelError::MissingSessionId);
-        }
+        validate_ownership(&self.workspace_id, &self.session_id)?;
         if self.event_id.is_empty() {
             return Err(ModelError::MissingEventId);
         }
@@ -134,6 +147,16 @@ impl NewTimelineEvent {
             _ => Ok(()),
         }
     }
+}
+
+fn validate_ownership(workspace_id: &str, session_id: &str) -> Result<(), ModelError> {
+    if workspace_id.is_empty() {
+        return Err(ModelError::MissingWorkspaceId);
+    }
+    if session_id.is_empty() {
+        return Err(ModelError::MissingSessionId);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq)]

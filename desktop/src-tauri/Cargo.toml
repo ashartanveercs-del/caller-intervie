@@ -33,6 +33,8 @@ tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-t
 iota_stronghold = "=2.1.0"
 keyring = "=4.1.6"
 getrandom = "0.3"
+fs2 = "0.4"
+tempfile = "3"
 zeroize = "1"
 thiserror = "2"
 
@@ -41,9 +43,6 @@ rusqlite = { version = "=0.40.1", default-features = false, features = ["bundled
 
 [target.'cfg(target_os = "macos")'.dependencies]
 rusqlite = { version = "=0.40.1", default-features = false, features = ["bundled-sqlcipher"] }
-
-[dev-dependencies]
-tempfile = "3"
 
 [[test]]
 name = "storage"
