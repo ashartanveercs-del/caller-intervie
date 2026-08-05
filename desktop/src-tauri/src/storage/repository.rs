@@ -1,7 +1,9 @@
-use std::{fmt::Write as _, path::Path, sync::Mutex};
+use std::{path::Path, sync::Mutex};
 
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
-use zeroize::Zeroizing;
+use rusqlite::{
+    ffi, params, types::Type, Connection, OptionalExtension, Transaction, TransactionBehavior,
+};
+use serde_json::Value;
 
 use super::{
     migrations::{migrate, MigrationError},
@@ -61,6 +63,7 @@ impl SessionRepository {
     }
 
     pub fn create_session(&self, session: &NewSession) -> Result<(), RepositoryError> {
+        session.validate()?;
         let connection = self
             .connection
             .lock()
@@ -70,6 +73,7 @@ impl SessionRepository {
     }
 
     pub fn save_session_brief(&self, brief: &NewSessionBrief) -> Result<(), RepositoryError> {
+        brief.validate()?;
         let connection = self
             .connection
             .lock()
@@ -101,7 +105,7 @@ impl SessionRepository {
             }
         })?;
         if let Some((host_sequence, existing)) = existing_event(&transaction, &event.event_id)? {
-            if existing == event_content(event, &payload_json) {
+            if existing == event_content(event) {
                 return Ok(AppendEventResult::Duplicate { host_sequence });
             }
             return Err(RepositoryError::EventContentCollision {
@@ -200,8 +204,20 @@ impl SessionRepository {
 }
 
 fn apply_cipher_key(connection: &mut Connection, key: &[u8]) -> Result<(), RepositoryError> {
-    let pragma = cipher_key_pragma(key);
-    connection.execute_batch(&pragma)?;
+    let key_length = i32::try_from(key.len()).map_err(|_| RepositoryError::CipherUnavailable)?;
+    let database_name = b"main\0";
+    // The connection and byte slices remain valid and exclusively borrowed for the FFI call.
+    let result = unsafe {
+        ffi::sqlite3_key_v2(
+            connection.handle(),
+            database_name.as_ptr().cast(),
+            key.as_ptr().cast(),
+            key_length,
+        )
+    };
+    if result != ffi::SQLITE_OK {
+        return Err(rusqlite::Error::SqliteFailure(ffi::Error::new(result), None).into());
+    }
     connection.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
         row.get::<_, i64>(0)
     })?;
@@ -210,23 +226,6 @@ fn apply_cipher_key(connection: &mut Connection, key: &[u8]) -> Result<(), Repos
         return Err(RepositoryError::CipherUnavailable);
     }
     Ok(())
-}
-
-fn cipher_key_hex(key: &[u8]) -> Zeroizing<String> {
-    let mut hex = Zeroizing::new(String::with_capacity(key.len() * 2));
-    for byte in key {
-        write!(&mut *hex, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    hex
-}
-
-fn cipher_key_pragma(key: &[u8]) -> Zeroizing<String> {
-    let hex = cipher_key_hex(key);
-    let mut pragma = Zeroizing::new(String::with_capacity(hex.len() + 20));
-    pragma.push_str("PRAGMA key = \"x'");
-    pragma.push_str(&hex);
-    pragma.push_str("'\";");
-    pragma
 }
 
 fn ensure_session(
@@ -257,10 +256,10 @@ struct EventContent {
     correlation_id: Option<String>,
     request_id: Option<String>,
     turn_id: Option<String>,
-    payload_json: String,
+    payload: Value,
 }
 
-fn event_content(event: &NewTimelineEvent, payload_json: &str) -> EventContent {
+fn event_content(event: &NewTimelineEvent) -> EventContent {
     EventContent {
         workspace_id: event.workspace_id.clone(),
         session_id: event.session_id.clone(),
@@ -271,7 +270,7 @@ fn event_content(event: &NewTimelineEvent, payload_json: &str) -> EventContent {
         correlation_id: event.correlation_id.clone(),
         request_id: event.request_id.clone(),
         turn_id: event.turn_id.clone(),
-        payload_json: payload_json.to_owned(),
+        payload: event.payload.clone(),
     }
 }
 
@@ -280,6 +279,7 @@ fn existing_event(
     event_id: &str,
 ) -> Result<Option<(i64, EventContent)>, RepositoryError> {
     transaction.query_row("SELECT host_sequence, workspace_id, session_id, source_generation, source_sequence, timestamp_ms, kind, correlation_id, request_id, turn_id, payload_json FROM timeline_events WHERE event_id = ?1", [event_id], |row| {
+        let payload_json: String = row.get(10)?;
         let content = EventContent {
             workspace_id: row.get(1)?,
             session_id: row.get(2)?,
@@ -290,7 +290,9 @@ fn existing_event(
             correlation_id: row.get(7)?,
             request_id: row.get(8)?,
             turn_id: row.get(9)?,
-            payload_json: row.get(10)?,
+            payload: serde_json::from_str(&payload_json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(10, Type::Text, Box::new(error))
+            })?,
         };
         Ok((row.get(0)?, content))
     }).optional().map_err(Into::into)
@@ -329,8 +331,10 @@ fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTimelineEve
 mod tests {
     use super::{RepositoryError, SessionRepository};
     use crate::{
-        AppendEventResult, NewSession, NewSessionBrief, NewTimelineEvent, TimelineEventKind,
+        AppendEventResult, ModelError, NewSession, NewSessionBrief, NewTimelineEvent,
+        TimelineEventKind,
     };
+    use rusqlite::params;
     use serde_json::json;
     use std::fs;
     use tempfile::{tempdir, TempDir};
@@ -358,18 +362,18 @@ mod tests {
     }
 
     #[test]
-    fn sqlcipher_key_derived_strings_have_zeroizing_types() {
+    fn sqlcipher_key_is_passed_as_bytes_through_the_native_api() {
         let production = include_str!("repository.rs")
             .split("#[cfg(test)]")
             .next()
             .unwrap();
 
-        assert!(production.contains("use zeroize::Zeroizing;"));
-        assert!(production.contains("fn cipher_key_hex"));
-        assert!(production.contains("fn cipher_key_pragma"));
-        assert_eq!(production.matches("-> Zeroizing<String>").count(), 2);
-        assert!(!production.contains("map(|byte| format!"));
-        assert!(!production.contains("execute_batch(&format!(\"PRAGMA key"));
+        assert!(production.contains("ffi::sqlite3_key_v2("));
+        assert!(production.contains("ffi::SQLITE_OK"));
+        assert!(production.contains("connection.handle()"));
+        assert!(!production.contains("PRAGMA key"));
+        assert!(!production.contains("cipher_key_hex"));
+        assert!(!production.contains("cipher_key_pragma"));
     }
 
     fn session(workspace_id: &str) -> NewSession {
@@ -483,6 +487,52 @@ mod tests {
         assert!(matches!(
             repository.append_event(&aliased_by_old_fingerprint),
             Err(RepositoryError::EventContentCollision { .. })
+        ));
+    }
+
+    #[test]
+    fn equivalent_json_object_order_is_idempotent() {
+        let (_temp, _path, repository) = repository();
+        repository.create_session(&session(WORKSPACE_A)).unwrap();
+        let mut note = event("json-order-event", TimelineEventKind::Note);
+        note.payload = json!({"alpha": 1, "beta": 2});
+        repository.append_event(&note).unwrap();
+        repository
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE timeline_events SET payload_json = ?1 WHERE event_id = ?2",
+                params!["{\"beta\":2,\"alpha\":1}", note.event_id],
+            )
+            .unwrap();
+
+        assert_eq!(
+            repository.append_event(&note).unwrap(),
+            AppendEventResult::Duplicate { host_sequence: 1 }
+        );
+    }
+
+    #[test]
+    fn sessions_and_briefs_reject_empty_ownership() {
+        let (_temp, _path, repository) = repository();
+        let mut invalid_session = session(WORKSPACE_A);
+        invalid_session.workspace_id.clear();
+        assert!(matches!(
+            repository.create_session(&invalid_session),
+            Err(RepositoryError::Model(ModelError::MissingWorkspaceId))
+        ));
+
+        repository.create_session(&session(WORKSPACE_A)).unwrap();
+        let invalid_brief = NewSessionBrief {
+            workspace_id: WORKSPACE_A.into(),
+            session_id: String::new(),
+            summary: "brief".into(),
+            updated_at_ms: 1,
+        };
+        assert!(matches!(
+            repository.save_session_brief(&invalid_brief),
+            Err(RepositoryError::Model(ModelError::MissingSessionId))
         ));
     }
     #[test]
