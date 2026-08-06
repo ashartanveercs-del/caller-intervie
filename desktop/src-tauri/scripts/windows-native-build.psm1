@@ -3,7 +3,7 @@ Set-StrictMode -Version Latest
 
 $script:BuildContract = [pscustomobject]@{
     SchemaVersion = 1
-    RecipeRevision = 1
+    RecipeRevision = 3
     LibsodiumVersion = '1.0.20'
     SourceAsset = 'libsodium-1.0.20.tar.gz'
     SourceUrl = 'https://github.com/jedisct1/libsodium/releases/download/1.0.20-RELEASE/libsodium-1.0.20.tar.gz'
@@ -15,8 +15,15 @@ $script:BuildContract = [pscustomobject]@{
     PlatformToolset = 'v143'
     RuntimeLibrary = 'MultiThreadedDLL'
     PropertyFile = 'builds/msvc/properties/ReleaseLIB.props'
+    DebugPropertyFile = 'builds/msvc/properties/Release.props'
+    DebugInformationFormat = 'OldStyle'
     Library = 'lib/libsodium.lib'
     CacheDirectory = 'libsodium-1.0.20-msvc-static-md-x64'
+    CargoTarget = 'x86_64-pc-windows-msvc'
+    VisualStudioInstallationVersion = '17.14.37516.0'
+    MsBuildVersion = '17.14.51.32402'
+    VcToolsVersion = '14.44.35207'
+    LinkVersion = '14.44.35228.0'
 }
 
 function Get-WindowsNativeBuildContract {
@@ -55,6 +62,31 @@ function Convert-LibsodiumReleasePropertyToDynamicCrt {
     return 1
 }
 
+function Convert-LibsodiumReleaseDebugInformationToEmbedded {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "The libsodium Release property file is missing: $Path"
+    }
+
+    $externalNode = '<DebugInformationFormat>ProgramDatabase</DebugInformationFormat>'
+    $embeddedNode = '<DebugInformationFormat>OldStyle</DebugInformationFormat>'
+    $content = [System.IO.File]::ReadAllText($Path)
+    $externalCount = [regex]::Matches($content, [regex]::Escape($externalNode)).Count
+    $embeddedCount = [regex]::Matches($content, [regex]::Escape($embeddedNode)).Count
+    if ($externalCount -ne 1 -or $embeddedCount -ne 0) {
+        throw "Expected exactly one ProgramDatabase DebugInformationFormat node and no OldStyle node; found $externalCount and $embeddedCount."
+    }
+
+    $content = $content.Replace($externalNode, $embeddedNode)
+    [System.IO.File]::WriteAllText($Path, $content, [System.Text.UTF8Encoding]::new($true))
+    return 1
+}
+
 function Assert-LibsodiumArchiveInspection {
     [CmdletBinding()]
     param(
@@ -68,6 +100,21 @@ function Assert-LibsodiumArchiveInspection {
     $staticCrtPattern = '(?i)/DEFAULTLIB:"?LIBCMTD?"?(?=\s|$)'
     if ([regex]::IsMatch($DirectiveOutput, $staticCrtPattern)) {
         throw 'libsodium.lib requests LIBCMT or LIBCMTD; refusing the static-CRT archive.'
+    }
+
+    $debugDynamicCrtPattern = '(?i)/DEFAULTLIB:"?MSVCRTD"?(?=\s|$)'
+    if ([regex]::IsMatch($DirectiveOutput, $debugDynamicCrtPattern)) {
+        throw 'libsodium.lib requests MSVCRTD; refusing the debug dynamic-CRT archive.'
+    }
+
+    $runtimeMismatches = [regex]::Matches(
+        $DirectiveOutput,
+        '(?i)/FAILIFMISMATCH:"?RuntimeLibrary=([^"\s]+)"?'
+    )
+    foreach ($runtimeMismatch in $runtimeMismatches) {
+        if ($runtimeMismatch.Groups[1].Value -cne 'MD_DynamicRelease') {
+            throw "libsodium.lib contains an incompatible RuntimeLibrary directive: $($runtimeMismatch.Groups[1].Value)."
+        }
     }
 
     $dynamicCrtPattern = '(?i)/DEFAULTLIB:"?MSVCRT"?(?=\s|$)'
@@ -95,6 +142,13 @@ function Get-ReceiptValue {
         [Parameter(Mandatory = $true)] $Receipt,
         [Parameter(Mandatory = $true)] [string] $Name
     )
+
+    if ($Receipt -is [System.Collections.IDictionary]) {
+        if (-not $Receipt.ContainsKey($Name)) {
+            throw "The libsodium build receipt is missing '$Name'."
+        }
+        return $Receipt[$Name]
+    }
 
     $property = $Receipt.PSObject.Properties[$Name]
     if ($null -eq $property) {
@@ -127,16 +181,27 @@ function Assert-LibsodiumBuildReceipt {
     }
 
     try {
-        $receipt = Get-Content -LiteralPath $ReceiptPath -Raw | ConvertFrom-Json
+        Add-Type -AssemblyName System.Web.Extensions
+        $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+        $serializer.MaxJsonLength = 65536
+        $receipt = $serializer.DeserializeObject((Get-Content -LiteralPath $ReceiptPath -Raw))
     }
     catch {
         throw "The libsodium build receipt is not valid JSON: $($_.Exception.Message)"
     }
 
+    if ($null -eq $receipt -or $receipt -isnot [System.Collections.IDictionary]) {
+        throw 'The libsodium build receipt must be a JSON object.'
+    }
+
     $contract = Get-WindowsNativeBuildContract
-    $expected = [ordered]@{
+    $expectedIntegers = [ordered]@{
         schema_version = $contract.SchemaVersion
         recipe_revision = $contract.RecipeRevision
+        property_transform_count = 1
+        debug_property_transform_count = 1
+    }
+    $expectedStrings = [ordered]@{
         libsodium_version = $contract.LibsodiumVersion
         source_asset = $contract.SourceAsset
         source_url = $contract.SourceUrl
@@ -147,27 +212,62 @@ function Assert-LibsodiumBuildReceipt {
         platform_toolset = $contract.PlatformToolset
         runtime_library = $contract.RuntimeLibrary
         property_file = $contract.PropertyFile
-        property_transform_count = 1
+        debug_property_file = $contract.DebugPropertyFile
+        debug_information_format = $contract.DebugInformationFormat
         library = $contract.Library
         machine = 'x64'
         crt_default_library = 'MSVCRT'
+        visual_studio_installation_version = $contract.VisualStudioInstallationVersion
+        msbuild_version = $contract.MsBuildVersion
+        vc_tools_version = $contract.VcToolsVersion
+        link_version = $contract.LinkVersion
     }
 
-    foreach ($entry in $expected.GetEnumerator()) {
+    $expectedFieldNames = @($expectedIntegers.Keys) + @($expectedStrings.Keys) + @('library_sha256')
+    foreach ($propertyName in $receipt.Keys) {
+        if ($expectedFieldNames -cnotcontains $propertyName) {
+            throw "The libsodium build receipt contains unknown JSON field '$propertyName'."
+        }
+    }
+
+    $integerTypeCodes = @(
+        [System.TypeCode]::SByte,
+        [System.TypeCode]::Byte,
+        [System.TypeCode]::Int16,
+        [System.TypeCode]::UInt16,
+        [System.TypeCode]::Int32,
+        [System.TypeCode]::UInt32,
+        [System.TypeCode]::Int64,
+        [System.TypeCode]::UInt64
+    )
+    foreach ($entry in $expectedIntegers.GetEnumerator()) {
         $actual = Get-ReceiptValue -Receipt $receipt -Name $entry.Key
-        if ($actual.ToString() -cne $entry.Value.ToString()) {
+        if ($null -eq $actual -or $integerTypeCodes -cnotcontains [System.Type]::GetTypeCode($actual.GetType())) {
+            throw "The libsodium build receipt field '$($entry.Key)' must be a JSON unsigned integer."
+        }
+        $numeric = [decimal] $actual
+        if ($numeric -lt 0 -or $numeric -gt [uint32]::MaxValue) {
+            throw "The libsodium build receipt field '$($entry.Key)' must be a JSON unsigned integer."
+        }
+        if ($numeric -ne $entry.Value) {
             throw "The libsodium build receipt field '$($entry.Key)' is stale or incompatible."
         }
     }
 
-    foreach ($versionField in @('msbuild_version', 'link_version')) {
-        $version = (Get-ReceiptValue -Receipt $receipt -Name $versionField).ToString()
-        if ($version -notmatch '^\d+(?:\.\d+)+$') {
-            throw "The libsodium build receipt field '$versionField' is invalid."
+    foreach ($entry in $expectedStrings.GetEnumerator()) {
+        $actual = Get-ReceiptValue -Receipt $receipt -Name $entry.Key
+        if ($actual -isnot [string]) {
+            throw "The libsodium build receipt field '$($entry.Key)' must be a JSON string."
+        }
+        if ($actual -cne $entry.Value) {
+            throw "The libsodium build receipt field '$($entry.Key)' is stale or incompatible."
         }
     }
 
-    $expectedLibraryHash = (Get-ReceiptValue -Receipt $receipt -Name 'library_sha256').ToString()
+    $expectedLibraryHash = Get-ReceiptValue -Receipt $receipt -Name 'library_sha256'
+    if ($expectedLibraryHash -isnot [string]) {
+        throw "The libsodium build receipt field 'library_sha256' must be a JSON string."
+    }
     if ($expectedLibraryHash -notmatch '^[0-9a-f]{64}$') {
         throw 'The libsodium build receipt library SHA-256 is invalid.'
     }
@@ -201,17 +301,51 @@ function Get-VisualStudioInstallationPath {
         [Parameter(Mandatory = $true)] [string] $VsWherePath
     )
 
-    $output = @(
-        & $VsWherePath -latest -version '[17.0,18.0)' -products '*' -requires Microsoft.Component.MSBuild Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-    )
+    $contract = Get-WindowsNativeBuildContract
+    $output = @(& $VsWherePath -latest -version '[17.14,17.15)' -products '*' -requires Microsoft.Component.MSBuild Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json -utf8)
     if ($LASTEXITCODE -ne 0) {
         throw "vswhere.exe failed while locating Visual Studio 2022 Build Tools (exit $LASTEXITCODE)."
     }
-    $installationPath = $output | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Container) } | Select-Object -First 1
-    if (-not $installationPath) {
-        throw 'Visual Studio 2022 Build Tools with MSBuild and the x64 MSVC toolchain were not found.'
+    try {
+        $installations = @((($output -join [Environment]::NewLine) | ConvertFrom-Json))
     }
-    return [System.IO.Path]::GetFullPath($installationPath)
+    catch {
+        throw "vswhere.exe returned invalid JSON: $($_.Exception.Message)"
+    }
+    if ($installations.Count -ne 1) {
+        throw "vswhere.exe did not find exactly one approved Visual Studio $($contract.VisualStudioInstallationVersion) installation."
+    }
+
+    $installation = $installations[0]
+    if ($installation.installationVersion -cne $contract.VisualStudioInstallationVersion) {
+        throw "Visual Studio installation version must be exactly $($contract.VisualStudioInstallationVersion); found '$($installation.installationVersion)'."
+    }
+    if (-not $installation.installationPath -or -not (Test-Path -LiteralPath $installation.installationPath -PathType Container)) {
+        throw 'The approved Visual Studio installation path is unavailable.'
+    }
+    return [System.IO.Path]::GetFullPath($installation.installationPath)
+}
+
+function Assert-ApprovedToolchainVersions {
+    param(
+        [Parameter(Mandatory = $true)] [string] $VisualStudioInstallationVersion,
+        [Parameter(Mandatory = $true)] [string] $MsBuildVersion,
+        [Parameter(Mandatory = $true)] [string] $VcToolsVersion,
+        [Parameter(Mandatory = $true)] [string] $LinkVersion
+    )
+
+    $contract = Get-WindowsNativeBuildContract
+    foreach ($field in @(
+        'VisualStudioInstallationVersion',
+        'MsBuildVersion',
+        'VcToolsVersion',
+        'LinkVersion'
+    )) {
+        $actual = Get-Variable -Name $field -ValueOnly
+        if ($actual -cne $contract.$field) {
+            throw "$field must be exactly $($contract.$field); found '$actual'."
+        }
+    }
 }
 
 function Get-VisualStudio2022Toolchain {
@@ -238,18 +372,12 @@ function Get-VisualStudio2022Toolchain {
         }
     }
 
-    $msvcToolsRoot = Join-Path $installation 'VC\Tools\MSVC'
-    $toolVersions = @(Get-ChildItem -LiteralPath $msvcToolsRoot -Directory -ErrorAction SilentlyContinue |
-        Where-Object {
-            $parsed = $null
-            [version]::TryParse($_.Name, [ref] $parsed) -and
-                (Test-Path -LiteralPath (Join-Path $_.FullName 'bin\Hostx64\x64\link.exe') -PathType Leaf)
-        } |
-        Sort-Object { [version] $_.Name } -Descending)
-    if ($toolVersions.Count -eq 0) {
-        throw 'The selected Visual Studio 2022 installation has no x64 MSVC linker.'
+    $contract = Get-WindowsNativeBuildContract
+    $vcToolsInstallDirectory = Join-Path $installation "VC\Tools\MSVC\$($contract.VcToolsVersion)"
+    $link = Join-Path $vcToolsInstallDirectory 'bin\Hostx64\x64\link.exe'
+    if (-not (Test-Path -LiteralPath $link -PathType Leaf)) {
+        throw "The selected Visual Studio installation does not contain the approved VC tools directory $($contract.VcToolsVersion)."
     }
-    $link = Join-Path $toolVersions[0].FullName 'bin\Hostx64\x64\link.exe'
 
     return [pscustomobject]@{
         InstallationPath = $installation
@@ -257,7 +385,7 @@ function Get-VisualStudio2022Toolchain {
         MsBuildPath = $msbuild
         LinkPath = $link
         V143ToolsetPath = $v143Toolset
-        VcToolsInstallDirectory = $toolVersions[0].FullName
+        VcToolsInstallDirectory = $vcToolsInstallDirectory
     }
 }
 
@@ -336,6 +464,46 @@ function Get-ExecutableVersion {
         }
     }
     throw "$DisplayName did not report a parseable version."
+}
+
+function Clear-InheritedMsBuildEnvironment {
+    foreach ($variable in @(
+        'CL',
+        '_CL_',
+        'LINK',
+        '_LINK_',
+        'ForceImportBeforeCppTargets',
+        'ForceImportAfterCppTargets'
+    )) {
+        Remove-Item -LiteralPath "Env:$variable" -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-ControlledMsBuild {
+    param(
+        [Parameter(Mandatory = $true)] [string] $MsBuildPath,
+        [Parameter(Mandatory = $true)] [string] $SolutionPath,
+        [Parameter(Mandatory = $true)] [string] $LogPath
+    )
+
+    Clear-InheritedMsBuildEnvironment
+    $contract = Get-WindowsNativeBuildContract
+    $arguments = @(
+        $SolutionPath,
+        '-noAutoResponse',
+        '/nologo',
+        '/m',
+        '/t:Rebuild',
+        "/p:Configuration=$($contract.Configuration)",
+        "/p:Platform=$($contract.Platform)",
+        "/p:PlatformToolset=$($contract.PlatformToolset)",
+        '/p:ImportDirectoryBuildProps=false',
+        '/p:ImportDirectoryBuildTargets=false',
+        '/verbosity:minimal',
+        '/fileLogger',
+        "/fileLoggerParameters:LogFile=$LogPath;Verbosity=normal"
+    )
+    return Invoke-NativeCommandWithOutput -ExecutablePath $MsBuildPath -Arguments $arguments
 }
 
 function Invoke-LibsodiumArchiveInspection {
@@ -435,7 +603,8 @@ function New-LibsodiumBuildReceipt {
     param(
         [Parameter(Mandatory = $true)] [string] $LibraryPath,
         [Parameter(Mandatory = $true)] [string] $MsBuildVersion,
-        [Parameter(Mandatory = $true)] [string] $LinkVersion
+        [Parameter(Mandatory = $true)] [string] $LinkVersion,
+        [Parameter(Mandatory = $true)] [string] $VcToolsVersion
     )
 
     $contract = Get-WindowsNativeBuildContract
@@ -454,19 +623,26 @@ function New-LibsodiumBuildReceipt {
         runtime_library = $contract.RuntimeLibrary
         property_file = $contract.PropertyFile
         property_transform_count = 1
+        debug_property_file = $contract.DebugPropertyFile
+        debug_information_format = $contract.DebugInformationFormat
+        debug_property_transform_count = 1
         library = $contract.Library
         library_sha256 = $libraryHash
         machine = 'x64'
         crt_default_library = 'MSVCRT'
+        visual_studio_installation_version = $contract.VisualStudioInstallationVersion
         msbuild_version = $MsBuildVersion
         link_version = $LinkVersion
+        vc_tools_version = $VcToolsVersion
     }
 }
 
 function Get-ValidatedProvisionedArtifact {
     param(
         [Parameter(Mandatory = $true)] [string] $ArtifactRoot,
-        [Parameter(Mandatory = $true)] [string] $LinkPath
+        [Parameter(Mandatory = $true)] [string] $LinkPath,
+        [Parameter(Mandatory = $true)] [string] $MsBuildPath,
+        [Parameter(Mandatory = $true)] [string] $VcToolsVersion
     )
 
     $contract = Get-WindowsNativeBuildContract
@@ -477,6 +653,13 @@ function Get-ValidatedProvisionedArtifact {
     if ($receipt.link_version -cne $inspection.LinkVersion) {
         throw 'The cached libsodium receipt was produced with a different MSVC linker version.'
     }
+    $currentMsBuildVersion = Get-ExecutableVersion -ExecutablePath $MsBuildPath -Arguments @('-version', '-nologo') -DisplayName 'MSBuild'
+    if ($receipt.msbuild_version -cne $currentMsBuildVersion) {
+        throw 'The cached libsodium receipt was produced with a different MSBuild version.'
+    }
+    if ($receipt.vc_tools_version -cne $VcToolsVersion) {
+        throw 'The cached libsodium receipt was produced with a different VC tools version.'
+    }
 
     return [pscustomobject]@{
         ArtifactRoot = $ArtifactRoot
@@ -486,20 +669,69 @@ function Get-ValidatedProvisionedArtifact {
     }
 }
 
+function Publish-RollbackSafeArtifact {
+    param(
+        [Parameter(Mandatory = $true)] [string] $NativeRoot,
+        [Parameter(Mandatory = $true)] [string] $StagedArtifactRoot,
+        [Parameter(Mandatory = $true)] [string] $ArtifactRoot,
+        [Parameter(Mandatory = $true)] [scriptblock] $ValidateArtifact,
+        [scriptblock] $MoveDirectory = {
+            param($source, $destination)
+            [System.IO.Directory]::Move($source, $destination)
+        }
+    )
+
+    $backupRoot = Join-Path $NativeRoot ("backup-" + [guid]::NewGuid().ToString('N'))
+    $previousMoved = $false
+    $replacementMoved = $false
+    try {
+        if (Test-Path -LiteralPath $ArtifactRoot) {
+            & $MoveDirectory $ArtifactRoot $backupRoot
+            $previousMoved = $true
+        }
+
+        & $MoveDirectory $StagedArtifactRoot $ArtifactRoot
+        $replacementMoved = $true
+        $validatedArtifact = & $ValidateArtifact $ArtifactRoot
+
+        if ($previousMoved -and (Test-Path -LiteralPath $backupRoot)) {
+            Remove-NativeTree -NativeRoot $NativeRoot -Path $backupRoot
+        }
+        return $validatedArtifact
+    }
+    catch {
+        $publicationError = $_.Exception
+        try {
+            if ($replacementMoved -and (Test-Path -LiteralPath $ArtifactRoot)) {
+                Remove-NativeTree -NativeRoot $NativeRoot -Path $ArtifactRoot
+            }
+            if ($previousMoved -and (Test-Path -LiteralPath $backupRoot)) {
+                if (Test-Path -LiteralPath $ArtifactRoot) {
+                    Remove-NativeTree -NativeRoot $NativeRoot -Path $ArtifactRoot
+                }
+                & $MoveDirectory $backupRoot $ArtifactRoot
+            }
+        }
+        catch {
+            throw "Cache publication failed ('$($publicationError.Message)') and rollback failed: $($_.Exception.Message)"
+        }
+        throw $publicationError
+    }
+}
+
 function New-ProvisionedLibsodiumArtifact {
     param(
         [Parameter(Mandatory = $true)] [string] $NativeRoot,
         [Parameter(Mandatory = $true)] [string] $ArchivePath,
         [Parameter(Mandatory = $true)] [string] $MsBuildPath,
         [Parameter(Mandatory = $true)] [string] $LinkPath,
+        [Parameter(Mandatory = $true)] [string] $VcToolsVersion,
         [Parameter(Mandatory = $true)] [string] $ArtifactRoot
     )
 
     $contract = Get-WindowsNativeBuildContract
     $workRoot = Join-Path $NativeRoot 'w'
     $artifactStage = Join-Path $NativeRoot 's'
-    $published = $false
-
     try {
         Remove-NativeTree -NativeRoot $NativeRoot -Path $workRoot
         Remove-NativeTree -NativeRoot $NativeRoot -Path $artifactStage
@@ -529,15 +761,20 @@ function New-ProvisionedLibsodiumArtifact {
             throw "The libsodium RuntimeLibrary transform count was $replacementCount instead of 1."
         }
 
+        $debugPropertyPath = Join-Path $sourceRoot ($contract.DebugPropertyFile.Replace('/', '\'))
+        $debugReplacementCount = Convert-LibsodiumReleaseDebugInformationToEmbedded -Path $debugPropertyPath
+        if ($debugReplacementCount -ne 1) {
+            throw "The libsodium DebugInformationFormat transform count was $debugReplacementCount instead of 1."
+        }
+
         $solutionPath = Join-Path $sourceRoot ($contract.Solution.Replace('/', '\'))
         if (-not (Test-Path -LiteralPath $solutionPath -PathType Leaf)) {
             throw "The expected libsodium VS2022 solution is missing: $solutionPath"
         }
 
         $msbuildLog = Join-Path $workRoot 'msbuild.log'
-        & $MsBuildPath $solutionPath /nologo /m /t:Rebuild "/p:Configuration=$($contract.Configuration)" "/p:Platform=$($contract.Platform)" "/p:PlatformToolset=$($contract.PlatformToolset)" /verbosity:minimal /fileLogger "/fileLoggerParameters:LogFile=$msbuildLog;Verbosity=normal"
-        if ($LASTEXITCODE -ne 0) {
-            $msbuildExitCode = $LASTEXITCODE
+        $msbuildExitCode = Invoke-ControlledMsBuild -MsBuildPath $MsBuildPath -SolutionPath $solutionPath -LogPath $msbuildLog
+        if ($msbuildExitCode -ne 0) {
             $logTail = if (Test-Path -LiteralPath $msbuildLog -PathType Leaf) {
                 (Get-Content -LiteralPath $msbuildLog -Tail 40) -join [Environment]::NewLine
             }
@@ -564,7 +801,7 @@ function New-ProvisionedLibsodiumArtifact {
         $stageLibrary = Join-Path $stageLibraryDirectory 'libsodium.lib'
         Copy-Item -LiteralPath $builtLibrary -Destination $stageLibrary
 
-        $receipt = New-LibsodiumBuildReceipt -LibraryPath $stageLibrary -MsBuildVersion $msbuildVersion -LinkVersion $inspection.LinkVersion
+        $receipt = New-LibsodiumBuildReceipt -LibraryPath $stageLibrary -MsBuildVersion $msbuildVersion -LinkVersion $inspection.LinkVersion -VcToolsVersion $VcToolsVersion
         $receiptPath = Join-Path $artifactStage 'receipt.json'
         $receiptJson = $receipt | ConvertTo-Json -Depth 3
         [System.IO.File]::WriteAllText($receiptPath, $receiptJson + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
@@ -572,19 +809,19 @@ function New-ProvisionedLibsodiumArtifact {
         Assert-LibsodiumBuildReceipt -ReceiptPath $receiptPath -LibraryPath $stageLibrary | Out-Null
         Invoke-LibsodiumArchiveInspection -LinkPath $LinkPath -LibraryPath $stageLibrary | Out-Null
 
-        if (Test-Path -LiteralPath $ArtifactRoot) {
-            Remove-NativeTree -NativeRoot $NativeRoot -Path $ArtifactRoot
-        }
-        [System.IO.Directory]::Move($artifactStage, $ArtifactRoot)
-        $published = $true
-
-        return Get-ValidatedProvisionedArtifact -ArtifactRoot $ArtifactRoot -LinkPath $LinkPath
-    }
-    catch {
-        if ($published -and (Test-Path -LiteralPath $ArtifactRoot)) {
-            Remove-NativeTree -NativeRoot $NativeRoot -Path $ArtifactRoot
-        }
-        throw
+        $validatePublishedArtifact = {
+            param($publishedRoot)
+            Get-ValidatedProvisionedArtifact `
+                -ArtifactRoot $publishedRoot `
+                -LinkPath $LinkPath `
+                -MsBuildPath $MsBuildPath `
+                -VcToolsVersion $VcToolsVersion
+        }.GetNewClosure()
+        return Publish-RollbackSafeArtifact `
+            -NativeRoot $NativeRoot `
+            -StagedArtifactRoot $artifactStage `
+            -ArtifactRoot $ArtifactRoot `
+            -ValidateArtifact $validatePublishedArtifact
     }
     finally {
         Remove-NativeTree -NativeRoot $NativeRoot -Path $workRoot
@@ -596,14 +833,15 @@ function Get-ProvisionedLibsodiumArtifact {
     param(
         [Parameter(Mandatory = $true)] [string] $NativeRoot,
         [Parameter(Mandatory = $true)] [string] $MsBuildPath,
-        [Parameter(Mandatory = $true)] [string] $LinkPath
+        [Parameter(Mandatory = $true)] [string] $LinkPath,
+        [Parameter(Mandatory = $true)] [string] $VcToolsVersion
     )
 
     $contract = Get-WindowsNativeBuildContract
     $artifactRoot = Join-Path $NativeRoot $contract.CacheDirectory
     if (Test-Path -LiteralPath $artifactRoot) {
         try {
-            return Get-ValidatedProvisionedArtifact -ArtifactRoot $artifactRoot -LinkPath $LinkPath
+            return Get-ValidatedProvisionedArtifact -ArtifactRoot $artifactRoot -LinkPath $LinkPath -MsBuildPath $MsBuildPath -VcToolsVersion $VcToolsVersion
         }
         catch {
             Write-Warning "Rejecting cached libsodium artifact: $($_.Exception.Message)"
@@ -611,7 +849,7 @@ function Get-ProvisionedLibsodiumArtifact {
     }
 
     $archivePath = Get-VerifiedLibsodiumSourceArchive -NativeRoot $NativeRoot
-    return New-ProvisionedLibsodiumArtifact -NativeRoot $NativeRoot -ArchivePath $archivePath -MsBuildPath $MsBuildPath -LinkPath $LinkPath -ArtifactRoot $artifactRoot
+    return New-ProvisionedLibsodiumArtifact -NativeRoot $NativeRoot -ArchivePath $archivePath -MsBuildPath $MsBuildPath -LinkPath $LinkPath -VcToolsVersion $VcToolsVersion -ArtifactRoot $artifactRoot
 }
 
 function Get-CargoTargetDirectoryArgument {
@@ -619,18 +857,137 @@ function Get-CargoTargetDirectoryArgument {
         [Parameter(Mandatory = $true)] [string[]] $CargoArguments
     )
 
+    $found = $false
+    $targetDirectory = $null
     for ($index = 0; $index -lt $CargoArguments.Count; $index++) {
+        if ($CargoArguments[$index] -eq '--') {
+            break
+        }
         if ($CargoArguments[$index] -eq '--target-dir') {
-            if ($index + 1 -ge $CargoArguments.Count) {
+            if ($index + 1 -ge $CargoArguments.Count -or $CargoArguments[$index + 1] -eq '--') {
                 throw 'Cargo --target-dir is missing its path argument.'
             }
-            return $CargoArguments[$index + 1]
+            if ($found) {
+                throw 'Cargo --target-dir may be supplied only once.'
+            }
+            $targetDirectory = $CargoArguments[$index + 1]
+            $found = $true
+            $index++
+            continue
         }
         if ($CargoArguments[$index].StartsWith('--target-dir=', [System.StringComparison]::Ordinal)) {
-            return $CargoArguments[$index].Substring('--target-dir='.Length)
+            if ($found) {
+                throw 'Cargo --target-dir may be supplied only once.'
+            }
+            $targetDirectory = $CargoArguments[$index].Substring('--target-dir='.Length)
+            if ([string]::IsNullOrWhiteSpace($targetDirectory)) {
+                throw 'Cargo --target-dir is missing its path argument.'
+            }
+            $found = $true
         }
     }
-    return $null
+    return $targetDirectory
+}
+
+function Get-CargoTargetArgument {
+    param(
+        [Parameter(Mandatory = $true)] [string[]] $CargoArguments
+    )
+
+    $found = $false
+    $target = $null
+    for ($index = 0; $index -lt $CargoArguments.Count; $index++) {
+        $argument = $CargoArguments[$index]
+        if ($argument -eq '--') {
+            break
+        }
+        if ($argument -eq '--target') {
+            if ($index + 1 -ge $CargoArguments.Count -or $CargoArguments[$index + 1] -eq '--') {
+                throw 'Cargo --target requires a target triple.'
+            }
+            if ($found) {
+                throw 'Cargo --target may be supplied only once.'
+            }
+            $target = $CargoArguments[$index + 1]
+            $found = $true
+            $index++
+            continue
+        }
+        if ($argument.StartsWith('--target=', [System.StringComparison]::Ordinal)) {
+            if ($found) {
+                throw 'Cargo --target may be supplied only once.'
+            }
+            $target = $argument.Substring('--target='.Length)
+            if ([string]::IsNullOrWhiteSpace($target)) {
+                throw 'Cargo --target requires a target triple.'
+            }
+            $found = $true
+        }
+    }
+    return $target
+}
+
+function Get-CargoProfileDirectory {
+    param(
+        [Parameter(Mandatory = $true)] [string[]] $CargoArguments
+    )
+
+    $profile = 'debug'
+    for ($index = 0; $index -lt $CargoArguments.Count; $index++) {
+        $argument = $CargoArguments[$index]
+        if ($argument -eq '--') {
+            break
+        }
+        if ($argument -eq '--release' -or $argument -eq '-r') {
+            $profile = 'release'
+            continue
+        }
+        if ($argument -eq '--profile') {
+            if ($index + 1 -ge $CargoArguments.Count -or $CargoArguments[$index + 1] -eq '--') {
+                throw 'Cargo --profile requires a profile name.'
+            }
+            $profile = $CargoArguments[$index + 1]
+            $index++
+            continue
+        }
+        if ($argument.StartsWith('--profile=', [System.StringComparison]::Ordinal)) {
+            $profile = $argument.Substring('--profile='.Length)
+            if ([string]::IsNullOrWhiteSpace($profile)) {
+                throw 'Cargo --profile requires a profile name.'
+            }
+        }
+    }
+    if ($profile -eq 'dev' -or $profile -eq 'test') {
+        return 'debug'
+    }
+    return $profile
+}
+
+function Get-EffectiveCargoTarget {
+    param(
+        [Parameter(Mandatory = $true)] [string[]] $CargoArguments
+    )
+
+    $contract = Get-WindowsNativeBuildContract
+    $requestedTarget = Get-CargoTargetArgument -CargoArguments $CargoArguments
+    if ($requestedTarget -and $requestedTarget -cne $contract.CargoTarget) {
+        throw "Unsupported Cargo target '$requestedTarget'; only $($contract.CargoTarget) is allowed."
+    }
+    return $contract.CargoTarget
+}
+
+function Get-CargoBuildRoot {
+    param(
+        [Parameter(Mandatory = $true)] [string] $TargetRoot,
+        [Parameter(Mandatory = $true)] [string[]] $CargoArguments
+    )
+
+    $root = $TargetRoot
+    $effectiveTarget = Get-EffectiveCargoTarget -CargoArguments $CargoArguments
+    if ($effectiveTarget) {
+        $root = Join-Path $root $effectiveTarget
+    }
+    return Join-Path $root (Get-CargoProfileDirectory -CargoArguments $CargoArguments)
 }
 
 function Get-CargoTargetRoot {
@@ -641,10 +998,7 @@ function Get-CargoTargetRoot {
 
     $configuredTarget = Get-CargoTargetDirectoryArgument -CargoArguments $CargoArguments
     if (-not $configuredTarget) {
-        $configuredTarget = $env:CARGO_TARGET_DIR
-    }
-    if (-not $configuredTarget) {
-        return Join-Path $ManifestRoot 'target'
+        return Join-Path $ManifestRoot '.native\cargo-target'
     }
     if ([System.IO.Path]::IsPathRooted($configuredTarget)) {
         return [System.IO.Path]::GetFullPath($configuredTarget)
@@ -652,28 +1006,133 @@ function Get-CargoTargetRoot {
     return [System.IO.Path]::GetFullPath((Join-Path (Get-Location) $configuredTarget))
 }
 
+function Add-CargoArgumentsBeforeApplicationBoundary {
+    param(
+        [Parameter(Mandatory = $true)] [string[]] $CargoArguments,
+        [Parameter(Mandatory = $true)] [string[]] $ArgumentsToAdd
+    )
+
+    $boundary = [array]::IndexOf($CargoArguments, '--')
+    if ($boundary -lt 0) {
+        $result = @($CargoArguments) + @($ArgumentsToAdd)
+        return $result
+    }
+
+    $beforeBoundary = if ($boundary -eq 0) { @() } else { @($CargoArguments[0..($boundary - 1)]) }
+    $fromBoundary = @($CargoArguments[$boundary..($CargoArguments.Count - 1)])
+    $result = @($beforeBoundary) + @($ArgumentsToAdd) + @($fromBoundary)
+    return $result
+}
+
+function Assert-SafeCargoArguments {
+    param(
+        [Parameter(Mandatory = $true)] [string[]] $CargoArguments
+    )
+
+    $boundary = [array]::IndexOf($CargoArguments, '--')
+    $commandArguments = @(if ($boundary -lt 0) {
+            @($CargoArguments)
+        }
+        elseif ($boundary -eq 0) {
+            @()
+        }
+        else {
+            @($CargoArguments[0..($boundary - 1)])
+        })
+
+    if ($commandArguments -ccontains 'rustc') {
+        throw 'cargo rustc is not supported by the Windows native wrapper.'
+    }
+
+    for ($index = 0; $index -lt $commandArguments.Count; $index++) {
+        $argument = $commandArguments[$index]
+        if ($argument -ceq '--config' -or $argument.StartsWith('--config=', [System.StringComparison]::Ordinal)) {
+            throw 'Cargo --config may not override the Windows native build contract.'
+        }
+
+        $codegen = $null
+        if ($argument -ceq '-C' -or $argument -ceq '--codegen') {
+            if ($index + 1 -lt $commandArguments.Count) {
+                $index++
+                $codegen = $commandArguments[$index]
+            }
+        }
+        elseif ($argument.StartsWith('-C', [System.StringComparison]::Ordinal) -and $argument.Length -gt 2) {
+            $codegen = $argument.Substring(2)
+        }
+        elseif ($argument.StartsWith('--codegen=', [System.StringComparison]::Ordinal)) {
+            $codegen = $argument.Substring('--codegen='.Length)
+        }
+
+        if ($codegen -match '(?i)^linker=') {
+            throw 'Cargo arguments may not override the selected linker.'
+        }
+        if ($codegen -match '(?i)^target-feature=(?:[^,]+,)*\+crt-static(?:,|$)') {
+            throw 'Cargo arguments may not enable crt-static.'
+        }
+    }
+}
+
+function New-ControlledCargoInvocation {
+    param(
+        [Parameter(Mandatory = $true)] [string] $ManifestRoot,
+        [Parameter(Mandatory = $true)] [string] $LinkPath,
+        [Parameter(Mandatory = $true)] [string[]] $CargoArguments
+    )
+
+    Assert-SafeCargoArguments -CargoArguments $CargoArguments
+    $contract = Get-WindowsNativeBuildContract
+    $target = Get-EffectiveCargoTarget -CargoArguments $CargoArguments
+    $targetRoot = Get-CargoTargetRoot -ManifestRoot $ManifestRoot -CargoArguments $CargoArguments
+    $controlledArguments = [string[]] @($CargoArguments)
+    if (-not (Get-CargoTargetArgument -CargoArguments $controlledArguments)) {
+        $controlledArguments = [string[]] @(Add-CargoArgumentsBeforeApplicationBoundary `
+                -CargoArguments $controlledArguments `
+                -ArgumentsToAdd @('--target', $target))
+    }
+    if (-not (Get-CargoTargetDirectoryArgument -CargoArguments $controlledArguments)) {
+        $controlledArguments = [string[]] @(Add-CargoArgumentsBeforeApplicationBoundary `
+                -CargoArguments $controlledArguments `
+                -ArgumentsToAdd @('--target-dir', $targetRoot))
+    }
+
+    foreach ($variable in @(
+        'RUSTFLAGS',
+        'CARGO_BUILD_RUSTFLAGS',
+        'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS'
+    )) {
+        Remove-Item -LiteralPath "Env:$variable" -ErrorAction SilentlyContinue
+    }
+    $env:CARGO_BUILD_TARGET = $target
+    $env:CARGO_TARGET_DIR = $targetRoot
+    $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $LinkPath
+    $env:CARGO_ENCODED_RUSTFLAGS = '-Ctarget-feature=-crt-static'
+    $env:CFLAGS = '/Z7'
+    $env:CXXFLAGS = '/Z7'
+
+    return [pscustomobject]@{
+        CargoArguments = $controlledArguments
+        Target = $target
+        TargetRoot = $targetRoot
+        ProfileDirectory = Get-CargoProfileDirectory -CargoArguments $controlledArguments
+        BuildRoot = Get-CargoBuildRoot -TargetRoot $targetRoot -CargoArguments $controlledArguments
+    }
+}
+
 function Assert-CargoUsedProvisionedLibsodium {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)] [string] $TargetRoot,
-        [Parameter(Mandatory = $true)] [string] $LibraryDirectory,
-        [Parameter(Mandatory = $true)] [datetime] $NotBeforeUtc
+        [Parameter(Mandatory = $true)] [string] $BuildRoot,
+        [Parameter(Mandatory = $true)] [string] $LibraryDirectory
     )
 
-    if (-not (Test-Path -LiteralPath $TargetRoot -PathType Container)) {
-        throw 'Cargo did not create the expected target directory.'
+    if (-not (Test-Path -LiteralPath $BuildRoot -PathType Container)) {
+        throw 'Cargo did not create the expected target/profile directory.'
     }
 
-    $patterns = @(
-        (Join-Path $TargetRoot '*\build\libsodium-sys-stable-*\output'),
-        (Join-Path $TargetRoot '*\*\build\libsodium-sys-stable-*\output')
-    )
-    $outputFiles = @($patterns |
-        ForEach-Object { Get-ChildItem -Path $_ -File -ErrorAction SilentlyContinue } |
-        Sort-Object FullName -Unique |
-        Where-Object { $_.LastWriteTimeUtc -ge $NotBeforeUtc.AddSeconds(-5) })
+    $outputFiles = @(Get-ChildItem -Path (Join-Path $BuildRoot 'build\libsodium-sys-stable-*\output') -File -ErrorAction SilentlyContinue)
     if ($outputFiles.Count -eq 0) {
-        throw 'Cargo did not produce a fresh libsodium-sys-stable build-script output.'
+        throw 'Cargo did not produce a libsodium-sys-stable build-script output in the requested target/profile.'
     }
 
     $expectedDirectory = [System.IO.Path]::GetFullPath($LibraryDirectory).TrimEnd('\', '/')
@@ -693,6 +1152,17 @@ function Assert-CargoUsedProvisionedLibsodium {
     }
     if ($linkSearchCount -eq 0) {
         throw 'Cargo produced no inspectable libsodium native link-search directive.'
+    }
+}
+
+function Assert-CargoLibsodiumOutputAbsent {
+    param(
+        [Parameter(Mandatory = $true)] [string] $BuildRoot
+    )
+
+    $outputs = @(Get-ChildItem -Path (Join-Path $BuildRoot 'build\libsodium-sys-stable-*\output') -File -ErrorAction SilentlyContinue)
+    if ($outputs.Count -ne 0) {
+        throw 'cargo clean left a libsodium-sys-stable build-script output in the requested target/profile.'
     }
 }
 
@@ -724,7 +1194,7 @@ function Get-CargoCleanProfileArguments {
         if ($argument -eq '--') {
             break
         }
-        if ($argument -eq '--release') {
+        if ($argument -eq '--release' -or $argument -eq '-r') {
             $profileArguments += '--release'
             continue
         }
@@ -747,6 +1217,29 @@ function Get-CargoCleanProfileArguments {
     return $profileArguments
 }
 
+function Get-LibsodiumCargoCleanArguments {
+    param(
+        [Parameter(Mandatory = $true)] [string] $ManifestRoot,
+        [Parameter(Mandatory = $true)] [string[]] $CargoArguments
+    )
+
+    $targetRoot = Get-CargoTargetRoot -ManifestRoot $ManifestRoot -CargoArguments $CargoArguments
+    $target = Get-EffectiveCargoTarget -CargoArguments $CargoArguments
+    $cleanArguments = @(
+        'clean',
+        '--manifest-path',
+        (Join-Path $ManifestRoot 'Cargo.toml'),
+        '-p',
+        'libsodium-sys-stable',
+        '--target-dir',
+        $targetRoot,
+        '--target',
+        $target
+    )
+    $cleanArguments += @(Get-CargoCleanProfileArguments -CargoArguments $CargoArguments)
+    return $cleanArguments
+}
+
 function Invoke-LibsodiumCargoClean {
     param(
         [Parameter(Mandatory = $true)] [string] $CargoPath,
@@ -754,23 +1247,44 @@ function Invoke-LibsodiumCargoClean {
         [Parameter(Mandatory = $true)] [string[]] $CargoArguments
     )
 
-    $cleanArguments = @(
-        'clean',
-        '--manifest-path',
-        (Join-Path $ManifestRoot 'Cargo.toml'),
-        '-p',
-        'libsodium-sys-stable'
-    )
-    $targetDirectory = Get-CargoTargetDirectoryArgument -CargoArguments $CargoArguments
-    if ($targetDirectory) {
-        $cleanArguments += @('--target-dir', $targetDirectory)
-    }
-    $cleanArguments += @(Get-CargoCleanProfileArguments -CargoArguments $CargoArguments)
+    $cleanArguments = [string[]] @(Get-LibsodiumCargoCleanArguments `
+            -ManifestRoot $ManifestRoot `
+            -CargoArguments $CargoArguments)
 
     $cleanExitCode = Invoke-NativeCommandWithOutput -ExecutablePath $CargoPath -Arguments $cleanArguments
     if ($cleanExitCode -ne 0) {
         throw "Unable to clear cached libsodium-sys-stable artifacts (cargo clean exit $cleanExitCode)."
     }
+}
+
+function Invoke-ControlledCargoBuild {
+    param(
+        [Parameter(Mandatory = $true)] [string] $CargoPath,
+        [Parameter(Mandatory = $true)] [string] $ManifestRoot,
+        [Parameter(Mandatory = $true)] [string] $LinkPath,
+        [Parameter(Mandatory = $true)] [string[]] $CargoArguments,
+        [Parameter(Mandatory = $true)] [string] $LibraryDirectory
+    )
+
+    $invocation = New-ControlledCargoInvocation `
+        -ManifestRoot $ManifestRoot `
+        -LinkPath $LinkPath `
+        -CargoArguments $CargoArguments
+    Invoke-LibsodiumCargoClean `
+        -CargoPath $CargoPath `
+        -ManifestRoot $ManifestRoot `
+        -CargoArguments $invocation.CargoArguments
+    Assert-CargoLibsodiumOutputAbsent -BuildRoot $invocation.BuildRoot
+
+    $cargoExitCode = Invoke-NativeCommandWithOutput `
+        -ExecutablePath $CargoPath `
+        -Arguments $invocation.CargoArguments
+    if ($cargoExitCode -eq 0) {
+        Assert-CargoUsedProvisionedLibsodium `
+            -BuildRoot $invocation.BuildRoot `
+            -LibraryDirectory $LibraryDirectory
+    }
+    return $cargoExitCode
 }
 
 function Assert-PortableOpenSslBuildTools {
@@ -835,8 +1349,18 @@ function Invoke-WindowsNativeBuild {
         $toolchain = Get-VisualStudio2022Toolchain -InstallationPath $installation
         Initialize-VisualStudioBuildEnvironment -DeveloperCommand $toolchain.DeveloperCommand
         Assert-SelectedVisualStudioEnvironment -Toolchain $toolchain
+        $vcToolsVersion = Split-Path -Leaf $toolchain.VcToolsInstallDirectory.TrimEnd('\')
+        $msBuildVersion = Get-ExecutableVersion -ExecutablePath $toolchain.MsBuildPath -Arguments @('-version', '-nologo') -DisplayName 'MSBuild'
+        $linkVersion = Get-ExecutableVersion -ExecutablePath $toolchain.LinkPath -Arguments @('/?') -DisplayName 'MSVC linker'
+        $contract = Get-WindowsNativeBuildContract
+        Assert-ApprovedToolchainVersions `
+            -VisualStudioInstallationVersion $contract.VisualStudioInstallationVersion `
+            -MsBuildVersion $msBuildVersion `
+            -VcToolsVersion $vcToolsVersion `
+            -LinkVersion $linkVersion
+        Clear-InheritedMsBuildEnvironment
 
-        $artifact = Get-ProvisionedLibsodiumArtifact -NativeRoot $nativeRoot -MsBuildPath $toolchain.MsBuildPath -LinkPath $toolchain.LinkPath
+        $artifact = Get-ProvisionedLibsodiumArtifact -NativeRoot $nativeRoot -MsBuildPath $toolchain.MsBuildPath -LinkPath $toolchain.LinkPath -VcToolsVersion $vcToolsVersion
         Write-Host "Verified libsodium $((Get-WindowsNativeBuildContract).LibsodiumVersion) StaticRelease x64 /MD artifact."
 
         if ($ProvisionOnly) {
@@ -852,6 +1376,8 @@ function Invoke-WindowsNativeBuild {
         $env:SODIUM_LIB_DIR = $artifact.LibraryDirectory
         $env:DESKTOP_LIBSODIUM_RECEIPT = $artifact.ReceiptPath
         $env:DESKTOP_MSVC_LINK = $toolchain.LinkPath
+        $env:DESKTOP_MSBUILD_VERSION = $msBuildVersion
+        $env:DESKTOP_VC_TOOLS_VERSION = $vcToolsVersion
         Remove-Item Env:SODIUM_SHARED, Env:SODIUM_USE_PKG_CONFIG, Env:VCPKG_ROOT, Env:VCPKGRS_DYNAMIC, Env:VCPKGRS_TRIPLET -ErrorAction SilentlyContinue
 
         if ($CargoArguments.Count -eq 0) {
@@ -866,14 +1392,12 @@ function Invoke-WindowsNativeBuild {
             )
         }
 
-        $targetRoot = Get-CargoTargetRoot -ManifestRoot $manifestRootFull -CargoArguments $CargoArguments
-        Invoke-LibsodiumCargoClean -CargoPath $cargo.Source -ManifestRoot $manifestRootFull -CargoArguments $CargoArguments
-        $cargoStartedUtc = (Get-Date).ToUniversalTime()
-        $cargoExitCode = Invoke-NativeCommandWithOutput -ExecutablePath $cargo.Source -Arguments $CargoArguments
-        if ($cargoExitCode -eq 0) {
-            Assert-CargoUsedProvisionedLibsodium -TargetRoot $targetRoot -LibraryDirectory $artifact.LibraryDirectory -NotBeforeUtc $cargoStartedUtc
-        }
-        return $cargoExitCode
+        return Invoke-ControlledCargoBuild `
+            -CargoPath $cargo.Source `
+            -ManifestRoot $manifestRootFull `
+            -LinkPath $toolchain.LinkPath `
+            -CargoArguments $CargoArguments `
+            -LibraryDirectory $artifact.LibraryDirectory
     }
     finally {
         $lock.Dispose()
@@ -884,6 +1408,7 @@ Export-ModuleMember -Function @(
     'Assert-CargoUsedProvisionedLibsodium',
     'Assert-LibsodiumArchiveInspection',
     'Assert-LibsodiumBuildReceipt',
+    'Convert-LibsodiumReleaseDebugInformationToEmbedded',
     'Convert-LibsodiumReleasePropertyToDynamicCrt',
     'Get-VisualStudio2022Toolchain',
     'Get-WindowsNativeBuildContract',

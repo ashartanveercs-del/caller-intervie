@@ -1,36 +1,60 @@
 # Windows native build
 
-Run `windows-native-build.ps1` from the repository root. The wrapper uses `vswhere` with version
-range `[17.0,18.0)` to select one Visual Studio 2022 installation that has both MSBuild and x64
-MSVC. VsDevCmd, MSBuild, the latest x64 linker, and the v143 platform-toolset marker are all
-derived from that same installation. The wrapper then downloads the official
-`libsodium-1.0.20.tar.gz` source asset into ignored `desktop/src-tauri/.native`. It requires SHA-256
-`ebb65ef6ca439333c2bb41a0c1990587288da07f6c7fd07cb3a18cc18d30ce19` before extraction.
+Run `windows-native-build.ps1` from the repository root. The wrapper accepts only this native-build
+recipe:
 
-Provisioning extracts into a short, lock-protected staging path, verifies that
-`builds/msvc/properties/ReleaseLIB.props` contains exactly one `MultiThreaded` runtime node, changes
-that node to `MultiThreadedDLL`, and builds the VS2022 solution as `StaticRelease|x64` with toolset
-`v143`. It then inspects `libsodium.lib` with MSVC `link /dump /directives` and `/headers`. The
-archive is rejected unless every object is x64, `MSVCRT` is present, and neither `LIBCMT` nor
-`LIBCMTD` is present.
+- Visual Studio installation version `17.14.37516.0`
+- MSBuild version `17.14.51.32402`
+- VC tools directory version `14.44.35207`
+- linker version `14.44.35228.0`
 
-Only a validated static library and `receipt.json` are published atomically to
-`.native/libsodium-1.0.20-msvc-static-md-x64`. The receipt records the immutable source contract,
-exact property replacement count, build configuration, tool versions, CRT directive, and library
-SHA-256. Every wrapper invocation rechecks the receipt, artifact hash, architecture, and CRT
-directives before invoking Cargo. No libsodium DLL is built or packaged.
+`vswhere` searches only the Visual Studio 17.14 line. The discovered installation metadata and all
+three executable/tool-directory versions must match exactly; a Visual Studio update requires a
+deliberate recipe revision. VsDevCmd, MSBuild, the x64 linker, and the v143 platform-toolset marker
+must come from that one installation.
 
-Before the requested Cargo command, the wrapper runs package-scoped
-`cargo clean -p libsodium-sys-stable`. This removes any bundled archive that a failed unsupported
-direct Cargo attempt may have cached. After a successful command, the wrapper inspects the fresh
-dependency build-script output and rejects it unless every libsodium native link-search directive
-names the provisioned project-local directory.
+The wrapper downloads the official `libsodium-1.0.20.tar.gz` source asset into ignored
+`desktop/src-tauri/.native` and requires SHA-256
+`ebb65ef6ca439333c2bb41a0c1990587288da07f6c7fd07cb3a18cc18d30ce19` before extraction. Native
+provisioning runs under the project-local lock. Before MSBuild starts, inherited `CL`, `_CL_`,
+`LINK`, `_LINK_`, `ForceImportBeforeCppTargets`, and `ForceImportAfterCppTargets` values are
+removed. MSBuild also receives `-noAutoResponse`, `ImportDirectoryBuildProps=false`, and
+`ImportDirectoryBuildTargets=false`.
 
-No machine-specific path is tracked. Example:
+Provisioning extracts into a short staging path, changes the one verified `MultiThreaded` property
+to `MultiThreadedDLL`, changes the one verified release debug-information property from
+`ProgramDatabase` to `OldStyle`, and builds `StaticRelease|x64` with toolset `v143`. The result is
+inspected with `link /dump /directives` and `/headers`. Every object must be x64. The archive must
+request `/DEFAULTLIB:MSVCRT` and must not request `LIBCMT`, `LIBCMTD`, or `MSVCRTD`. A
+`/FAILIFMISMATCH:RuntimeLibrary` directive is optional; when present, its value must be
+`MD_DynamicRelease`.
+
+The staged static library and `receipt.json` replace the cache at
+`.native/libsodium-1.0.20-msvc-static-md-x64` using a lock-protected, rollback-safe sequence. The
+previous cache remains as a backup until the replacement has moved into place and passed receipt,
+hash, architecture, CRT, and tool-version validation. A move or validation failure restores that
+backup. No libsodium DLL is built or packaged.
+
+Every requested Cargo command targets `x86_64-pc-windows-msvc` explicitly. When the caller omits
+`--target-dir`, the wrapper selects `.native/cargo-target`; output is therefore under
+`.native/cargo-target/x86_64-pc-windows-msvc/<profile>`. An explicit caller `--target-dir` is
+preserved and resolved exactly. The selective `cargo clean -p libsodium-sys-stable`, requested
+command, and post-build attestation all use the same target, target directory, and profile. Both
+`--release` and `-r` select the `release` profile.
+
+The wrapper rejects `cargo rustc`, Cargo `--config`, non-x86_64 Windows targets, linker codegen
+overrides, and `+crt-static`. It replaces ambient Cargo target, target-directory, linker, and Rust
+flag settings. `CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER` names the approved linker,
+`CARGO_ENCODED_RUSTFLAGS=-Ctarget-feature=-crt-static`, and ambient `RUSTFLAGS` plus target
+rustflags are removed. Vendored OpenSSL 3.6.3 builds receive controlled `CFLAGS=/Z7` and
+`CXXFLAGS=/Z7`, overriding ambient values so debug information is embedded in objects instead of
+requiring `ossl_static.pdb`. No linker-warning suppression is part of the recipe.
+
+Example:
 
 ```powershell
 & .\desktop\src-tauri\scripts\windows-native-build.ps1 -CargoArguments @(
-  'test', '--manifest-path', '.\desktop\src-tauri\Cargo.toml', '--test', 'storage', '--', '--test-threads=1'
+  'test', '--manifest-path', '.\desktop\src-tauri\Cargo.toml', '--test', 'storage', '-r', '--', '--test-threads=1'
 )
 ```
 
@@ -38,17 +62,7 @@ Use `-ProvisionOnly` to build or validate the project-local artifact without inv
 Vendored OpenSSL Cargo commands additionally require portable Strawberry Perl and NASM on `PATH`;
 if `PERL` names the Strawberry `perl.exe`, the wrapper prepends its directory to `PATH`.
 
-Windows MSVC package builds fail closed unless `SODIUM_LIB_DIR` and
-`DESKTOP_LIBSODIUM_RECEIPT` select this exact provisioned artifact and receipt. They also require
-the wrapper-selected linker to match `VCToolsInstallDir` beneath the selected version-17
-`VSINSTALLDIR`. The build script independently hashes both the official source archive and
-`libsodium.lib`, then runs that linker with `/dump /directives` and `/dump /headers`; receipt CRT
-and machine claims are not trusted by themselves. The wrapper clears shared, pkg-config, and vcpkg
-selection variables so `libsodium-sys-stable` cannot select its bundled `/MT(d)` archive.
-
-The supported threat model assumes the tracked wrapper/build script and the local Visual Studio
-installation are trusted. Manually fabricating environment variables or mutating both a cached
-library and its receipt is not a supported build path; even then, the package build still enforces
-the source checksum plus the actual archive's x64 and dynamic-CRT directives. The package build
-script suppresses only missing-native-PDB warning `LNK4099`, and only on this package's binary,
-cdylib, and test final links. It never suppresses `LNK4098` or blanket Rust linker diagnostics.
+Windows package builds fail closed unless `SODIUM_LIB_DIR`, `DESKTOP_LIBSODIUM_RECEIPT`, and the
+selected linker identify the exact project-local artifact and approved toolchain. The Rust build
+script independently validates the closed receipt schema, source and library hashes, selected
+paths, x64 machine headers, CRT directives, and inspecting linker version.
