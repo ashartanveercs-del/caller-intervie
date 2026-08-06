@@ -694,10 +694,12 @@ function Publish-RollbackSafeArtifact {
         [Parameter(Mandatory = $true)] [string] $StagedArtifactRoot,
         [Parameter(Mandatory = $true)] [string] $ArtifactRoot,
         [Parameter(Mandatory = $true)] [scriptblock] $ValidateArtifact,
+        [object[]] $ValidationArguments = @(),
         [scriptblock] $MoveDirectory = {
             param($source, $destination)
             [System.IO.Directory]::Move($source, $destination)
-        }
+        },
+        [scriptblock] $CleanupBackup
     )
 
     $backupRoot = Join-Path $NativeRoot ("backup-" + [guid]::NewGuid().ToString('N'))
@@ -711,12 +713,7 @@ function Publish-RollbackSafeArtifact {
 
         & $MoveDirectory $StagedArtifactRoot $ArtifactRoot
         $replacementMoved = $true
-        $validatedArtifact = & $ValidateArtifact $ArtifactRoot
-
-        if ($previousMoved -and (Test-Path -LiteralPath $backupRoot)) {
-            Remove-NativeTree -NativeRoot $NativeRoot -Path $backupRoot
-        }
-        return $validatedArtifact
+        $validatedArtifact = & $ValidateArtifact $ArtifactRoot @ValidationArguments
     }
     catch {
         $publicationError = $_.Exception
@@ -736,6 +733,48 @@ function Publish-RollbackSafeArtifact {
         }
         throw $publicationError
     }
+
+    if ($previousMoved) {
+        try {
+            if (Test-Path -LiteralPath $backupRoot) {
+                if ($null -eq $CleanupBackup) {
+                    Remove-NativeTree -NativeRoot $NativeRoot -Path $backupRoot
+                }
+                else {
+                    & $CleanupBackup $NativeRoot $backupRoot | Out-Null
+                }
+            }
+        }
+        catch {
+            Write-Warning "Validated cache publication succeeded, but backup cleanup failed: $($_.Exception.Message)"
+        }
+    }
+    return $validatedArtifact
+}
+
+function Publish-ProvisionedLibsodiumArtifact {
+    param(
+        [Parameter(Mandatory = $true)] [string] $NativeRoot,
+        [Parameter(Mandatory = $true)] [string] $StagedArtifactRoot,
+        [Parameter(Mandatory = $true)] [string] $ArtifactRoot,
+        [Parameter(Mandatory = $true)] [string] $LinkPath,
+        [Parameter(Mandatory = $true)] [string] $MsBuildPath,
+        [Parameter(Mandatory = $true)] [string] $VcToolsVersion
+    )
+
+    return Publish-RollbackSafeArtifact `
+        -NativeRoot $NativeRoot `
+        -StagedArtifactRoot $StagedArtifactRoot `
+        -ArtifactRoot $ArtifactRoot `
+        -ValidateArtifact {
+            param($publishedRoot, $link, $msbuild, $vcTools)
+            Get-ValidatedProvisionedArtifact `
+                -ArtifactRoot $publishedRoot `
+                -LinkPath $link `
+                -MsBuildPath $msbuild `
+                -VcToolsVersion $vcTools
+        } `
+        -ValidationArguments @($LinkPath, $MsBuildPath, $VcToolsVersion)
 }
 
 function New-ProvisionedLibsodiumArtifact {
@@ -828,19 +867,13 @@ function New-ProvisionedLibsodiumArtifact {
         Assert-LibsodiumBuildReceipt -ReceiptPath $receiptPath -LibraryPath $stageLibrary | Out-Null
         Invoke-LibsodiumArchiveInspection -LinkPath $LinkPath -LibraryPath $stageLibrary | Out-Null
 
-        $validatePublishedArtifact = {
-            param($publishedRoot)
-            Get-ValidatedProvisionedArtifact `
-                -ArtifactRoot $publishedRoot `
-                -LinkPath $LinkPath `
-                -MsBuildPath $MsBuildPath `
-                -VcToolsVersion $VcToolsVersion
-        }.GetNewClosure()
-        return Publish-RollbackSafeArtifact `
+        return Publish-ProvisionedLibsodiumArtifact `
             -NativeRoot $NativeRoot `
             -StagedArtifactRoot $artifactStage `
             -ArtifactRoot $ArtifactRoot `
-            -ValidateArtifact $validatePublishedArtifact
+            -LinkPath $LinkPath `
+            -MsBuildPath $MsBuildPath `
+            -VcToolsVersion $VcToolsVersion
     }
     finally {
         Remove-NativeTree -NativeRoot $NativeRoot -Path $workRoot

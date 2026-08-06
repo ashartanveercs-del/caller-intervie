@@ -985,6 +985,121 @@ exit /b 0
         Assert-Equal 0 $exitCode 'Successful native stderr contaminated the numeric return value.'
     }
 
+    Invoke-Test 'provisioned cache publication validates in module scope and removes the backup' {
+        $nativeBuildModule = Get-Module | Where-Object { $_.Path -eq $modulePath } | Select-Object -First 1
+        $nativeRoot = Join-Path $testRoot 'validated-publication-cache'
+        $artifactRoot = Join-Path $nativeRoot 'artifact'
+        $stagedRoot = Join-Path $nativeRoot 'staged'
+        $stageLibraryDirectory = Join-Path $stagedRoot 'lib'
+        $stageLibrary = Join-Path $stageLibraryDirectory 'libsodium.lib'
+        $fakeLink = Join-Path $testRoot 'publication-link.cmd'
+        $fakeMsBuild = Join-Path $testRoot 'publication-msbuild.cmd'
+        $contract = Get-WindowsNativeBuildContract
+
+        New-Item -ItemType Directory -Path $artifactRoot, $stageLibraryDirectory -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $artifactRoot 'marker.txt'), 'previous')
+        [System.IO.File]::WriteAllBytes($stageLibrary, [byte[]] (31, 32, 33, 34))
+        $receipt = New-TestReceipt -LibraryPath $stageLibrary
+        [System.IO.File]::WriteAllText((Join-Path $stagedRoot 'receipt.json'), ($receipt | ConvertTo-Json))
+        [System.IO.File]::WriteAllText(
+            $fakeLink,
+            "@echo off`r`n" +
+            "if /I `%~2==/directives (`r`n" +
+            "  echo Microsoft ^(R^) COFF/PE Dumper Version $($contract.LinkVersion)`r`n" +
+            "  echo /DEFAULTLIB:^`"MSVCRT^`"`r`n" +
+            "  exit /b 0`r`n" +
+            ")`r`n" +
+            "if /I `%~2==/headers (`r`n" +
+            "  echo Microsoft ^(R^) COFF/PE Dumper Version $($contract.LinkVersion)`r`n" +
+            "  echo 8664 machine ^(x64^)`r`n" +
+            "  exit /b 0`r`n" +
+            ")`r`n" +
+            "exit /b 1`r`n"
+        )
+        [System.IO.File]::WriteAllText(
+            $fakeMsBuild,
+            "@echo off`r`necho $($contract.MsBuildVersion)`r`nexit /b 0`r`n"
+        )
+
+        $published = & $nativeBuildModule {
+            param($native, $staged, $artifact, $link, $msbuild, $vcToolsVersion)
+            Publish-ProvisionedLibsodiumArtifact `
+                -NativeRoot $native `
+                -StagedArtifactRoot $staged `
+                -ArtifactRoot $artifact `
+                -LinkPath $link `
+                -MsBuildPath $msbuild `
+                -VcToolsVersion $vcToolsVersion
+        } $nativeRoot $stagedRoot $artifactRoot $fakeLink $fakeMsBuild $contract.VcToolsVersion
+
+        Assert-Equal $artifactRoot $published.ArtifactRoot 'Publication did not return the validated artifact root.'
+        Assert-Equal (Join-Path $artifactRoot 'lib\libsodium.lib') $published.LibraryPath 'Publication returned the wrong validated library path.'
+        Assert-Equal $true (Test-Path -LiteralPath $published.ReceiptPath -PathType Leaf) 'Publication did not return a valid receipt path.'
+        Assert-Equal $false (Test-Path -LiteralPath (Join-Path $artifactRoot 'marker.txt')) 'The previous cache remained installed.'
+        Assert-Equal 0 @(Get-ChildItem -LiteralPath $nativeRoot -Directory | Where-Object { $_.Name -like 'backup-*' }).Count 'A successful publication left its backup behind.'
+    }
+
+    Invoke-Test 'backup cleanup failure leaves the validated replacement committed' {
+        $nativeBuildModule = Get-Module | Where-Object { $_.Path -eq $modulePath } | Select-Object -First 1
+        $nativeRoot = Join-Path $testRoot 'cleanup-failure-cache'
+        $artifactRoot = Join-Path $nativeRoot 'artifact'
+        $stagedRoot = Join-Path $nativeRoot 'staged'
+        New-Item -ItemType Directory -Path $artifactRoot, $stagedRoot -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $artifactRoot 'marker.txt'), 'previous')
+        [System.IO.File]::WriteAllText((Join-Path $artifactRoot 'second.txt'), 'backup-remnant')
+        [System.IO.File]::WriteAllText((Join-Path $stagedRoot 'marker.txt'), 'validated-replacement')
+
+        $operations = [System.Collections.Generic.List[string]]::new()
+        $moveDirectory = {
+            param($source, $destination)
+            $operations.Add("move:$source->$destination") | Out-Null
+            [System.IO.Directory]::Move($source, $destination)
+        }.GetNewClosure()
+        $cleanupBackup = {
+            param($native, $backup)
+            $operations.Add("cleanup:$backup") | Out-Null
+            Remove-Item -LiteralPath (Join-Path $backup 'marker.txt') -Force
+            throw 'injected partial backup cleanup failure'
+        }.GetNewClosure()
+
+        $publication = & $nativeBuildModule {
+            param($native, $staged, $artifact, $move, $cleanup)
+            $cleanupWarnings = @()
+            $successOutput = @(
+                Publish-RollbackSafeArtifact `
+                    -NativeRoot $native `
+                    -StagedArtifactRoot $staged `
+                    -ArtifactRoot $artifact `
+                    -MoveDirectory $move `
+                    -CleanupBackup $cleanup `
+                    -ValidateArtifact {
+                        param($path)
+                        [pscustomobject]@{
+                            ArtifactRoot = $path
+                            Marker = Get-Content -LiteralPath (Join-Path $path 'marker.txt') -Raw
+                        }
+                    } `
+                    -WarningVariable cleanupWarnings `
+                    -WarningAction SilentlyContinue
+            )
+            [pscustomobject]@{
+                SuccessOutput = $successOutput
+                WarningText = $cleanupWarnings -join [Environment]::NewLine
+            }
+        } $nativeRoot $stagedRoot $artifactRoot $moveDirectory $cleanupBackup
+
+        Assert-Equal 1 $publication.SuccessOutput.Count 'Backup cleanup contaminated the successful publication output.'
+        Assert-Equal $artifactRoot $publication.SuccessOutput[0].ArtifactRoot 'Publication did not return the validated replacement.'
+        Assert-Equal 'validated-replacement' $publication.SuccessOutput[0].Marker 'The validated replacement was rolled back after commit.'
+        Assert-Equal 'validated-replacement' ([System.IO.File]::ReadAllText((Join-Path $artifactRoot 'marker.txt'))) 'The validated replacement is not installed.'
+        Assert-Equal 2 @($operations | Where-Object { $_ -like 'move:*' }).Count 'Publication tried to restore the damaged backup.'
+        Assert-Equal 1 @(Get-ChildItem -LiteralPath $nativeRoot -Directory | Where-Object { $_.Name -like 'backup-*' }).Count 'Partial backup remnants were not retained for later cleanup.'
+        if ($publication.WarningText -notmatch 'backup cleanup failed' -or
+            $publication.WarningText -notmatch 'injected partial backup cleanup failure') {
+            throw "Publication did not emit the required cleanup warning: '$($publication.WarningText)'."
+        }
+    }
+
     Invoke-Test 'cache publication restores the previous artifact when the staged move fails' {
         $nativeBuildModule = Get-Module | Where-Object { $_.Path -eq $modulePath } | Select-Object -First 1
         $nativeRoot = Join-Path $testRoot 'move-failure-cache'
@@ -1062,7 +1177,10 @@ exit /b 0
             'CFLAGS=/Z7',
             'CXXFLAGS=/Z7',
             'lock-protected',
-            'rollback-safe'
+            'rollback-safe',
+            'backup cleanup is best-effort',
+            'cleanup failure emits a warning',
+            'backup remnants for later cleanup'
         )) {
             if ($readme -notmatch [regex]::Escape($requiredText)) {
                 throw "The native-build documentation is missing '$requiredText'."
