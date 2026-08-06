@@ -278,7 +278,7 @@ fn validate_table(
         let required = required_columns
             .iter()
             .any(|required| required.name == column.name);
-        if !required && column.hidden == 0 && column.not_null && column.default_value.is_none() {
+        if !required && !extra_column_is_insert_compatible(column) {
             return Err(MigrationError::SchemaIntegrity {
                 reason: format!(
                     "extra column {table}.{} cannot be populated by current writes",
@@ -313,6 +313,77 @@ fn validate_table(
         });
     }
     Ok(())
+}
+
+fn extra_column_is_insert_compatible(column: &TableColumn) -> bool {
+    if !column.not_null {
+        return true;
+    }
+    column.hidden == 0
+        && column
+            .default_value
+            .as_deref()
+            .is_some_and(is_provably_non_null_literal)
+}
+
+fn is_provably_non_null_literal(default_value: &str) -> bool {
+    let mut value = default_value.trim();
+    while value.starts_with('(') && value.ends_with(')') {
+        value = value[1..value.len() - 1].trim();
+    }
+    if value.is_empty() || value.eq_ignore_ascii_case("NULL") {
+        return false;
+    }
+    if matches!(
+        value.to_ascii_uppercase().as_str(),
+        "TRUE" | "FALSE" | "CURRENT_DATE" | "CURRENT_TIME" | "CURRENT_TIMESTAMP"
+    ) {
+        return true;
+    }
+    if is_quoted_literal(value) {
+        return true;
+    }
+    if value.len() >= 3
+        && matches!(value.as_bytes()[0], b'x' | b'X')
+        && is_quoted_literal(&value[1..])
+    {
+        let hex = &value[2..value.len() - 1];
+        return hex.len() % 2 == 0 && hex.bytes().all(|byte| byte.is_ascii_hexdigit());
+    }
+    let numeric = value
+        .strip_prefix('+')
+        .or_else(|| value.strip_prefix('-'))
+        .unwrap_or(value);
+    if let Some(hex) = numeric
+        .strip_prefix("0x")
+        .or_else(|| numeric.strip_prefix("0X"))
+    {
+        return !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit());
+    }
+    numeric.bytes().any(|byte| byte.is_ascii_digit())
+        && numeric
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'.' | b'e' | b'E' | b'+' | b'-'))
+        && value.parse::<f64>().is_ok()
+}
+
+fn is_quoted_literal(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'\'' || bytes[bytes.len() - 1] != b'\'' {
+        return false;
+    }
+    let mut index = 1;
+    while index < bytes.len() - 1 {
+        if bytes[index] == b'\'' {
+            if index + 1 >= bytes.len() - 1 || bytes[index + 1] != b'\'' {
+                return false;
+            }
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    true
 }
 
 fn has_workspace_session_cascade(
@@ -791,6 +862,86 @@ mod tests {
             .unwrap();
 
         assert!(migrate(&mut connection).is_err());
+    }
+
+    #[test]
+    fn extension_column_rejects_not_null_default_null() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE settings;
+                CREATE TABLE settings (
+                    workspace_id TEXT NOT NULL,
+                    setting_key TEXT NOT NULL,
+                    value_json TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL DEFAULT NULL,
+                    PRIMARY KEY (workspace_id, setting_key)
+                );",
+            )
+            .unwrap();
+
+        assert!(migrate(&mut connection).is_err());
+    }
+
+    #[test]
+    fn extension_column_rejects_not_null_generated_null() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE settings;
+                CREATE TABLE settings (
+                    workspace_id TEXT NOT NULL,
+                    setting_key TEXT NOT NULL,
+                    value_json TEXT NOT NULL,
+                    tenant_id TEXT GENERATED ALWAYS AS (NULL) VIRTUAL NOT NULL,
+                    PRIMARY KEY (workspace_id, setting_key)
+                );",
+            )
+            .unwrap();
+
+        assert!(migrate(&mut connection).is_err());
+    }
+
+    #[test]
+    fn extension_column_accepts_nullable_column() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE settings;
+                CREATE TABLE settings (
+                    workspace_id TEXT NOT NULL,
+                    setting_key TEXT NOT NULL,
+                    value_json TEXT NOT NULL,
+                    tenant_id TEXT,
+                    PRIMARY KEY (workspace_id, setting_key)
+                );",
+            )
+            .unwrap();
+
+        migrate(&mut connection).unwrap();
+    }
+
+    #[test]
+    fn extension_column_accepts_not_null_literal_default() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE settings;
+                CREATE TABLE settings (
+                    workspace_id TEXT NOT NULL,
+                    setting_key TEXT NOT NULL,
+                    value_json TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL DEFAULT 'local',
+                    PRIMARY KEY (workspace_id, setting_key)
+                );",
+            )
+            .unwrap();
+
+        migrate(&mut connection).unwrap();
     }
 
     #[test]
