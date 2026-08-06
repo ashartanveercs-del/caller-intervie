@@ -47,23 +47,22 @@ pub trait SecretStore: Send + Sync {
 
 #[derive(Default)]
 pub struct MemorySecretStore {
-    secret: Mutex<Option<Vec<u8>>>,
+    secret: Mutex<Option<DatabaseKey>>,
 }
 
 impl SecretStore for MemorySecretStore {
     fn load(&self) -> Result<Option<DatabaseKey>, KeyManagerError> {
-        Ok(self
+        let secret = self
             .secret
             .lock()
-            .map_err(|_| KeyManagerError::SecretStore)?
-            .clone()
-            .map(Zeroizing::new))
+            .map_err(|_| KeyManagerError::SecretStore)?;
+        Ok(secret.clone())
     }
     fn store(&self, value: &[u8]) -> Result<(), KeyManagerError> {
         *self
             .secret
             .lock()
-            .map_err(|_| KeyManagerError::SecretStore)? = Some(value.to_vec());
+            .map_err(|_| KeyManagerError::SecretStore)? = Some(Zeroizing::new(value.to_vec()));
         Ok(())
     }
     fn delete(&self) -> Result<(), KeyManagerError> {
@@ -144,7 +143,7 @@ impl<S: SecretStore + ?Sized> KeyManager<S> {
             }
             (true, Some(UnlockSecret::Pending(unlock_secret))) => {
                 let database_key = read_database_key(&self.snapshot_path, unlock_secret.clone())?;
-                self.secrets.store(&unlock_secret)?;
+                self.store_committed_unlock_secret(&unlock_secret)?;
                 Ok(database_key)
             }
             (false, Some(UnlockSecret::Pending(_))) => self.create_database_key(),
@@ -187,8 +186,27 @@ impl<S: SecretStore + ?Sized> KeyManager<S> {
                 Err(KeyManagerError::Stronghold)
             };
         }
-        self.secrets.store(&unlock_secret)?;
+        self.store_committed_unlock_secret(&unlock_secret)?;
         Ok(database_key)
+    }
+
+    fn store_committed_unlock_secret(&self, unlock_secret: &[u8]) -> Result<(), KeyManagerError> {
+        if let Err(store_error) = self.secrets.store(unlock_secret) {
+            let committed = self.secrets.load().ok().flatten().and_then(|stored| {
+                match decode_unlock_secret(stored) {
+                    Ok(UnlockSecret::Committed(visible)) => Some(visible),
+                    Ok(UnlockSecret::Pending(_)) | Err(_) => None,
+                }
+            });
+            if committed
+                .as_deref()
+                .is_some_and(|visible| visible == unlock_secret)
+            {
+                return Ok(());
+            }
+            return Err(store_error);
+        }
+        Ok(())
     }
 }
 
@@ -380,9 +398,17 @@ fn persist_migrated_snapshot(
         .tempfile_in(parent)
         .map_err(|_| KeyManagerError::Stronghold)?
         .into_temp_path();
+    #[cfg(test)]
+    if tests::take_legacy_migration_failure(tests::LegacyMigrationFailure::Commit) {
+        return Err(KeyManagerError::Stronghold);
+    }
     stronghold
         .commit_with_keyprovider(&SnapshotPath::from_path(&temporary_snapshot), provider)
         .map_err(|_| KeyManagerError::Stronghold)?;
+    #[cfg(test)]
+    if tests::take_legacy_migration_failure(tests::LegacyMigrationFailure::Publish) {
+        return Err(KeyManagerError::Stronghold);
+    }
     temporary_snapshot
         .persist(snapshot_path)
         .map_err(|_| KeyManagerError::Stronghold)
@@ -405,15 +431,41 @@ mod tests {
     };
     use iota_stronghold::{KeyProvider, SnapshotPath, Stronghold};
     use std::{
+        cell::Cell,
         panic::{catch_unwind, AssertUnwindSafe},
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
-            Arc, Barrier,
+            Arc, Barrier, Mutex,
         },
         thread,
         time::Duration,
     };
     use tempfile::tempdir;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum LegacyMigrationFailure {
+        Commit,
+        Publish,
+    }
+
+    thread_local! {
+        static LEGACY_MIGRATION_FAILURE: Cell<Option<LegacyMigrationFailure>> = const { Cell::new(None) };
+    }
+
+    fn fail_next_legacy_migration_at(failure: LegacyMigrationFailure) {
+        LEGACY_MIGRATION_FAILURE.with(|pending| pending.set(Some(failure)));
+    }
+
+    pub(super) fn take_legacy_migration_failure(failure: LegacyMigrationFailure) -> bool {
+        LEGACY_MIGRATION_FAILURE.with(|pending| {
+            if pending.get() == Some(failure) {
+                pending.set(None);
+                true
+            } else {
+                false
+            }
+        })
+    }
 
     struct FailOnceSecretStore {
         inner: MemorySecretStore,
@@ -532,6 +584,103 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum FinalWriteFailureMode {
+        BeforeWrite,
+        AfterWrite,
+    }
+
+    struct FailFinalWriteStore {
+        inner: MemorySecretStore,
+        mode: FinalWriteFailureMode,
+        store_calls: AtomicUsize,
+    }
+
+    impl FailFinalWriteStore {
+        fn new(mode: FinalWriteFailureMode) -> Self {
+            Self {
+                inner: MemorySecretStore::default(),
+                mode,
+                store_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl SecretStore for FailFinalWriteStore {
+        fn load(&self) -> Result<Option<super::DatabaseKey>, KeyManagerError> {
+            self.inner.load()
+        }
+
+        fn store(&self, value: &[u8]) -> Result<(), KeyManagerError> {
+            if self.store_calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                if matches!(self.mode, FinalWriteFailureMode::AfterWrite) {
+                    self.inner.store(value)?;
+                }
+                return Err(KeyManagerError::SecretStore);
+            }
+            self.inner.store(value)
+        }
+
+        fn delete(&self) -> Result<(), KeyManagerError> {
+            self.inner.delete()
+        }
+    }
+
+    fn create_legacy_snapshot(
+        snapshot: &std::path::Path,
+    ) -> (super::DatabaseKey, super::DatabaseKey) {
+        let unlock_secret = super::DatabaseKey::new(vec![0x31; 32]);
+        let database_key = super::DatabaseKey::new(vec![0x52; 32]);
+        let stronghold = Stronghold::default();
+        let client = stronghold.create_client(CLIENT_PATH).unwrap();
+        client
+            .store()
+            .insert(RECORD_PATH.to_vec(), database_key.to_vec(), None)
+            .unwrap();
+        let provider = KeyProvider::try_from(unlock_secret.clone()).unwrap();
+        stronghold
+            .commit_with_keyprovider(&SnapshotPath::from_path(snapshot), &provider)
+            .unwrap();
+        (unlock_secret, database_key)
+    }
+
+    fn read_legacy_store_key(
+        snapshot: &std::path::Path,
+        unlock_secret: &super::DatabaseKey,
+    ) -> super::DatabaseKey {
+        let stronghold = Stronghold::default();
+        let provider = KeyProvider::try_from(unlock_secret.clone()).unwrap();
+        stronghold
+            .load_snapshot(&provider, &SnapshotPath::from_path(snapshot))
+            .unwrap();
+        let client = stronghold.load_client(CLIENT_PATH).unwrap();
+        super::DatabaseKey::new(client.store().get(RECORD_PATH).unwrap().unwrap())
+    }
+
+    fn assert_legacy_migration_failure_is_recoverable(failure: LegacyMigrationFailure) {
+        let temp = tempdir().unwrap();
+        let snapshot = temp.path().join("legacy-failure.stronghold");
+        let (unlock_secret, database_key) = create_legacy_snapshot(&snapshot);
+        let secrets = Arc::new(MemorySecretStore::default());
+        secrets.store(&unlock_secret).unwrap();
+        let manager = KeyManager::new(&snapshot, secrets.clone());
+
+        fail_next_legacy_migration_at(failure);
+        assert!(matches!(
+            manager.database_key(),
+            Err(KeyManagerError::Stronghold)
+        ));
+        assert_eq!(
+            read_legacy_store_key(&snapshot, &unlock_secret).as_slice(),
+            database_key.as_slice()
+        );
+
+        let migrated = manager.database_key().unwrap();
+        assert_eq!(migrated.as_slice(), database_key.as_slice());
+        let reopened = KeyManager::new(&snapshot, secrets).database_key().unwrap();
+        assert_eq!(reopened.as_slice(), database_key.as_slice());
+    }
+
     #[test]
     fn database_key_is_created_in_stronghold_and_reloads() {
         let temp = tempdir().unwrap();
@@ -550,6 +699,14 @@ mod tests {
             reopened.database_key().unwrap().as_slice(),
             first.as_slice()
         );
+    }
+
+    #[test]
+    fn memory_secret_store_uses_zeroizing_backing() {
+        fn require_zeroizing_backing(_: &Mutex<Option<super::DatabaseKey>>) {}
+
+        let store = MemorySecretStore::default();
+        require_zeroizing_backing(&store.secret);
     }
 
     #[test]
@@ -586,6 +743,16 @@ mod tests {
 
         let reopened = KeyManager::new(&snapshot, secrets).database_key().unwrap();
         assert_eq!(reopened.as_slice(), database_key.as_slice());
+    }
+
+    #[test]
+    fn failure_path_legacy_commit_failure_preserves_snapshot_and_retries() {
+        assert_legacy_migration_failure_is_recoverable(LegacyMigrationFailure::Commit);
+    }
+
+    #[test]
+    fn failure_path_legacy_publication_failure_preserves_snapshot_and_retries() {
+        assert_legacy_migration_failure_is_recoverable(LegacyMigrationFailure::Publish);
     }
     #[test]
     fn existing_vault_without_unlock_secret_requires_recovery() {
@@ -707,6 +874,46 @@ mod tests {
             .unwrap();
         let reopened = KeyManager::new(&snapshot, secrets).database_key().unwrap();
         assert_eq!(recovered.as_slice(), reopened.as_slice());
+    }
+
+    #[test]
+    fn failure_path_final_credential_error_preserves_pending_key_for_retry() {
+        let temp = tempdir().unwrap();
+        let snapshot = temp.path().join("final-write-error.stronghold");
+        let secrets = Arc::new(FailFinalWriteStore::new(FinalWriteFailureMode::BeforeWrite));
+        let manager = KeyManager::new(&snapshot, secrets.clone());
+
+        assert!(matches!(
+            manager.database_key(),
+            Err(KeyManagerError::SecretStore)
+        ));
+        assert!(snapshot.exists());
+
+        let pending = secrets.inner.load().unwrap().unwrap();
+        let unlock_secret = match super::decode_unlock_secret(pending).unwrap() {
+            super::UnlockSecret::Pending(unlock_secret) => unlock_secret,
+            super::UnlockSecret::Committed(_) => panic!("credential must remain pending"),
+        };
+        let expected = super::read_database_key(&snapshot, unlock_secret).unwrap();
+        let recovered = manager.database_key().unwrap();
+        assert_eq!(recovered.as_slice(), expected.as_slice());
+        let reopened = KeyManager::new(&snapshot, secrets).database_key().unwrap();
+        assert_eq!(reopened.as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn failure_path_visible_final_credential_is_reconciled_without_rotation() {
+        let temp = tempdir().unwrap();
+        let snapshot = temp.path().join("visible-final-write.stronghold");
+        let secrets = Arc::new(FailFinalWriteStore::new(FinalWriteFailureMode::AfterWrite));
+        let manager = KeyManager::new(&snapshot, secrets.clone());
+
+        let database_key = manager.database_key().unwrap();
+        let visible_secret = secrets.inner.load().unwrap().unwrap();
+        assert_eq!(visible_secret.len(), 32);
+
+        let reopened = KeyManager::new(&snapshot, secrets).database_key().unwrap();
+        assert_eq!(reopened.as_slice(), database_key.as_slice());
     }
 
     #[test]
