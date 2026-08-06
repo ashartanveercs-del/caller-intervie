@@ -13,7 +13,7 @@
 - Target Windows and macOS desktop; keep web-compatible React feature code separate from Tauri adapters.
 - Use Tauri 2 with React and TypeScript; do not extend the PySide6 UI for new customer-facing workflows.
 - Keep the existing PySide6 application runnable until its replacement passes parity checks.
-- Use Node.js 22 or newer, pnpm 11 or newer, Python 3.12, and Rust 1.77.2 or newer.
+- Use Node.js 22 or newer, pnpm 11 or newer, Python 3.12, and Rust 1.88.0 or newer. Production builds use the repository-pinned Rust 1.97.1 toolchain.
 - Use length-prefixed MessagePack frames over inherited standard input/output; do not open a localhost sidecar port.
 - The Tauri host owns sidecar streams; React never launches or writes to the process directly.
 - Store session data locally in SQLCipher and keep raw audio transient by default.
@@ -102,7 +102,8 @@ Run on Windows:
 ```powershell
 winget install --id Rustlang.Rustup -e
 $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
-rustup default stable
+rustup toolchain install 1.97.1 --profile minimal
+rustup show active-toolchain
 node --version
 pnpm --version
 py --version
@@ -110,7 +111,7 @@ rustc --version
 cargo --version
 ```
 
-Expected: Node 22+, pnpm 11+, Python 3.12, and Rust 1.77.2+.
+Expected: Node 22+, pnpm 11+, Python 3.12, and the repository-pinned Rust 1.97.1 toolchain (MSRV 1.88.0).
 
 - [ ] **Step 2: Scaffold the official Tauri React TypeScript template**
 
@@ -748,7 +749,7 @@ Also test migration from an empty database, strict event sequence ordering, inco
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test --manifest-path desktop/src-tauri/Cargo.toml storage`
+Run: `cargo test --manifest-path desktop/src-tauri/Cargo.toml --test storage`
 
 Expected: FAIL because storage modules do not exist.
 
@@ -769,7 +770,7 @@ Register `create_session`, `save_session_brief`, `complete_session`, `list_sessi
 Run:
 
 ```powershell
-cargo test --manifest-path desktop/src-tauri/Cargo.toml storage
+cargo test --manifest-path desktop/src-tauri/Cargo.toml --test storage
 cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
 ```
 

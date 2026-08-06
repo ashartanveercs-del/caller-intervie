@@ -1,5 +1,8 @@
 # Windows native build
 
+Rust `1.88.0` is the minimum supported compiler. Repository builds use the exact Rust `1.97.1`
+toolchain declared in the root `rust-toolchain.toml`.
+
 Run `windows-native-build.ps1` from the repository root. The wrapper accepts only this native-build
 recipe:
 
