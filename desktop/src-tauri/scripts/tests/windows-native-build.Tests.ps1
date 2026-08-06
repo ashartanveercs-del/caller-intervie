@@ -905,6 +905,63 @@ try {
         }
     }
 
+    Invoke-Test 'cargo bench is rejected after global options before invoking Cargo' {
+        $nativeBuildModule = Get-Module | Where-Object { $_.Path -eq $modulePath } | Select-Object -First 1
+        $manifestRoot = Join-Path $testRoot 'cargo-bench-rejection'
+        $targetRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("wnb-bench-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $selectedLinker = Join-Path $testRoot 'bench-link.exe'
+        $libraryDirectory = Join-Path $testRoot 'bench-libsodium\lib'
+        $callsPath = Join-Path $testRoot 'bench-cargo-calls.txt'
+        $fakeCargo = Join-Path $testRoot 'bench-cargo.cmd'
+        New-Item -ItemType Directory -Path $manifestRoot, $libraryDirectory -Force | Out-Null
+        [System.IO.File]::WriteAllText($selectedLinker, '')
+        [System.IO.File]::WriteAllText(
+            $fakeCargo,
+            "@echo off`r`necho invoked>>`"$callsPath`"`r`nexit /b 0`r`n"
+        )
+        $cases = @(
+            @{ Arguments = [string[]] @('bench', '--release', '--target-dir', $targetRoot) },
+            @{ Arguments = [string[]] @('--color', 'always', 'bench', '--release', '--target-dir', $targetRoot) }
+        )
+
+        try {
+            foreach ($case in $cases) {
+                Remove-Item -LiteralPath $callsPath -Force -ErrorAction SilentlyContinue
+                Assert-Throws {
+                    & $nativeBuildModule {
+                        param($cargo, $root, $linker, $arguments, $library)
+                        Invoke-ControlledCargoBuild `
+                            -CargoPath $cargo `
+                            -ManifestRoot $root `
+                            -LinkPath $linker `
+                            -CargoArguments $arguments `
+                            -LibraryDirectory $library
+                    } $fakeCargo $manifestRoot $selectedLinker ([string[]] $case.Arguments) $libraryDirectory
+                } 'cargo bench'
+                Assert-Equal $false (Test-Path -LiteralPath $callsPath) 'Cargo was invoked before rejecting cargo bench.'
+            }
+        }
+        finally {
+            Remove-Item -LiteralPath $targetRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    Invoke-Test 'Cargo subcommand detection preserves build test and clippy application arguments' {
+        $nativeBuildModule = Get-Module | Where-Object { $_.Path -eq $modulePath } | Select-Object -First 1
+        $cases = @(
+            @{ Arguments = [string[]] @('build', '--release') },
+            @{ Arguments = [string[]] @('--color', 'always', 'test', '--', 'bench') },
+            @{ Arguments = [string[]] @('-v', 'clippy', '--', 'bench', 'rustc') }
+        )
+
+        foreach ($case in $cases) {
+            & $nativeBuildModule {
+                param($arguments)
+                Assert-SafeCargoArguments -CargoArguments $arguments
+            } ([string[]] $case.Arguments)
+        }
+    }
+
     Invoke-Test 'cargo clean uses the requested target profile and target directory contract' {
         $nativeBuildModule = Get-Module | Where-Object { $_.Path -eq $modulePath } | Select-Object -First 1
         $manifestRoot = Join-Path $testRoot 'cargo-clean-contract'
@@ -1263,6 +1320,7 @@ exit /b 0
             'less than 260',
             'shorter absolute `--target-dir`',
             'before `cargo clean` or the requested Cargo command',
+            'cargo bench',
             'CFLAGS=/Z7',
             'CXXFLAGS=/Z7',
             'lock-protected',

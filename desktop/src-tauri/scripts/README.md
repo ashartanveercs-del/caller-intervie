@@ -55,9 +55,9 @@ Its full path must be less than 260 characters. This check also applies to calle
 directories; an over-budget path fails before Cargo starts and asks for a
 shorter absolute `--target-dir`.
 
-The wrapper rejects `cargo rustc`, Cargo `--config`, non-x86_64 Windows targets, linker codegen
-overrides, and `+crt-static`. It replaces ambient Cargo target, target-directory, linker, and Rust
-flag settings. `CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER` names the approved linker,
+The wrapper rejects `cargo rustc`, `cargo bench`, Cargo `--config`, non-x86_64 Windows targets,
+linker codegen overrides, and `+crt-static`. It replaces ambient Cargo target, target-directory,
+linker, and Rust flag settings. `CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER` names the approved linker,
 `CARGO_ENCODED_RUSTFLAGS=-Ctarget-feature=-crt-static`, and ambient `RUSTFLAGS` plus target
 rustflags are removed. Vendored OpenSSL 3.6.3 builds receive controlled `CFLAGS=/Z7` and
 `CXXFLAGS=/Z7`, overriding ambient values so debug information is embedded in objects instead of

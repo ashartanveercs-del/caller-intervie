@@ -1090,6 +1090,31 @@ function Add-CargoArgumentsBeforeApplicationBoundary {
     return $result
 }
 
+function Get-CargoSubcommand {
+    param(
+        [Parameter(Mandatory = $true)] [string[]] $CargoArguments
+    )
+
+    $boundary = [array]::IndexOf($CargoArguments, '--')
+    $commandArgumentCount = if ($boundary -lt 0) { $CargoArguments.Count } else { $boundary }
+    $globalOptionsWithValues = @('--color', '--config', '-C', '-Z')
+    for ($index = 0; $index -lt $commandArgumentCount; $index++) {
+        $argument = $CargoArguments[$index]
+        if ($index -eq 0 -and $argument.StartsWith('+', [System.StringComparison]::Ordinal)) {
+            continue
+        }
+        if ($globalOptionsWithValues -ccontains $argument) {
+            $index++
+            continue
+        }
+        if ($argument.StartsWith('-', [System.StringComparison]::Ordinal)) {
+            continue
+        }
+        return $argument
+    }
+    return $null
+}
+
 function Assert-SafeCargoArguments {
     param(
         [Parameter(Mandatory = $true)] [string[]] $CargoArguments
@@ -1106,8 +1131,12 @@ function Assert-SafeCargoArguments {
             @($CargoArguments[0..($boundary - 1)])
         })
 
-    if ($commandArguments -ccontains 'rustc') {
+    $subcommand = Get-CargoSubcommand -CargoArguments $CargoArguments
+    if ($subcommand -ceq 'rustc') {
         throw 'cargo rustc is not supported by the Windows native wrapper.'
+    }
+    if ($subcommand -ceq 'bench') {
+        throw 'cargo bench is not supported by the Windows native wrapper.'
     }
 
     for ($index = 0; $index -lt $commandArguments.Count; $index++) {
