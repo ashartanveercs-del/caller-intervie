@@ -33,7 +33,9 @@ The staged static library and `receipt.json` replace the cache at
 `.native/libsodium-1.0.20-msvc-static-md-x64` using a lock-protected, rollback-safe sequence. The
 previous cache remains as a backup until the replacement has moved into place and passed receipt,
 hash, architecture, CRT, and tool-version validation. A move or validation failure restores that
-backup. No libsodium DLL is built or packaged.
+backup. After validation commits the replacement, backup cleanup is best-effort; a cleanup failure emits a warning
+and leaves backup remnants for later cleanup. It does not roll back the validated replacement. No libsodium DLL
+is built or packaged.
 
 Every requested Cargo command targets `x86_64-pc-windows-msvc` explicitly. When the caller omits
 `--target-dir`, the wrapper selects `.native/cargo-target`; output is therefore under
