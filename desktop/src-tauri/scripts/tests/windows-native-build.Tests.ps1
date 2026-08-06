@@ -109,6 +109,22 @@ function New-TestReceipt {
     return $receipt
 }
 
+$script:openSslObjectProbeSuffix = 'build\openssl-sys-0123456789abcdef\out\openssl-build\build\src\providers\implementations\ciphers\libdefault-lib-cipher_aes_cbc_hmac_sha256_etm_hw.obj'
+
+function New-TestCargoTargetRootForProbeLength {
+    param(
+        [Parameter(Mandatory = $true)] [int] $ProbeLength,
+        [string] $Profile = 'release'
+    )
+
+    $targetAndProfileSuffix = "x86_64-pc-windows-msvc\$Profile\$script:openSslObjectProbeSuffix"
+    $targetRootLength = $ProbeLength - 1 - $targetAndProfileSuffix.Length
+    if ($targetRootLength -lt 3) {
+        throw "Probe length $ProbeLength is too short for an absolute Windows target root."
+    }
+    return 'C:\' + ('t' * ($targetRootLength - 3))
+}
+
 $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("windows-native-build-tests-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $testRoot | Out-Null
 
@@ -732,6 +748,43 @@ try {
         Assert-Equal 'release' $parsed.ProfileDirectory 'Application arguments changed the Cargo profile directory.'
     }
 
+    Invoke-Test 'the default controlled Cargo target root uses the intentional short name' {
+        $nativeBuildModule = Get-Module | Where-Object { $_.Path -eq $modulePath } | Select-Object -First 1
+        $manifestRoot = Join-Path $testRoot 'default-target-root'
+        $targetRoot = & $nativeBuildModule {
+            param($root)
+            Get-CargoTargetRoot -ManifestRoot $root -CargoArguments @('build', '--release')
+        } $manifestRoot
+
+        Assert-Equal (Join-Path $manifestRoot '.native\t') $targetRoot 'The default Cargo target root is not the intentional short path.'
+    }
+
+    Invoke-Test 'the OpenSSL object path budget accepts a 259-character probe' {
+        $nativeBuildModule = Get-Module | Where-Object { $_.Path -eq $modulePath } | Select-Object -First 1
+        $targetRoot = New-TestCargoTargetRootForProbeLength -ProbeLength 259
+        $probePath = Join-Path $targetRoot "x86_64-pc-windows-msvc\release\$script:openSslObjectProbeSuffix"
+        Assert-Equal 259 $probePath.Length 'The accepted boundary fixture does not model a 259-character path.'
+
+        & $nativeBuildModule {
+            param($root)
+            Assert-CargoTargetPathBudget -TargetRoot $root -CargoArguments @('build', '--release')
+        } $targetRoot
+    }
+
+    Invoke-Test 'the OpenSSL object path budget rejects a 260-character probe' {
+        $nativeBuildModule = Get-Module | Where-Object { $_.Path -eq $modulePath } | Select-Object -First 1
+        $targetRoot = New-TestCargoTargetRootForProbeLength -ProbeLength 260
+        $probePath = Join-Path $targetRoot "x86_64-pc-windows-msvc\release\$script:openSslObjectProbeSuffix"
+        Assert-Equal 260 $probePath.Length 'The rejected boundary fixture does not model a 260-character path.'
+
+        Assert-Throws {
+            & $nativeBuildModule {
+                param($root)
+                Assert-CargoTargetPathBudget -TargetRoot $root -CargoArguments @('build', '--release')
+            } $targetRoot
+        } '260.*shorter absolute --target-dir'
+    }
+
     Invoke-Test 'the controlled Cargo environment overrides configured native-build inputs' {
         $nativeBuildModule = Get-Module | Where-Object { $_.Path -eq $modulePath } | Select-Object -First 1
         $manifestRoot = Join-Path $testRoot 'cargo-environment'
@@ -765,7 +818,7 @@ try {
             } $manifestRoot $selectedLinker
 
             $contract = Get-WindowsNativeBuildContract
-            $expectedTargetRoot = Join-Path $manifestRoot '.native\cargo-target'
+            $expectedTargetRoot = Join-Path $manifestRoot '.native\t'
             Assert-Equal $contract.CargoTarget $invocation.Target 'The Cargo target was not pinned.'
             Assert-Equal $expectedTargetRoot $invocation.TargetRoot 'The default Cargo target directory was not controlled.'
             Assert-Equal (Join-Path $expectedTargetRoot "$($contract.CargoTarget)\debug") $invocation.BuildRoot 'The attestation root does not match the controlled target and profile.'
@@ -890,7 +943,7 @@ try {
     Invoke-Test 'the controlled Cargo boundary cleans builds and attests the exact root without leaking stdout' {
         $nativeBuildModule = Get-Module | Where-Object { $_.Path -eq $modulePath } | Select-Object -First 1
         $manifestRoot = Join-Path $testRoot 'cargo-boundary'
-        $targetRoot = Join-Path $testRoot 'cargo-boundary-target'
+        $targetRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("wnb-cargo-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
         $libraryDirectory = Join-Path $testRoot 'cargo-boundary-libsodium\lib'
         $selectedLinker = Join-Path $testRoot 'boundary-link.exe'
         $callsPath = Join-Path $testRoot 'fake-cargo-calls.txt'
@@ -957,7 +1010,38 @@ exit /b 0
             foreach ($variable in $fakeVariables) {
                 [System.Environment]::SetEnvironmentVariable($variable, $previousValues[$variable], 'Process')
             }
+            Remove-Item -LiteralPath $targetRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
+    }
+
+    Invoke-Test 'an over-budget target directory is rejected before invoking Cargo' {
+        $nativeBuildModule = Get-Module | Where-Object { $_.Path -eq $modulePath } | Select-Object -First 1
+        $manifestRoot = Join-Path $testRoot 'cargo-path-budget-rejection'
+        $targetRoot = New-TestCargoTargetRootForProbeLength -ProbeLength 260
+        $selectedLinker = Join-Path $testRoot 'path-budget-link.exe'
+        $libraryDirectory = Join-Path $testRoot 'path-budget-libsodium\lib'
+        $callsPath = Join-Path $testRoot 'path-budget-cargo-calls.txt'
+        $fakeCargo = Join-Path $testRoot 'path-budget-cargo.cmd'
+        New-Item -ItemType Directory -Path $manifestRoot, $libraryDirectory -Force | Out-Null
+        [System.IO.File]::WriteAllText($selectedLinker, '')
+        [System.IO.File]::WriteAllText(
+            $fakeCargo,
+            "@echo off`r`necho invoked>>`"$callsPath`"`r`nexit /b 0`r`n"
+        )
+
+        Assert-Throws {
+            & $nativeBuildModule {
+                param($cargo, $root, $linker, $targetDirectory, $library)
+                Invoke-ControlledCargoBuild `
+                    -CargoPath $cargo `
+                    -ManifestRoot $root `
+                    -LinkPath $linker `
+                    -CargoArguments @('build', '--release', '--target-dir', $targetDirectory) `
+                    -LibraryDirectory $library
+            } $fakeCargo $manifestRoot $selectedLinker $targetRoot $libraryDirectory
+        } '260.*shorter absolute --target-dir'
+
+        Assert-Equal $false (Test-Path -LiteralPath $callsPath) 'Cargo was invoked before the target path budget rejection.'
     }
 
     Invoke-Test 'Cargo build-root scoping always includes the approved explicit target' {
@@ -1173,7 +1257,12 @@ exit /b 0
             '14.44.35207',
             '14.44.35228.0',
             'x86_64-pc-windows-msvc',
-            '.native/cargo-target',
+            '.native/t',
+            'openssl-sys-0123456789abcdef',
+            'libdefault-lib-cipher_aes_cbc_hmac_sha256_etm_hw.obj',
+            'less than 260',
+            'shorter absolute `--target-dir`',
+            'before `cargo clean` or the requested Cargo command',
             'CFLAGS=/Z7',
             'CXXFLAGS=/Z7',
             'lock-protected',

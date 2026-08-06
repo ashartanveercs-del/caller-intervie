@@ -33,16 +33,24 @@ The staged static library and `receipt.json` replace the cache at
 `.native/libsodium-1.0.20-msvc-static-md-x64` using a lock-protected, rollback-safe sequence. The
 previous cache remains as a backup until the replacement has moved into place and passed receipt,
 hash, architecture, CRT, and tool-version validation. A move or validation failure restores that
-backup. After validation commits the replacement, backup cleanup is best-effort; a cleanup failure emits a warning
-and leaves backup remnants for later cleanup. It does not roll back the validated replacement. No libsodium DLL
-is built or packaged.
+backup. After validation commits the replacement, backup cleanup is best-effort. A cleanup failure emits a warning
+and leaves backup remnants for later cleanup. It does not roll back the validated replacement. No libsodium DLL is
+built or packaged.
 
 Every requested Cargo command targets `x86_64-pc-windows-msvc` explicitly. When the caller omits
-`--target-dir`, the wrapper selects `.native/cargo-target`; output is therefore under
-`.native/cargo-target/x86_64-pc-windows-msvc/<profile>`. An explicit caller `--target-dir` is
-preserved and resolved exactly. The selective `cargo clean -p libsodium-sys-stable`, requested
-command, and post-build attestation all use the same target, target directory, and profile. Both
-`--release` and `-r` select the `release` profile.
+`--target-dir`, the wrapper intentionally selects the short `.native/t`; output is therefore under
+`.native/t/x86_64-pc-windows-msvc/<profile>`. An explicit caller `--target-dir` is preserved and
+resolved exactly. The selective `cargo clean -p libsodium-sys-stable`, requested command, and
+post-build attestation all use the same target, target directory, and profile. Both `--release` and
+`-r` select the `release` profile.
+
+Before `cargo clean` or the requested Cargo command, the wrapper checks the resolved target root
+against the vendored OpenSSL 3.6.3 path budget. The deterministic probe uses the pinned target and
+profile plus
+`build/openssl-sys-0123456789abcdef/out/openssl-build/build/src/providers/implementations/ciphers/libdefault-lib-cipher_aes_cbc_hmac_sha256_etm_hw.obj`.
+Its full path must be less than 260 characters. This check also applies to caller-supplied target
+directories; an over-budget path fails before Cargo starts and asks for a
+shorter absolute `--target-dir`.
 
 The wrapper rejects `cargo rustc`, Cargo `--config`, non-x86_64 Windows targets, linker codegen
 overrides, and `+crt-static`. It replaces ambient Cargo target, target-directory, linker, and Rust
