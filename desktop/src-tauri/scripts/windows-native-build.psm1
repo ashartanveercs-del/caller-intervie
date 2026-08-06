@@ -450,12 +450,14 @@ function Get-ExecutableVersion {
     param(
         [Parameter(Mandatory = $true)] [string] $ExecutablePath,
         [Parameter(Mandatory = $true)] [string[]] $Arguments,
-        [Parameter(Mandatory = $true)] [string] $DisplayName
+        [Parameter(Mandatory = $true)] [string] $DisplayName,
+        [int[]] $AcceptedExitCodes = @(0)
     )
 
     $output = @(& $ExecutablePath @Arguments 2>&1)
-    if ($LASTEXITCODE -ne 0) {
-        throw "$DisplayName version inspection failed (exit $LASTEXITCODE)."
+    $exitCode = $LASTEXITCODE
+    if ($AcceptedExitCodes -notcontains $exitCode) {
+        throw "$DisplayName version inspection failed (exit $exitCode)."
     }
     foreach ($line in $output) {
         $match = [regex]::Match($line.ToString(), '(?<!\d)(\d+(?:\.\d+)+)(?!\d)')
@@ -464,6 +466,23 @@ function Get-ExecutableVersion {
         }
     }
     throw "$DisplayName did not report a parseable version."
+}
+
+function Get-ApprovedMsvcLinkerVersion {
+    param(
+        [Parameter(Mandatory = $true)] [string] $LinkPath
+    )
+
+    $version = Get-ExecutableVersion `
+        -ExecutablePath $LinkPath `
+        -Arguments @('/?') `
+        -DisplayName 'MSVC linker' `
+        -AcceptedExitCodes @(0, 1100)
+    $approvedVersion = (Get-WindowsNativeBuildContract).LinkVersion
+    if ($version -cne $approvedVersion) {
+        throw "MSVC linker version must be exactly $approvedVersion; found '$version'."
+    }
+    return $version
 }
 
 function Clear-InheritedMsBuildEnvironment {
@@ -1351,7 +1370,7 @@ function Invoke-WindowsNativeBuild {
         Assert-SelectedVisualStudioEnvironment -Toolchain $toolchain
         $vcToolsVersion = Split-Path -Leaf $toolchain.VcToolsInstallDirectory.TrimEnd('\')
         $msBuildVersion = Get-ExecutableVersion -ExecutablePath $toolchain.MsBuildPath -Arguments @('-version', '-nologo') -DisplayName 'MSBuild'
-        $linkVersion = Get-ExecutableVersion -ExecutablePath $toolchain.LinkPath -Arguments @('/?') -DisplayName 'MSVC linker'
+        $linkVersion = Get-ApprovedMsvcLinkerVersion -LinkPath $toolchain.LinkPath
         $contract = Get-WindowsNativeBuildContract
         Assert-ApprovedToolchainVersions `
             -VisualStudioInstallationVersion $contract.VisualStudioInstallationVersion `
