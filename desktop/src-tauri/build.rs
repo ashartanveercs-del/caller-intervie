@@ -29,12 +29,17 @@ struct BuildReceipt {
     runtime_library: String,
     property_file: String,
     property_transform_count: u32,
+    debug_property_file: String,
+    debug_information_format: String,
+    debug_property_transform_count: u32,
     library: String,
     library_sha256: String,
     machine: String,
     crt_default_library: String,
+    visual_studio_installation_version: String,
     msbuild_version: String,
     link_version: String,
+    vc_tools_version: String,
 }
 
 fn main() {
@@ -44,6 +49,8 @@ fn main() {
         "SODIUM_USE_PKG_CONFIG",
         "DESKTOP_LIBSODIUM_RECEIPT",
         "DESKTOP_MSVC_LINK",
+        "DESKTOP_MSBUILD_VERSION",
+        "DESKTOP_VC_TOOLS_VERSION",
         "VSINSTALLDIR",
         "VCToolsInstallDir",
         "VisualStudioVersion",
@@ -51,20 +58,24 @@ fn main() {
         println!("cargo:rerun-if-env-changed={variable}");
     }
 
-    if is_windows_msvc_target() {
+    if is_windows_target() {
+        if !is_supported_windows_target() {
+            panic!("unsupported Windows target; only x86_64-pc-windows-msvc is supported");
+        }
         validate_windows_libsodium();
-
-        println!("cargo:rustc-link-arg-bins=/IGNORE:4099");
-        println!("cargo:rustc-link-arg-cdylib=/IGNORE:4099");
-        println!("cargo:rustc-link-arg-tests=/IGNORE:4099");
     }
 
     tauri_build::build()
 }
 
-fn is_windows_msvc_target() -> bool {
+fn is_windows_target() -> bool {
     env::var("CARGO_CFG_TARGET_OS").is_ok_and(|value| value == "windows")
-        && env::var("CARGO_CFG_TARGET_ENV").is_ok_and(|value| value == "msvc")
+}
+
+fn is_supported_windows_target() -> bool {
+    env::var("TARGET").as_deref() == Ok("x86_64-pc-windows-msvc")
+        && env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+        && env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64")
 }
 
 fn validate_windows_libsodium() {
@@ -132,6 +143,24 @@ fn validate_windows_libsodium() {
     });
 
     validate_receipt_contract(&receipt);
+    require_receipt_value(
+        "msbuild_version",
+        receipt.msbuild_version.as_str(),
+        env::var("DESKTOP_MSBUILD_VERSION")
+            .unwrap_or_else(|_| {
+                panic!("DESKTOP_MSBUILD_VERSION is absent; use the Windows native wrapper")
+            })
+            .as_str(),
+    );
+    require_receipt_value(
+        "vc_tools_version",
+        receipt.vc_tools_version.as_str(),
+        env::var("DESKTOP_VC_TOOLS_VERSION")
+            .unwrap_or_else(|_| {
+                panic!("DESKTOP_VC_TOOLS_VERSION is absent; use the Windows native wrapper")
+            })
+            .as_str(),
+    );
     let actual_library_sha256 = sha256_file(&expected_library);
     if receipt.library_sha256 != actual_library_sha256 {
         panic!("the provisioned libsodium.lib SHA-256 does not match its build receipt");
@@ -239,12 +268,25 @@ fn inspect_libsodium_archive(link: &Path, library: &Path, receipt_link_version: 
         .collect();
     if default_libraries
         .iter()
-        .any(|library| library == "LIBCMT" || library == "LIBCMTD")
+        .any(|library| library == "LIBCMT" || library == "LIBCMTD" || library == "MSVCRTD")
     {
-        panic!("the provisioned libsodium.lib requests LIBCMT or LIBCMTD");
+        panic!("the provisioned libsodium.lib requests a non-release CRT");
     }
     if !default_libraries.iter().any(|library| library == "MSVCRT") {
         panic!("the provisioned libsodium.lib does not request the release dynamic CRT MSVCRT");
+    }
+    for directive in directives.split_whitespace() {
+        let normalized = directive.replace('"', "");
+        if let Some(runtime) = normalized
+            .to_ascii_uppercase()
+            .strip_prefix("/FAILIFMISMATCH:RUNTIMELIBRARY=")
+        {
+            if runtime != "MD_DYNAMICRELEASE" {
+                panic!(
+                    "the provisioned libsodium.lib has an incompatible RuntimeLibrary directive"
+                );
+            }
+        }
     }
 
     let actual_link_version = directives
@@ -295,7 +337,7 @@ fn run_link_dump(link: &Path, mode: &str, library: &Path) -> String {
 
 fn validate_receipt_contract(receipt: &BuildReceipt) {
     require_receipt_value("schema_version", receipt.schema_version, 1);
-    require_receipt_value("recipe_revision", receipt.recipe_revision, 1);
+    require_receipt_value("recipe_revision", receipt.recipe_revision, 3);
     require_receipt_value(
         "libsodium_version",
         receipt.libsodium_version.as_str(),
@@ -343,6 +385,21 @@ fn validate_receipt_contract(receipt: &BuildReceipt) {
         receipt.property_transform_count,
         1,
     );
+    require_receipt_value(
+        "debug_property_file",
+        receipt.debug_property_file.as_str(),
+        "builds/msvc/properties/Release.props",
+    );
+    require_receipt_value(
+        "debug_information_format",
+        receipt.debug_information_format.as_str(),
+        "OldStyle",
+    );
+    require_receipt_value(
+        "debug_property_transform_count",
+        receipt.debug_property_transform_count,
+        1,
+    );
     require_receipt_value("library", receipt.library.as_str(), "lib/libsodium.lib");
     require_receipt_value("machine", receipt.machine.as_str(), "x64");
     require_receipt_value(
@@ -350,13 +407,26 @@ fn validate_receipt_contract(receipt: &BuildReceipt) {
         receipt.crt_default_library.as_str(),
         "MSVCRT",
     );
-
-    if !is_version(&receipt.msbuild_version) {
-        panic!("the libsodium build receipt field 'msbuild_version' is invalid");
-    }
-    if !is_version(&receipt.link_version) {
-        panic!("the libsodium build receipt field 'link_version' is invalid");
-    }
+    require_receipt_value(
+        "visual_studio_installation_version",
+        receipt.visual_studio_installation_version.as_str(),
+        "17.14.37516.0",
+    );
+    require_receipt_value(
+        "msbuild_version",
+        receipt.msbuild_version.as_str(),
+        "17.14.51.32402",
+    );
+    require_receipt_value(
+        "vc_tools_version",
+        receipt.vc_tools_version.as_str(),
+        "14.44.35207",
+    );
+    require_receipt_value(
+        "link_version",
+        receipt.link_version.as_str(),
+        "14.44.35228.0",
+    );
     if receipt.library_sha256.len() != 64
         || !receipt
             .library_sha256
@@ -374,14 +444,6 @@ where
     if actual != expected {
         panic!("the libsodium build receipt field '{field}' is stale or incompatible");
     }
-}
-
-fn is_version(value: &str) -> bool {
-    let components: Vec<_> = value.split('.').collect();
-    components.len() >= 2
-        && components.iter().all(|component| {
-            !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
-        })
 }
 
 fn sha256_file(path: &Path) -> String {
