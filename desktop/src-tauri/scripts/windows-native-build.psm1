@@ -1042,6 +1042,20 @@ function Get-CargoBuildRoot {
     return Join-Path $root (Get-CargoProfileDirectory -CargoArguments $CargoArguments)
 }
 
+function Assert-CargoTargetPathBudget {
+    param(
+        [Parameter(Mandatory = $true)] [string] $TargetRoot,
+        [Parameter(Mandatory = $true)] [string[]] $CargoArguments
+    )
+
+    $buildRoot = Get-CargoBuildRoot -TargetRoot $TargetRoot -CargoArguments $CargoArguments
+    $openSslObjectSuffix = 'build\openssl-sys-0123456789abcdef\out\openssl-build\build\src\providers\implementations\ciphers\libdefault-lib-cipher_aes_cbc_hmac_sha256_etm_hw.obj'
+    $probePath = Join-Path $buildRoot $openSslObjectSuffix
+    if ($probePath.Length -ge 260) {
+        throw "Cargo target directory is too long for vendored OpenSSL 3.6.3: the representative object path is $($probePath.Length) characters (must be less than 260). Supply a shorter absolute --target-dir. Probe: $probePath"
+    }
+}
+
 function Get-CargoTargetRoot {
     param(
         [Parameter(Mandatory = $true)] [string] $ManifestRoot,
@@ -1050,7 +1064,7 @@ function Get-CargoTargetRoot {
 
     $configuredTarget = Get-CargoTargetDirectoryArgument -CargoArguments $CargoArguments
     if (-not $configuredTarget) {
-        return Join-Path $ManifestRoot '.native\cargo-target'
+        return Join-Path $ManifestRoot '.native\t'
     }
     if ([System.IO.Path]::IsPathRooted($configuredTarget)) {
         return [System.IO.Path]::GetFullPath($configuredTarget)
@@ -1322,6 +1336,9 @@ function Invoke-ControlledCargoBuild {
         -ManifestRoot $ManifestRoot `
         -LinkPath $LinkPath `
         -CargoArguments $CargoArguments
+    Assert-CargoTargetPathBudget `
+        -TargetRoot $invocation.TargetRoot `
+        -CargoArguments $invocation.CargoArguments
     Invoke-LibsodiumCargoClean `
         -CargoPath $CargoPath `
         -ManifestRoot $ManifestRoot `
