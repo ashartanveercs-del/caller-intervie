@@ -544,6 +544,75 @@ try {
         }
     }
 
+    Invoke-Test 'the linker help probe accepts only parseable approved output with exit 1100' {
+        $nativeBuildModule = Get-Module | Where-Object { $_.Path -eq $modulePath } | Select-Object -First 1
+        $fakeLinker = Join-Path $testRoot 'fake-linker-version.cmd'
+        [System.IO.File]::WriteAllText(
+            $fakeLinker,
+            "@echo off`r`nif defined FAKE_LINK_VERSION_OUTPUT echo %FAKE_LINK_VERSION_OUTPUT%`r`nexit /b %FAKE_LINK_EXIT_CODE%`r`n"
+        )
+        $variables = @('FAKE_LINK_VERSION_OUTPUT', 'FAKE_LINK_EXIT_CODE')
+        $previousValues = @{}
+        try {
+            foreach ($variable in $variables) {
+                $previousValues[$variable] = [System.Environment]::GetEnvironmentVariable($variable, 'Process')
+            }
+
+            $env:FAKE_LINK_VERSION_OUTPUT = 'Microsoft (R) Incremental Linker Version 14.44.35228.0'
+            $env:FAKE_LINK_EXIT_CODE = '1100'
+            $version = & $nativeBuildModule {
+                param($linker)
+                Get-ApprovedMsvcLinkerVersion -LinkPath $linker
+            } $fakeLinker
+            Assert-Equal '14.44.35228.0' $version 'The approved linker help output was not accepted.'
+
+            Assert-Throws {
+                & $nativeBuildModule {
+                    param($linker)
+                    Get-ExecutableVersion -ExecutablePath $linker -Arguments @('/?') -DisplayName 'generic tool'
+                } $fakeLinker
+            } 'exit 1100'
+
+            $env:FAKE_LINK_EXIT_CODE = '42'
+            Assert-Throws {
+                & $nativeBuildModule {
+                    param($linker)
+                    Get-ApprovedMsvcLinkerVersion -LinkPath $linker
+                } $fakeLinker
+            } 'exit 42'
+
+            $env:FAKE_LINK_EXIT_CODE = '1100'
+            $env:FAKE_LINK_VERSION_OUTPUT = $null
+            Assert-Throws {
+                & $nativeBuildModule {
+                    param($linker)
+                    Get-ApprovedMsvcLinkerVersion -LinkPath $linker
+                } $fakeLinker
+            } 'parseable version'
+
+            $env:FAKE_LINK_VERSION_OUTPUT = 'Microsoft linker version unavailable'
+            Assert-Throws {
+                & $nativeBuildModule {
+                    param($linker)
+                    Get-ApprovedMsvcLinkerVersion -LinkPath $linker
+                } $fakeLinker
+            } 'parseable version'
+
+            $env:FAKE_LINK_VERSION_OUTPUT = 'Microsoft (R) Incremental Linker Version 14.45.99999.0'
+            Assert-Throws {
+                & $nativeBuildModule {
+                    param($linker)
+                    Get-ApprovedMsvcLinkerVersion -LinkPath $linker
+                } $fakeLinker
+            } '14\.44\.35228\.0'
+        }
+        finally {
+            foreach ($variable in $variables) {
+                [System.Environment]::SetEnvironmentVariable($variable, $previousValues[$variable], 'Process')
+            }
+        }
+    }
+
     Invoke-Test 'toolchain selection refuses an unapproved VC tools directory' {
         $installation = Join-Path $testRoot 'vs-with-newer-vc-tools'
         foreach ($file in @(
