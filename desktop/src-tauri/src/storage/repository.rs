@@ -28,6 +28,8 @@ pub enum RepositoryError {
     InvalidSessionLimit { limit: usize },
     #[error("completed sessions must have completed or interrupted status")]
     InvalidCompletionStatus,
+    #[error("only session state events can atomically complete a session")]
+    InvalidTerminalEventKind,
     #[error("session brief could not be encoded as JSON")]
     BriefSerialization,
     #[error("request id is already associated with a different turn")]
@@ -112,23 +114,45 @@ impl SessionRepository {
             .map_err(|_| RepositoryError::ConnectionUnavailable)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure_session(&transaction, &event.workspace_id, &event.session_id)?;
-        let payload_json = serde_json::to_string(&event.payload).map_err(|_| {
-            RepositoryError::EventContentCollision {
-                event_id: event.event_id.clone(),
-            }
-        })?;
-        if let Some((host_sequence, existing)) = existing_event(&transaction, &event.event_id)? {
-            if existing == event_content(event) {
-                return Ok(AppendEventResult::Duplicate { host_sequence });
-            }
-            return Err(RepositoryError::EventContentCollision {
-                event_id: event.event_id.clone(),
-            });
-        }
-        let host_sequence: i64 = transaction.query_row("SELECT COALESCE(MAX(host_sequence), 0) + 1 FROM timeline_events WHERE workspace_id = ?1 AND session_id = ?2", params![event.workspace_id, event.session_id], |row| row.get(0))?;
-        transaction.execute("INSERT INTO timeline_events (event_id, workspace_id, session_id, host_sequence, source_generation, source_sequence, timestamp_ms, kind, correlation_id, request_id, turn_id, payload_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)", params![event.event_id, event.workspace_id, event.session_id, host_sequence, event.source_generation, event.source_sequence, event.timestamp_ms, event.kind.as_db(), event.correlation_id, event.request_id, event.turn_id, payload_json])?;
+        let result = append_event_in_transaction(&transaction, event)?;
         transaction.commit()?;
-        Ok(AppendEventResult::Inserted { host_sequence })
+        Ok(result)
+    }
+
+    /// Persists a terminal `session.state` event and its session transition as one commit.
+    pub fn append_terminal_event(
+        &self,
+        event: &NewTimelineEvent,
+        status: SessionStatus,
+        completed_at_ms: i64,
+    ) -> Result<AppendEventResult, RepositoryError> {
+        event.validate()?;
+        if !event.kind.is_durable() {
+            return Err(RepositoryError::NonDurableEvent(event.kind.clone()));
+        }
+        if event.kind != TimelineEventKind::SessionState {
+            return Err(RepositoryError::InvalidTerminalEventKind);
+        }
+        if matches!(status, SessionStatus::Active) {
+            return Err(RepositoryError::InvalidCompletionStatus);
+        }
+
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| RepositoryError::ConnectionUnavailable)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_session(&transaction, &event.workspace_id, &event.session_id)?;
+        let result = append_event_in_transaction(&transaction, event)?;
+        transition_session_in_transaction(
+            &transaction,
+            &event.workspace_id,
+            &event.session_id,
+            &status,
+            completed_at_ms,
+        )?;
+        transaction.commit()?;
+        Ok(result)
     }
 
     pub fn complete_session(
@@ -146,32 +170,15 @@ impl SessionRepository {
             .lock()
             .map_err(|_| RepositoryError::ConnectionUnavailable)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing: Option<String> = transaction
-            .query_row(
-                "SELECT status FROM sessions WHERE workspace_id = ?1 AND session_id = ?2",
-                params![workspace_id, session_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(existing) = existing else {
-            return Ok(false);
-        };
-        let existing = SessionStatus::from_db(&existing)?;
-        match existing {
-            SessionStatus::Active => {
-                transaction.execute(
-                    "UPDATE sessions SET status = ?3, completed_at_ms = ?4 WHERE workspace_id = ?1 AND session_id = ?2 AND status = 'active'",
-                    params![workspace_id, session_id, status.as_db(), completed_at_ms],
-                )?;
-                transaction.commit()?;
-                Ok(true)
-            }
-            existing if existing == status => {
-                transaction.commit()?;
-                Ok(true)
-            }
-            _ => Err(RepositoryError::SessionCompletionConflict),
-        }
+        let completed = transition_session_in_transaction(
+            &transaction,
+            workspace_id,
+            session_id,
+            &status,
+            completed_at_ms,
+        )?;
+        transaction.commit()?;
+        Ok(completed)
     }
 
     pub fn list_sessions(
@@ -371,6 +378,59 @@ fn ensure_session(
         Ok(())
     } else {
         Err(RepositoryError::NotFound)
+    }
+}
+
+fn append_event_in_transaction(
+    transaction: &Transaction<'_>,
+    event: &NewTimelineEvent,
+) -> Result<AppendEventResult, RepositoryError> {
+    let payload_json = serde_json::to_string(&event.payload).map_err(|_| {
+        RepositoryError::EventContentCollision {
+            event_id: event.event_id.clone(),
+        }
+    })?;
+    if let Some((host_sequence, existing)) = existing_event(transaction, &event.event_id)? {
+        if existing == event_content(event) {
+            return Ok(AppendEventResult::Duplicate { host_sequence });
+        }
+        return Err(RepositoryError::EventContentCollision {
+            event_id: event.event_id.clone(),
+        });
+    }
+    let host_sequence: i64 = transaction.query_row("SELECT COALESCE(MAX(host_sequence), 0) + 1 FROM timeline_events WHERE workspace_id = ?1 AND session_id = ?2", params![event.workspace_id, event.session_id], |row| row.get(0))?;
+    transaction.execute("INSERT INTO timeline_events (event_id, workspace_id, session_id, host_sequence, source_generation, source_sequence, timestamp_ms, kind, correlation_id, request_id, turn_id, payload_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)", params![event.event_id, event.workspace_id, event.session_id, host_sequence, event.source_generation, event.source_sequence, event.timestamp_ms, event.kind.as_db(), event.correlation_id, event.request_id, event.turn_id, payload_json])?;
+    Ok(AppendEventResult::Inserted { host_sequence })
+}
+
+fn transition_session_in_transaction(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    session_id: &str,
+    status: &SessionStatus,
+    completed_at_ms: i64,
+) -> Result<bool, RepositoryError> {
+    let existing: Option<String> = transaction
+        .query_row(
+            "SELECT status FROM sessions WHERE workspace_id = ?1 AND session_id = ?2",
+            params![workspace_id, session_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(existing) = existing else {
+        return Ok(false);
+    };
+    let existing = SessionStatus::from_db(&existing)?;
+    match existing {
+        SessionStatus::Active => {
+            transaction.execute(
+                "UPDATE sessions SET status = ?3, completed_at_ms = ?4 WHERE workspace_id = ?1 AND session_id = ?2 AND status = 'active'",
+                params![workspace_id, session_id, status.as_db(), completed_at_ms],
+            )?;
+            Ok(true)
+        }
+        existing if existing == *status => Ok(true),
+        _ => Err(RepositoryError::SessionCompletionConflict),
     }
 }
 
@@ -937,6 +997,182 @@ mod tests {
             .unwrap();
         assert_eq!(stored.status, SessionStatus::Interrupted);
         assert_eq!(stored.completed_at_ms, Some(1_700_000_000_050));
+    }
+
+    #[test]
+    fn committed_terminal_event_survives_reopen_without_restoring_an_active_session() {
+        let (_temp, path, repository) = repository();
+        repository.create_session(&session(WORKSPACE_A)).unwrap();
+        let terminal = event("session-stopped", TimelineEventKind::SessionState);
+
+        assert_eq!(
+            repository
+                .append_terminal_event(&terminal, SessionStatus::Completed, 1_700_000_000_050,)
+                .unwrap(),
+            AppendEventResult::Inserted { host_sequence: 1 }
+        );
+        drop(repository);
+
+        let reopened = SessionRepository::open(&path, &key(0x41)).unwrap();
+        assert_eq!(
+            reopened.get_timeline(WORKSPACE_A, SESSION).unwrap().len(),
+            1
+        );
+        let stored = reopened.get_session(WORKSPACE_A, SESSION).unwrap().unwrap();
+        assert_eq!(stored.status, SessionStatus::Completed);
+        assert_eq!(stored.completed_at_ms, Some(1_700_000_000_050));
+        assert!(reopened
+            .restore_active_session(WORKSPACE_A)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn terminal_event_retry_is_duplicate_and_preserves_original_completion_timestamp() {
+        let (_temp, _path, repository) = repository();
+        repository.create_session(&session(WORKSPACE_A)).unwrap();
+        let terminal = event("session-stopped-retry", TimelineEventKind::SessionState);
+
+        assert_eq!(
+            repository
+                .append_terminal_event(&terminal, SessionStatus::Completed, 1_700_000_000_050)
+                .unwrap(),
+            AppendEventResult::Inserted { host_sequence: 1 }
+        );
+        assert_eq!(
+            repository
+                .append_terminal_event(&terminal, SessionStatus::Completed, 1_700_000_000_060)
+                .unwrap(),
+            AppendEventResult::Duplicate { host_sequence: 1 }
+        );
+
+        let stored = repository
+            .get_session(WORKSPACE_A, SESSION)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, SessionStatus::Completed);
+        assert_eq!(stored.completed_at_ms, Some(1_700_000_000_050));
+        assert_eq!(
+            repository.get_timeline(WORKSPACE_A, SESSION).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn terminal_event_content_collision_rolls_back_session_completion() {
+        let (_temp, _path, repository) = repository();
+        repository.create_session(&session(WORKSPACE_A)).unwrap();
+        let original = event("session-stopped-collision", TimelineEventKind::SessionState);
+        repository.append_event(&original).unwrap();
+        let mut conflicting = original.clone();
+        conflicting.payload = json!({"status": "changed"});
+
+        assert!(matches!(
+            repository.append_terminal_event(
+                &conflicting,
+                SessionStatus::Completed,
+                1_700_000_000_050,
+            ),
+            Err(RepositoryError::EventContentCollision { .. })
+        ));
+
+        let stored = repository
+            .get_session(WORKSPACE_A, SESSION)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, SessionStatus::Active);
+        assert_eq!(stored.completed_at_ms, None);
+        let timeline = repository.get_timeline(WORKSPACE_A, SESSION).unwrap();
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].payload, original.payload);
+    }
+
+    #[test]
+    fn terminal_status_conflict_rolls_back_new_event_and_preserves_original_completion() {
+        let (_temp, _path, repository) = repository();
+        repository.create_session(&session(WORKSPACE_A)).unwrap();
+        repository
+            .complete_session(
+                WORKSPACE_A,
+                SESSION,
+                SessionStatus::Completed,
+                1_700_000_000_050,
+            )
+            .unwrap();
+        let terminal = event(
+            "session-interrupted-conflict",
+            TimelineEventKind::SessionState,
+        );
+
+        assert!(matches!(
+            repository.append_terminal_event(
+                &terminal,
+                SessionStatus::Interrupted,
+                1_700_000_000_060,
+            ),
+            Err(RepositoryError::SessionCompletionConflict)
+        ));
+
+        assert!(repository
+            .get_timeline(WORKSPACE_A, SESSION)
+            .unwrap()
+            .is_empty());
+        let stored = repository
+            .get_session(WORKSPACE_A, SESSION)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, SessionStatus::Completed);
+        assert_eq!(stored.completed_at_ms, Some(1_700_000_000_050));
+    }
+
+    #[test]
+    fn only_session_state_events_can_atomically_complete_a_session() {
+        let (_temp, _path, repository) = repository();
+        repository.create_session(&session(WORKSPACE_A)).unwrap();
+        let note = event("not-terminal", TimelineEventKind::Note);
+
+        assert!(matches!(
+            repository.append_terminal_event(&note, SessionStatus::Completed, 1_700_000_000_050,),
+            Err(RepositoryError::InvalidTerminalEventKind)
+        ));
+        assert!(repository
+            .get_timeline(WORKSPACE_A, SESSION)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            repository
+                .restore_active_session(WORKSPACE_A)
+                .unwrap()
+                .unwrap()
+                .session_id,
+            SESSION
+        );
+    }
+
+    #[test]
+    fn terminal_event_requires_a_session_owned_by_its_workspace() {
+        let (_temp, _path, repository) = repository();
+        repository.create_session(&session(WORKSPACE_B)).unwrap();
+        let terminal = event("wrong-workspace", TimelineEventKind::SessionState);
+
+        assert!(matches!(
+            repository.append_terminal_event(
+                &terminal,
+                SessionStatus::Completed,
+                1_700_000_000_050,
+            ),
+            Err(RepositoryError::NotFound)
+        ));
+        assert!(repository
+            .get_timeline(WORKSPACE_A, SESSION)
+            .unwrap()
+            .is_empty());
+        let stored = repository
+            .get_session(WORKSPACE_B, SESSION)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, SessionStatus::Active);
+        assert_eq!(stored.completed_at_ms, None);
     }
 
     #[test]
