@@ -1,5 +1,4 @@
 use std::{
-    convert::Infallible,
     fs::{File, OpenOptions},
     io::ErrorKind,
     path::{Path, PathBuf},
@@ -134,25 +133,29 @@ impl<S: SecretStore + ?Sized> KeyManager<S> {
             .lock()
             .map_err(|_| KeyManagerError::InitializationLock)?;
         let _snapshot_lock = SnapshotInitializationLock::acquire(&self.snapshot_path)?;
-        let has_snapshot = self.snapshot_path.exists();
+        let snapshot_presence = snapshot_presence(&self.snapshot_path)?;
         let unlock_secret = self.secrets.load()?.map(decode_unlock_secret).transpose()?;
-        match (has_snapshot, unlock_secret) {
-            (false, None) => self.create_database_key(),
-            (true, Some(UnlockSecret::Committed(unlock_secret))) => {
+        match (snapshot_presence, unlock_secret) {
+            (SnapshotPresence::Missing, None) => self.create_database_key(),
+            (SnapshotPresence::Present, Some(UnlockSecret::Committed(unlock_secret))) => {
                 read_database_key(&self.snapshot_path, unlock_secret)
             }
-            (true, Some(UnlockSecret::Pending(unlock_secret))) => {
+            (SnapshotPresence::Present, Some(UnlockSecret::Pending(unlock_secret))) => {
                 let database_key = read_database_key(&self.snapshot_path, unlock_secret.clone())?;
                 self.store_committed_unlock_secret(&unlock_secret)?;
                 Ok(database_key)
             }
-            (false, Some(UnlockSecret::Pending(_))) => self.create_database_key(),
-            (true, None) => Err(KeyManagerError::RecoveryRequired(
+            (SnapshotPresence::Missing, Some(UnlockSecret::Pending(unlock_secret))) => {
+                self.recover_database_key(unlock_secret)
+            }
+            (SnapshotPresence::Present, None) => Err(KeyManagerError::RecoveryRequired(
                 "vault exists but its OS unlock secret is missing",
             )),
-            (false, Some(UnlockSecret::Committed(_))) => Err(KeyManagerError::RecoveryRequired(
-                "OS unlock secret exists but its vault is missing",
-            )),
+            (SnapshotPresence::Missing, Some(UnlockSecret::Committed(_))) => {
+                Err(KeyManagerError::RecoveryRequired(
+                    "OS unlock secret exists but its vault is missing",
+                ))
+            }
         }
     }
 
@@ -163,6 +166,23 @@ impl<S: SecretStore + ?Sized> KeyManager<S> {
         getrandom::fill(&mut unlock_secret).map_err(|_| KeyManagerError::Randomness)?;
         let pending_secret = encode_pending_unlock_secret(&unlock_secret);
         self.secrets.store(&pending_secret)?;
+        self.publish_database_key(unlock_secret, database_key)
+    }
+
+    fn recover_database_key(
+        &self,
+        unlock_secret: DatabaseKey,
+    ) -> Result<DatabaseKey, KeyManagerError> {
+        let mut database_key = Zeroizing::new(vec![0_u8; 32]);
+        getrandom::fill(&mut database_key).map_err(|_| KeyManagerError::Randomness)?;
+        self.publish_database_key(unlock_secret, database_key)
+    }
+
+    fn publish_database_key(
+        &self,
+        unlock_secret: DatabaseKey,
+        database_key: DatabaseKey,
+    ) -> Result<DatabaseKey, KeyManagerError> {
         let parent = self
             .snapshot_path
             .parent()
@@ -210,6 +230,35 @@ impl<S: SecretStore + ?Sized> KeyManager<S> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SnapshotPresence {
+    Missing,
+    Present,
+}
+
+fn snapshot_presence(snapshot_path: &Path) -> Result<SnapshotPresence, KeyManagerError> {
+    #[cfg(test)]
+    if let Some(error_kind) = tests::take_snapshot_metadata_failure() {
+        return classify_snapshot_metadata(Err(std::io::Error::from(error_kind)));
+    }
+    classify_snapshot_metadata(std::fs::symlink_metadata(snapshot_path))
+}
+
+fn classify_snapshot_metadata(
+    metadata: std::io::Result<std::fs::Metadata>,
+) -> Result<SnapshotPresence, KeyManagerError> {
+    match metadata {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(SnapshotPresence::Present),
+        Ok(_) => Err(KeyManagerError::RecoveryRequired(
+            "vault path is not a regular file",
+        )),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(SnapshotPresence::Missing),
+        Err(_) => Err(KeyManagerError::RecoveryRequired(
+            "vault path could not be inspected",
+        )),
+    }
+}
+
 enum UnlockSecret {
     Committed(DatabaseKey),
     Pending(DatabaseKey),
@@ -250,8 +299,14 @@ impl SnapshotInitializationLock {
         let mut lock_name = file_name.to_os_string();
         lock_name.push(".lock");
         let lock_path = snapshot_path.with_file_name(lock_name);
+        match std::fs::symlink_metadata(&lock_path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Ok(_) | Err(_) => return Err(KeyManagerError::InitializationLock),
+        }
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(lock_path)
@@ -270,11 +325,9 @@ impl Drop for SnapshotInitializationLock {
 
 struct ExportedDatabaseKey(DatabaseKey);
 
-impl TryFrom<ProcedureOutput> for ExportedDatabaseKey {
-    type Error = Infallible;
-
-    fn try_from(output: ProcedureOutput) -> Result<Self, Self::Error> {
-        Ok(Self(Zeroizing::new(Vec::<u8>::from(output))))
+impl From<ProcedureOutput> for ExportedDatabaseKey {
+    fn from(output: ProcedureOutput) -> Self {
+        Self(Zeroizing::new(Vec::<u8>::from(output)))
     }
 }
 
@@ -432,7 +485,9 @@ mod tests {
     use iota_stronghold::{KeyProvider, SnapshotPath, Stronghold};
     use std::{
         cell::Cell,
+        io::ErrorKind,
         panic::{catch_unwind, AssertUnwindSafe},
+        path::Path,
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc, Barrier, Mutex,
@@ -450,6 +505,7 @@ mod tests {
 
     thread_local! {
         static LEGACY_MIGRATION_FAILURE: Cell<Option<LegacyMigrationFailure>> = const { Cell::new(None) };
+        static SNAPSHOT_METADATA_FAILURE: Cell<Option<ErrorKind>> = const { Cell::new(None) };
     }
 
     fn fail_next_legacy_migration_at(failure: LegacyMigrationFailure) {
@@ -465,6 +521,103 @@ mod tests {
                 false
             }
         })
+    }
+
+    fn fail_next_snapshot_metadata_with(error_kind: ErrorKind) {
+        SNAPSHOT_METADATA_FAILURE.with(|pending| pending.set(Some(error_kind)));
+    }
+
+    pub(super) fn take_snapshot_metadata_failure() -> Option<ErrorKind> {
+        SNAPSHOT_METADATA_FAILURE.with(|pending| pending.take())
+    }
+
+    #[derive(Default)]
+    struct RecordingSecretStore {
+        inner: MemorySecretStore,
+        stores: Mutex<Vec<super::DatabaseKey>>,
+    }
+
+    impl RecordingSecretStore {
+        fn seed(&self, value: &[u8]) {
+            self.inner.store(value).unwrap();
+        }
+
+        fn stored_values(&self) -> Vec<super::DatabaseKey> {
+            self.stores.lock().unwrap().clone()
+        }
+    }
+
+    impl SecretStore for RecordingSecretStore {
+        fn load(&self) -> Result<Option<super::DatabaseKey>, KeyManagerError> {
+            self.inner.load()
+        }
+
+        fn store(&self, value: &[u8]) -> Result<(), KeyManagerError> {
+            self.stores
+                .lock()
+                .map_err(|_| KeyManagerError::SecretStore)?
+                .push(super::DatabaseKey::new(value.to_vec()));
+            self.inner.store(value)
+        }
+
+        fn delete(&self) -> Result<(), KeyManagerError> {
+            self.inner.delete()
+        }
+    }
+
+    const TEST_UNLOCK_SECRET: &[u8; 32] = b"0123456789ABCDEF0123456789ABCDEF";
+
+    fn pending_test_secret() -> super::DatabaseKey {
+        super::encode_pending_unlock_secret(TEST_UNLOCK_SECRET)
+    }
+
+    fn assert_error_has_no_sensitive_data(error: &KeyManagerError, sensitive_path: &Path) {
+        let rendered = error.to_string();
+        let path = sensitive_path.to_string_lossy();
+        let file_name = sensitive_path.file_name().unwrap().to_string_lossy();
+        let unlock_secret = String::from_utf8_lossy(TEST_UNLOCK_SECRET);
+        assert!(!rendered.contains(path.as_ref()));
+        assert!(!rendered.contains(file_name.as_ref()));
+        assert!(!rendered.contains(unlock_secret.as_ref()));
+    }
+
+    fn assert_recovery_error_is_redacted(
+        error: &KeyManagerError,
+        expected_reason: &'static str,
+        sensitive_path: &Path,
+    ) {
+        assert!(matches!(
+            error,
+            KeyManagerError::RecoveryRequired(reason) if *reason == expected_reason
+        ));
+        assert_error_has_no_sensitive_data(error, sensitive_path);
+    }
+
+    fn snapshot_lock_path(snapshot_path: &Path) -> std::path::PathBuf {
+        let mut lock_name = snapshot_path.file_name().unwrap().to_os_string();
+        lock_name.push(".lock");
+        snapshot_path.with_file_name(lock_name)
+    }
+
+    #[cfg(unix)]
+    fn create_test_file_symlink(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).unwrap();
+        true
+    }
+
+    #[cfg(windows)]
+    fn create_test_file_symlink(target: &Path, link: &Path) -> bool {
+        const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+        match std::os::windows::fs::symlink_file(target, link) {
+            Ok(()) => true,
+            Err(error)
+                if error.kind() == ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) =>
+            {
+                false
+            }
+            Err(error) => panic!("failed to create test symlink: {error}"),
+        }
     }
 
     struct FailOnceSecretStore {
@@ -782,6 +935,127 @@ mod tests {
     }
 
     #[test]
+    fn permission_denied_snapshot_metadata_preserves_pending_secret_without_store() {
+        let temp = tempdir().unwrap();
+        let snapshot = temp.path().join("sensitive-metadata-path.stronghold");
+        let pending = pending_test_secret();
+        let secrets = Arc::new(RecordingSecretStore::default());
+        secrets.seed(&pending);
+        let manager = KeyManager::new(&snapshot, secrets.clone());
+
+        fail_next_snapshot_metadata_with(ErrorKind::PermissionDenied);
+        let result = manager.database_key();
+        let _ = take_snapshot_metadata_failure();
+        let error = result.unwrap_err();
+
+        assert_recovery_error_is_redacted(&error, "vault path could not be inspected", &snapshot);
+        assert!(secrets.stored_values().is_empty());
+        assert_eq!(
+            secrets.inner.load().unwrap().unwrap().as_slice(),
+            pending.as_slice()
+        );
+    }
+
+    #[test]
+    fn broken_snapshot_symlink_is_rejected_without_credential_mutation() {
+        let temp = tempdir().unwrap();
+        let snapshot = temp.path().join("sensitive-broken-link.stronghold");
+        let missing_target = temp.path().join("missing-snapshot-target");
+        if !create_test_file_symlink(&missing_target, &snapshot) {
+            return;
+        }
+        let pending = pending_test_secret();
+        let secrets = Arc::new(RecordingSecretStore::default());
+        secrets.seed(&pending);
+
+        let error = KeyManager::new(&snapshot, secrets.clone())
+            .database_key()
+            .unwrap_err();
+
+        assert_recovery_error_is_redacted(&error, "vault path is not a regular file", &snapshot);
+        assert!(secrets.stored_values().is_empty());
+        assert_eq!(
+            secrets.inner.load().unwrap().unwrap().as_slice(),
+            pending.as_slice()
+        );
+    }
+
+    #[test]
+    fn missing_snapshot_with_pending_secret_reuses_identical_unlock_secret() {
+        let temp = tempdir().unwrap();
+        let snapshot = temp.path().join("pending-recovery.stronghold");
+        let pending = pending_test_secret();
+        let secrets = Arc::new(RecordingSecretStore::default());
+        secrets.seed(&pending);
+
+        let database_key = KeyManager::new(&snapshot, secrets.clone())
+            .database_key()
+            .unwrap();
+
+        let stored_values = secrets.stored_values();
+        assert_eq!(stored_values.len(), 1);
+        assert_eq!(stored_values[0].as_slice(), TEST_UNLOCK_SECRET);
+        assert_eq!(
+            secrets.inner.load().unwrap().unwrap().as_slice(),
+            TEST_UNLOCK_SECRET
+        );
+        let reopened = super::read_database_key(
+            &snapshot,
+            super::DatabaseKey::new(TEST_UNLOCK_SECRET.to_vec()),
+        )
+        .unwrap();
+        assert_eq!(reopened.as_slice(), database_key.as_slice());
+    }
+
+    #[test]
+    fn snapshot_directory_is_rejected_as_non_regular() {
+        let temp = tempdir().unwrap();
+        let snapshot = temp.path().join("sensitive-snapshot-directory");
+        std::fs::create_dir(&snapshot).unwrap();
+        let pending = pending_test_secret();
+        let secrets = Arc::new(RecordingSecretStore::default());
+        secrets.seed(&pending);
+
+        let error = KeyManager::new(&snapshot, secrets.clone())
+            .database_key()
+            .unwrap_err();
+
+        assert_recovery_error_is_redacted(&error, "vault path is not a regular file", &snapshot);
+        assert!(secrets.stored_values().is_empty());
+        assert_eq!(
+            secrets.inner.load().unwrap().unwrap().as_slice(),
+            pending.as_slice()
+        );
+    }
+
+    #[test]
+    fn symlinked_initialization_lock_is_rejected() {
+        let temp = tempdir().unwrap();
+        let snapshot = temp.path().join("sensitive-lock-snapshot.stronghold");
+        let lock_path = snapshot_lock_path(&snapshot);
+        let lock_target = temp.path().join("sensitive-lock-target");
+        std::fs::write(&lock_target, b"existing lock target").unwrap();
+        if !create_test_file_symlink(&lock_target, &lock_path) {
+            return;
+        }
+        let pending = pending_test_secret();
+        let secrets = Arc::new(RecordingSecretStore::default());
+        secrets.seed(&pending);
+
+        let error = KeyManager::new(&snapshot, secrets.clone())
+            .database_key()
+            .unwrap_err();
+
+        assert!(matches!(error, KeyManagerError::InitializationLock));
+        assert_error_has_no_sensitive_data(&error, &lock_path);
+        assert!(secrets.stored_values().is_empty());
+        assert_eq!(
+            secrets.inner.load().unwrap().unwrap().as_slice(),
+            pending.as_slice()
+        );
+    }
+
+    #[test]
     fn unrelated_unlock_secret_for_existing_vault_requires_recovery() {
         let temp = tempdir().unwrap();
         let snapshot = temp.path().join("unrelated-secret.stronghold");
@@ -952,7 +1226,7 @@ mod tests {
     #[test]
     fn database_key_uses_the_zeroizing_stronghold_vault_api() {
         let production = include_str!("key_manager.rs")
-            .split("#[cfg(test)]")
+            .split("\nmod tests {")
             .next()
             .unwrap();
 

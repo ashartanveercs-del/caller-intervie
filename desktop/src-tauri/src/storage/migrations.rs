@@ -348,7 +348,7 @@ fn is_provably_non_null_literal(default_value: &str) -> bool {
         && is_quoted_literal(&value[1..])
     {
         let hex = &value[2..value.len() - 1];
-        return hex.len() % 2 == 0 && hex.bytes().all(|byte| byte.is_ascii_hexdigit());
+        return hex.len().is_multiple_of(2) && hex.bytes().all(|byte| byte.is_ascii_hexdigit());
     }
     let numeric = value
         .strip_prefix('+')
