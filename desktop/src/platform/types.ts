@@ -8,6 +8,24 @@ export type SidecarStatus = {
   diagnostics: string[];
 };
 
+export type StorageHealthStatus = "pending" | "ready" | "degraded" | "error";
+
+export type StorageHealth = {
+  status: StorageHealthStatus;
+  code?: string;
+  message?: string;
+  recoverable: boolean;
+};
+
+export type RequestTurnAssociation = {
+  requestId: string;
+  turnId: string;
+};
+
+export type AssociateRequestWithTurnInput = RequestTurnAssociation & {
+  sessionId: string;
+};
+
 export type SessionStatus = "active" | "completed" | "interrupted";
 
 export type SessionBrief = Record<string, unknown>;
@@ -38,9 +56,13 @@ export type SessionRecord = {
 
 export interface PlatformApi {
   sidecarStatus(): Promise<SidecarStatus>;
+  storageHealth(): Promise<StorageHealth>;
   send(command: Envelope): Promise<void>;
   restartSidecar(): Promise<SidecarStatus>;
   subscribe(listener: (event: Envelope) => void): Promise<() => void>;
+  subscribeStorageHealth(listener: (health: StorageHealth) => void): Promise<() => void>;
+  associateRequestWithTurn(input: AssociateRequestWithTurnInput): Promise<void>;
+  getRequestTurnAssociations(sessionId: string): Promise<RequestTurnAssociation[]>;
   createSession(input: CreateSessionInput): Promise<SessionRecord>;
   saveSessionBrief(input: SaveSessionBriefInput): Promise<void>;
   completeSession(sessionId: string, status: "completed" | "interrupted"): Promise<void>;

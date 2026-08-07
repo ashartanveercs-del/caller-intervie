@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { EventKind, type Envelope } from "../shared/protocol";
+import type { StorageHealth } from "../platform";
 import { createSessionStore } from "./sessionStore";
 
 const ids = {
@@ -172,6 +173,52 @@ describe("session store", () => {
     expect(store.getState().health.modelProvider).toMatchObject({ status: "ready" });
   });
 
+  it("tracks host storage health from pending through recovery", () => {
+    const store = createSessionStore();
+
+    expect(store.getState().health.storage).toEqual({ status: "pending", recoverable: false });
+    store.getState().setStorageHealth({
+      status: "degraded",
+      code: "storage-unavailable",
+      message: "Storage temporarily unavailable",
+      recoverable: true,
+    });
+    expect(store.getState().health.storage).toEqual({
+      status: "degraded",
+      code: "storage-unavailable",
+      message: "Storage temporarily unavailable",
+      recoverable: true,
+    });
+
+    store.getState().setStorageHealth({ status: "ready", recoverable: false });
+
+    expect(store.getState().health.storage).toEqual({ status: "ready", recoverable: false });
+  });
+
+  it.each([
+    { status: "ready", recoverable: false },
+    {
+      status: "degraded",
+      code: "storage-unavailable",
+      message: "Storage temporarily unavailable",
+      recoverable: true,
+    },
+    {
+      status: "error",
+      code: "storage-corrupt",
+      message: "Storage requires repair",
+      recoverable: false,
+    },
+  ] satisfies StorageHealth[])("preserves $status storage health across a sidecar restart", (storageHealth) => {
+    const store = createSessionStore();
+    store.getState().setStorageHealth(storageHealth);
+
+    store.getState().clearTransientState();
+
+    expect(store.getState().health.storage).toEqual(storageHealth);
+    expect(store.getState().health.sidecar).toEqual({ status: "pending" });
+  });
+
   it("clears only transient state after a sidecar restart", () => {
     const store = createSessionStore();
     store.getState().restoreSession({
@@ -222,6 +269,51 @@ describe("session store", () => {
 
     expect(store.getState().turns).toHaveLength(2);
     expect(store.getState().unresolvedSuggestionCorrelations).toEqual([ids.queryOne]);
+  });
+
+  it("keeps a persisted completed suggestion unresolved without a durable association", () => {
+    const store = createSessionStore();
+    activate(store);
+    const turn = question(ids.questionOne, "Only question", 1);
+    const answer = event(
+      EventKind.SUGGESTION_COMPLETED,
+      { suggestion_id: "suggestion-unmapped", text: "Unmapped answer" },
+      { correlation_id: ids.queryOne, sequence: 2 },
+    );
+
+    store.getState().restoreReplay([turn, answer]);
+
+    expect(store.getState().suggestionsByTurn).toEqual({});
+    expect(store.getState().unresolvedCompletedSuggestionsById["suggestion-unmapped"]).toMatchObject({
+      correlationId: ids.queryOne,
+      text: "Unmapped answer",
+    });
+  });
+
+  it("replays timeline envelopes in the host-provided order", () => {
+    const store = createSessionStore();
+    activate(store);
+    const firstFromHost = question(ids.questionOne, "First from host", 2);
+    const secondFromHost = question(ids.questionTwo, "Second from host", 1);
+
+    store.getState().restoreReplay([
+      { ...firstFromHost, timestamp_ms: 200 },
+      { ...secondFromHost, timestamp_ms: 100 },
+    ]);
+
+    expect(store.getState().turns.map((turn) => turn.text)).toEqual(["First from host", "Second from host"]);
+  });
+
+  it("keeps the first durable request mapping when a conflicting replay mapping appears", () => {
+    const store = createSessionStore();
+    activate(store);
+
+    store.getState().associateRequestWithTurn(ids.queryOne, ids.questionOne);
+    store.getState().associateRequestWithTurn(ids.queryOne, ids.questionOne);
+    store.getState().associateRequestWithTurn(ids.queryOne, ids.questionTwo);
+
+    expect(store.getState().requestToTurn).toEqual({ [ids.queryOne]: ids.questionOne });
+    expect(store.getState().lastError).toMatch(/conflict/i);
   });
 
   it("rejects malformed envelopes without corrupting state", () => {

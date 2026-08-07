@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, type ReactNode } from "react";
 import type { StoreApi } from "zustand/vanilla";
 import { CommandKind, type Envelope } from "../shared/protocol";
-import { createPlatform, type PlatformApi, type SidecarStatus } from "../platform";
+import { createPlatform, type PlatformApi, type SidecarStatus, type StorageHealth } from "../platform";
 import { createSessionStore, type SessionStoreState } from "../stores/sessionStore";
 
 type RuntimeContextValue = {
@@ -25,6 +25,15 @@ type RestoreLifecycle = {
   version: number;
 };
 
+type StorageHealthLifecycle = {
+  users: number;
+  disposed: boolean;
+  releaseTimer: ReturnType<typeof setTimeout> | null;
+  unlisten: (() => void) | null;
+  eventRevision: number;
+  ready: Promise<void>;
+};
+
 const RuntimeContext = createContext<RuntimeContextValue | null>(null);
 
 export type RuntimeProviderProps = {
@@ -36,6 +45,7 @@ export function RuntimeProvider({ children, platform: suppliedPlatform }: Runtim
   const platformRef = useRef<PlatformApi | null>(null);
   const storeRef = useRef<StoreApi<SessionStoreState> | null>(null);
   const lifecycleRef = useRef<SubscriptionLifecycle | null>(null);
+  const storageHealthLifecycleRef = useRef<StorageHealthLifecycle | null>(null);
   const restoreLifecycleRef = useRef<RestoreLifecycle | null>(null);
   const startedRef = useRef(false);
 
@@ -83,6 +93,13 @@ export function RuntimeProvider({ children, platform: suppliedPlatform }: Runtim
         }
         store.getState().restoreSession(session);
         const restoredRevision = store.getState().sessionRevision;
+        const associations = await platform.getRequestTurnAssociations(session.id);
+        if (!isCurrent() || store.getState().session?.id !== session.id || store.getState().sessionRevision !== restoredRevision) {
+          return;
+        }
+        for (const association of associations) {
+          store.getState().associateRequestWithTurn(association.requestId, association.turnId);
+        }
         const timeline = await platform.getTimeline(session.id);
         if (!isCurrent() || store.getState().session?.id !== session.id || store.getState().sessionRevision !== restoredRevision) {
           return;
@@ -97,6 +114,50 @@ export function RuntimeProvider({ children, platform: suppliedPlatform }: Runtim
   }, [platform, store]);
 
   useEffect(() => {
+    let lifecycle = storageHealthLifecycleRef.current;
+    if (!lifecycle) {
+      lifecycle = {
+        users: 0,
+        disposed: false,
+        releaseTimer: null,
+        unlisten: null,
+        eventRevision: 0,
+        ready: Promise.resolve(),
+      };
+      lifecycle.ready = platform.subscribeStorageHealth((health: StorageHealth) => {
+        lifecycle!.eventRevision += 1;
+        if (isSubscriptionActive(lifecycle!)) {
+          store.getState().setStorageHealth(health);
+        }
+      })
+        .then(async (unlisten) => {
+          lifecycle!.unlisten = unlisten;
+          if (!isSubscriptionActive(lifecycle!)) {
+            unlisten();
+            lifecycle!.unlisten = null;
+            return;
+          }
+          const eventRevision = lifecycle!.eventRevision;
+          const health = await platform.storageHealth();
+          if (isSubscriptionActive(lifecycle!) && lifecycle!.eventRevision === eventRevision) {
+            store.getState().setStorageHealth(health);
+          }
+        })
+        .catch((error) => {
+          if (isSubscriptionActive(lifecycle!)) store.getState().recordError(error);
+        });
+      storageHealthLifecycleRef.current = lifecycle;
+    }
+    lifecycle.users += 1;
+    if (lifecycle.releaseTimer !== null) {
+      clearTimeout(lifecycle.releaseTimer);
+      lifecycle.releaseTimer = null;
+    }
+
+    return () => releaseSubscriptionLifecycle(lifecycle!, storageHealthLifecycleRef);
+  }, [platform, store]);
+
+  useEffect(() => {
     let lifecycle = lifecycleRef.current;
     if (!lifecycle) {
       lifecycle = {
@@ -106,15 +167,19 @@ export function RuntimeProvider({ children, platform: suppliedPlatform }: Runtim
         unlisten: null,
         ready: Promise.resolve(),
       };
-      lifecycle.ready = platform.subscribe((event) => store.getState().applyEnvelope(event))
+      lifecycle.ready = platform.subscribe((event) => {
+        if (isSubscriptionActive(lifecycle!)) store.getState().applyEnvelope(event);
+      })
         .then((unlisten) => {
           lifecycle!.unlisten = unlisten;
-          if (lifecycle!.disposed) {
+          if (!isSubscriptionActive(lifecycle!)) {
             unlisten();
             lifecycle!.unlisten = null;
           }
         })
-        .catch(store.getState().recordError);
+        .catch((error) => {
+          if (isSubscriptionActive(lifecycle!)) store.getState().recordError(error);
+        });
       lifecycleRef.current = lifecycle;
     }
     lifecycle.users += 1;
@@ -141,8 +206,29 @@ export function RuntimeProvider({ children, platform: suppliedPlatform }: Runtim
   }, [platform, store]);
 
   const send = useCallback(async (command: Envelope, questionTurnId?: string) => {
-    if (command.kind === CommandKind.QUERY_TRIGGER && questionTurnId) {
-      store.getState().associateRequestWithTurn(command.id, questionTurnId);
+    if (command.kind === CommandKind.QUERY_TRIGGER) {
+      if (!questionTurnId) {
+        const error = new Error("query request requires a question turn association");
+        store.getState().recordError(error);
+        throw error;
+      }
+      const activeSession = store.getState().session;
+      if (!activeSession || activeSession.status !== "active" || activeSession.id !== command.session_id) {
+        const error = new Error("query request must target the active session before associating a question turn");
+        store.getState().recordError(error);
+        throw error;
+      }
+      try {
+        await platform.associateRequestWithTurn({
+          sessionId: activeSession.id,
+          requestId: command.id,
+          turnId: questionTurnId,
+        });
+        store.getState().associateRequestWithTurn(command.id, questionTurnId);
+      } catch (error) {
+        store.getState().recordError(error);
+        throw error;
+      }
     }
     try {
       await platform.send(command);
@@ -178,6 +264,25 @@ function releaseRestoreLifecycle(
   lifecycle.releaseTimer = setTimeout(() => {
     if (lifecycle.users !== 0) return;
     lifecycle.version += 1;
+    reference.current = null;
+  }, 0);
+}
+
+function isSubscriptionActive(lifecycle: SubscriptionLifecycle | StorageHealthLifecycle) {
+  return lifecycle.users > 0 && !lifecycle.disposed;
+}
+
+function releaseSubscriptionLifecycle(
+  lifecycle: SubscriptionLifecycle | StorageHealthLifecycle,
+  reference: { current: SubscriptionLifecycle | StorageHealthLifecycle | null },
+) {
+  lifecycle.users -= 1;
+  if (lifecycle.users !== 0) return;
+  lifecycle.releaseTimer = setTimeout(() => {
+    if (lifecycle.users !== 0) return;
+    lifecycle.disposed = true;
+    lifecycle.unlisten?.();
+    lifecycle.unlisten = null;
     reference.current = null;
   }, 0);
 }

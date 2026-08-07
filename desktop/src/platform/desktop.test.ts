@@ -69,6 +69,48 @@ describe("desktop platform", () => {
     expect(unlisten).toHaveBeenCalledTimes(1);
   });
 
+  it("uses durable association DTOs and redacts storage health events", async () => {
+    const unlisten = vi.fn();
+    let callback: ((event: { payload: unknown }) => void) | undefined;
+    listen.mockImplementationOnce(async (_event, handler) => {
+      callback = handler;
+      return unlisten;
+    });
+    invoke
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce([{ request_id: command.id, turn_id: sessionId }])
+      .mockResolvedValueOnce({ status: "ready", recoverable: false, internal_path: "must-not-leak" });
+    const platform = createDesktopPlatform();
+    const received: unknown[] = [];
+
+    await platform.associateRequestWithTurn({ sessionId, requestId: command.id, turnId: sessionId });
+    expect(await platform.getRequestTurnAssociations(sessionId)).toEqual([{ requestId: command.id, turnId: sessionId }]);
+    expect(await platform.storageHealth()).toEqual({ status: "ready", recoverable: false });
+    const cleanup = await platform.subscribeStorageHealth((health) => received.push(health));
+    callback?.({ payload: {
+      status: "degraded",
+      code: "storage-unavailable",
+      message: "Storage temporarily unavailable",
+      recoverable: true,
+      raw_database_error: "must-not-leak",
+    } });
+    cleanup();
+
+    expect(invoke.mock.calls).toEqual([
+      ["associate_request_with_turn", { input: { session_id: sessionId, request_id: command.id, turn_id: sessionId } }],
+      ["get_request_turn_associations", { sessionId }],
+      ["storage_health"],
+    ]);
+    expect(listen).toHaveBeenCalledWith("storage://health", expect.any(Function));
+    expect(received).toEqual([{
+      status: "degraded",
+      code: "storage-unavailable",
+      message: "Storage temporarily unavailable",
+      recoverable: true,
+    }]);
+    expect(unlisten).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps storage DTO argument shapes localized to native invokes", async () => {
     invoke
       .mockResolvedValueOnce(sessionDto)

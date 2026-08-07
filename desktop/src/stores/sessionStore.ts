@@ -1,6 +1,6 @@
 import { createStore, type StoreApi } from "zustand/vanilla";
 import { decodeEnvelope, EventKind, type Envelope } from "../shared/protocol";
-import type { SessionRecord, SessionStatus, SidecarStatus } from "../platform";
+import type { SessionRecord, SessionStatus, SidecarStatus, StorageHealth } from "../platform";
 
 export type RuntimeHealthStatus = "unknown" | "pending" | "ready" | "degraded" | "error" | "offline";
 
@@ -10,6 +10,7 @@ export type DependencyHealth = {
 };
 
 export type RuntimeHealth = {
+  storage: StorageHealth;
   sidecar: DependencyHealth;
   microphone: DependencyHealth;
   systemAudio: DependencyHealth;
@@ -80,6 +81,7 @@ export type SessionStoreState = {
   clearTransientState(): void;
   setLanguages(languages: SessionLanguages): void;
   setSidecarStatus(status: SidecarStatus): void;
+  setStorageHealth(health: StorageHealth): void;
   recordError(error: unknown): void;
 };
 
@@ -89,6 +91,7 @@ const initialLanguages: SessionLanguages = { ui: "en", input: "en", response: "e
 
 function unknownHealth(): RuntimeHealth {
   return {
+    storage: { status: "pending", recoverable: false },
     sidecar: { status: "unknown" },
     microphone: { status: "unknown" },
     systemAudio: { status: "unknown" },
@@ -183,6 +186,11 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
         ingest(value, "persisted");
       },
       associateRequestWithTurn(requestId, turnId) {
+        const existingTurnId = get().requestToTurn[requestId];
+        if (existingTurnId && existingTurnId !== turnId) {
+          get().recordError(`request association conflict for ${requestId}`);
+          return;
+        }
         set((state) => {
           const unresolved = Object.values(state.unresolvedCompletedSuggestionsById)
             .filter((suggestion) => suggestion.correlationId === requestId)
@@ -228,7 +236,7 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
           : resetForSession(state, session));
       },
       restoreReplay(events) {
-        for (const event of [...events].sort(compareChronologically)) {
+        for (const event of events) {
           ingest(event, "persisted");
         }
       },
@@ -237,8 +245,7 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
           partialTurnsById: {},
           partialSuggestionsById: {},
           partialSuggestionIdByCorrelation: {},
-          requestToTurn: {},
-          health: { ...unknownHealth(), sidecar: { status: "pending" } },
+          health: { ...unknownHealth(), storage: state.health.storage, sidecar: { status: "pending" } },
           sidecarGeneration: state.sidecarGeneration + 1,
           lastSequence: -1,
           lastError: null,
@@ -254,6 +261,9 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
             sidecar: { status: sidecarHealth(status.state), message: status.diagnostics[0] },
           },
         }));
+      },
+      setStorageHealth(health) {
+        set((state) => ({ health: { ...state.health, storage: { ...health } } }));
       },
       recordError(error) {
         set({ lastError: errorMessage(error) });
@@ -344,8 +354,7 @@ function applySuggestion(
   }
   const correlationId = envelope.correlation_id;
   const associatedTurnId = correlationId ? state.requestToTurn[correlationId] : undefined;
-  const replayTurnId = !associatedTurnId && source === "persisted" ? deriveReplayTurnId(state) : undefined;
-  const turnId = associatedTurnId ?? replayTurnId;
+  const turnId = associatedTurnId;
   const prior = state.partialSuggestionsById[suggestionId];
   const suggestion: Suggestion = {
     id: suggestionId,
@@ -438,12 +447,6 @@ function hasCompletedSuggestion(state: SessionStoreState, suggestionId: string):
     || suggestionId in state.unresolvedCompletedSuggestionsById;
 }
 
-function deriveReplayTurnId(state: SessionStoreState): string | undefined {
-  const candidates = state.turns.filter((turn) =>
-    turn.speakerRole === "interviewer" && !state.suggestionsByTurn[turn.id]);
-  return candidates.length === 1 ? candidates[0].id : undefined;
-}
-
 function applyHealth(set: StoreApi<SessionStoreState>["setState"], envelope: Envelope) {
   const dependency = envelope.kind === EventKind.AUDIO_HEALTH
     ? audioHealthKey(stringPayload(envelope.payload, "source"))
@@ -530,26 +533,6 @@ function sidecarHealth(state: SidecarStatus["state"]): RuntimeHealthStatus {
     case "stopped": return "offline";
     case "failed": return "error";
   }
-}
-
-function compareChronologically(left: unknown, right: unknown): number {
-  const leftTimestamp = timestampOf(left);
-  const rightTimestamp = timestampOf(right);
-  return leftTimestamp === rightTimestamp ? sequenceOf(left) - sequenceOf(right) : leftTimestamp - rightTimestamp;
-}
-
-function timestampOf(value: unknown): number {
-  return objectNumber(value, "timestamp_ms") ?? Number.MAX_SAFE_INTEGER;
-}
-
-function sequenceOf(value: unknown): number {
-  return objectNumber(value, "sequence") ?? Number.MAX_SAFE_INTEGER;
-}
-
-function objectNumber(value: unknown, key: string): number | undefined {
-  if (typeof value !== "object" || value === null || !(key in value)) return undefined;
-  const candidate = (value as Record<string, unknown>)[key];
-  return typeof candidate === "number" ? candidate : undefined;
 }
 
 function errorMessage(error: unknown): string {

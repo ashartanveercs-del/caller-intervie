@@ -3,19 +3,35 @@ import { listen } from "@tauri-apps/api/event";
 import { decodeEnvelope } from "../shared/protocol";
 import type {
   CreateSessionInput,
+  AssociateRequestWithTurnInput,
   PlatformApi,
+  RequestTurnAssociation,
   SaveSessionBriefInput,
   SessionBrief,
   SessionRecord,
   SessionStatus,
   SidecarState,
   SidecarStatus,
+  StorageHealth,
+  StorageHealthStatus,
 } from "./types";
 
 type SidecarStatusDto = {
   state: SidecarState;
   restartCount: number;
   diagnostics: string[];
+};
+
+type StorageHealthDto = {
+  status: StorageHealthStatus;
+  code?: string;
+  message?: string;
+  recoverable: boolean;
+};
+
+type RequestTurnAssociationDto = {
+  request_id: string;
+  turn_id: string;
 };
 
 // These DTOs deliberately stay in the adapter until Task 9's native types land.
@@ -37,6 +53,19 @@ function mapStatus(dto: SidecarStatusDto): SidecarStatus {
     restartCount: dto.restartCount,
     diagnostics: dto.diagnostics,
   };
+}
+
+function mapStorageHealth(dto: StorageHealthDto): StorageHealth {
+  return {
+    status: dto.status,
+    ...(typeof dto.code === "string" ? { code: dto.code } : {}),
+    ...(typeof dto.message === "string" ? { message: dto.message } : {}),
+    recoverable: dto.recoverable === true,
+  };
+}
+
+function mapRequestTurnAssociation(dto: RequestTurnAssociationDto): RequestTurnAssociation {
+  return { requestId: dto.request_id, turnId: dto.turn_id };
 }
 
 function mapSession(dto: SessionDto): SessionRecord {
@@ -61,6 +90,9 @@ export function createDesktopPlatform(): PlatformApi {
     async sidecarStatus() {
       return mapStatus(await invoke<SidecarStatusDto>("sidecar_status"));
     },
+    async storageHealth() {
+      return mapStorageHealth(await invoke<StorageHealthDto>("storage_health"));
+    },
     async send(command) {
       await invoke("send_sidecar_command", { command: decodeEnvelope(command) });
     },
@@ -69,6 +101,16 @@ export function createDesktopPlatform(): PlatformApi {
     },
     async subscribe(listener) {
       return listen<unknown>("sidecar://event", (event) => listener(decodeEnvelope(event.payload)));
+    },
+    async subscribeStorageHealth(listener) {
+      return listen<StorageHealthDto>("storage://health", (event) => listener(mapStorageHealth(event.payload)));
+    },
+    async associateRequestWithTurn(input) {
+      await invoke("associate_request_with_turn", { input: toRequestTurnAssociationDto(input) });
+    },
+    async getRequestTurnAssociations(sessionId) {
+      const associations = await invoke<RequestTurnAssociationDto[]>("get_request_turn_associations", { sessionId });
+      return associations.map(mapRequestTurnAssociation);
     },
     async createSession(input) {
       const dto = await invoke<SessionDto>("create_session", { input: toCreateSessionDto(input) });
@@ -113,4 +155,12 @@ function toCreateSessionDto(input: CreateSessionInput) {
 
 function toSaveSessionBriefDto(input: SaveSessionBriefInput) {
   return { session_id: input.sessionId, brief: input.brief };
+}
+
+function toRequestTurnAssociationDto(input: AssociateRequestWithTurnInput) {
+  return {
+    session_id: input.sessionId,
+    request_id: input.requestId,
+    turn_id: input.turnId,
+  };
 }
