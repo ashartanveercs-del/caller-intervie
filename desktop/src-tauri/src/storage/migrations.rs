@@ -1,3 +1,5 @@
+use std::collections::{btree_map::Entry, BTreeMap};
+
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use super::models::{
@@ -94,16 +96,17 @@ fn migrate_v1_to_v2(transaction: &Transaction<'_>) -> Result<(), MigrationError>
     validate_v1_schema(transaction)?;
     let sessions = {
         let mut statement = transaction.prepare(
-            "SELECT workspace_id, session_id, language, started_at_ms, completed_at_ms FROM sessions",
+            "SELECT workspace_id, session_id, title, language, started_at_ms, completed_at_ms FROM sessions",
         )?;
         statement
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?
@@ -123,6 +126,12 @@ fn migrate_v1_to_v2(transaction: &Transaction<'_>) -> Result<(), MigrationError>
             })?
             .collect::<Result<Vec<_>, _>>()?
     };
+    let mut legacy_briefs = briefs
+        .into_iter()
+        .map(|(workspace_id, session_id, summary, updated_at_ms)| {
+            ((workspace_id, session_id), (summary, updated_at_ms))
+        })
+        .collect::<BTreeMap<_, _>>();
     let events = {
         let mut statement = transaction.prepare("SELECT event_id, workspace_id, session_id, host_sequence, source_generation, source_sequence, timestamp_ms, kind, correlation_id, request_id, turn_id, payload_json FROM timeline_events")?;
         statement
@@ -145,13 +154,38 @@ fn migrate_v1_to_v2(transaction: &Transaction<'_>) -> Result<(), MigrationError>
             .collect::<Result<Vec<_>, _>>()?
     };
 
+    let mut associations = BTreeMap::new();
+    for event in &events {
+        let (Some(request_id), Some(turn_id)) = (&event.9, &event.10) else {
+            continue;
+        };
+        if request_id.is_empty() || turn_id.is_empty() {
+            continue;
+        }
+        match associations.entry((event.1.clone(), event.2.clone(), request_id.clone())) {
+            Entry::Vacant(entry) => {
+                entry.insert((turn_id.clone(), event.6));
+            }
+            Entry::Occupied(mut entry) => {
+                let (existing_turn_id, earliest_timestamp_ms) = entry.get_mut();
+                if existing_turn_id != turn_id {
+                    return Err(MigrationError::SchemaIntegrity {
+                        reason: "timeline_events contains conflicting request-to-turn associations"
+                            .to_owned(),
+                    });
+                }
+                *earliest_timestamp_ms = (*earliest_timestamp_ms).min(event.6);
+            }
+        }
+    }
+
     transaction.execute_batch(
         "ALTER TABLE session_briefs RENAME TO session_briefs_v1;
          ALTER TABLE timeline_events RENAME TO timeline_events_v1;
          ALTER TABLE sessions RENAME TO sessions_v1;",
     )?;
     create_v2_schema_without_settings(transaction)?;
-    for (workspace_id, session_id, language, started_at_ms, completed_at_ms) in sessions {
+    for (workspace_id, session_id, title, language, started_at_ms, completed_at_ms) in sessions {
         let status = if completed_at_ms.is_some() {
             SessionStatus::Completed
         } else {
@@ -161,16 +195,28 @@ fn migrate_v1_to_v2(transaction: &Transaction<'_>) -> Result<(), MigrationError>
             "INSERT INTO sessions (workspace_id, session_id, mode, status, ui_language, input_language, response_language, review_language, started_at_ms, completed_at_ms) VALUES (?1, ?2, 'interview', ?3, NULL, ?4, ?4, ?4, ?5, ?6)",
             rusqlite::params![workspace_id, session_id, status.as_db(), language, started_at_ms, completed_at_ms],
         )?;
-    }
-    for (workspace_id, session_id, summary, updated_at_ms) in briefs {
-        let brief_json = serde_json::to_string(&serde_json::json!({ "summary": summary }))
-            .map_err(|error| MigrationError::SchemaIntegrity {
-                reason: error.to_string(),
-            })?;
-        transaction.execute(
-            "INSERT INTO session_briefs (workspace_id, session_id, brief_json, updated_at_ms) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![workspace_id, session_id, brief_json, updated_at_ms],
-        )?;
+        let legacy_brief = legacy_briefs.remove(&(workspace_id.clone(), session_id.clone()));
+        let migrated_brief = match (title, legacy_brief) {
+            (Some(title), Some((summary, updated_at_ms))) => Some((
+                serde_json::json!({ "summary": summary, "title": title }),
+                updated_at_ms,
+            )),
+            (Some(title), None) => Some((serde_json::json!({ "title": title }), started_at_ms)),
+            (None, Some((summary, updated_at_ms))) => {
+                Some((serde_json::json!({ "summary": summary }), updated_at_ms))
+            }
+            (None, None) => None,
+        };
+        if let Some((brief, updated_at_ms)) = migrated_brief {
+            let brief_json =
+                serde_json::to_string(&brief).map_err(|error| MigrationError::SchemaIntegrity {
+                    reason: error.to_string(),
+                })?;
+            transaction.execute(
+                "INSERT INTO session_briefs (workspace_id, session_id, brief_json, updated_at_ms) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![workspace_id, session_id, brief_json, updated_at_ms],
+            )?;
+        }
     }
     for (
         event_id,
@@ -190,6 +236,12 @@ fn migrate_v1_to_v2(transaction: &Transaction<'_>) -> Result<(), MigrationError>
         transaction.execute(
             "INSERT INTO timeline_events (event_id, workspace_id, session_id, host_sequence, source_generation, source_sequence, timestamp_ms, kind, correlation_id, request_id, turn_id, payload_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![event_id, workspace_id, session_id, host_sequence, source_generation, source_sequence, timestamp_ms, kind, correlation_id, request_id, turn_id, payload_json],
+        )?;
+    }
+    for ((workspace_id, session_id, request_id), (turn_id, created_at_ms)) in associations {
+        transaction.execute(
+            "INSERT INTO request_turn_associations (workspace_id, session_id, request_id, turn_id, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![workspace_id, session_id, request_id, turn_id, created_at_ms],
         )?;
     }
     transaction.execute_batch(
@@ -245,6 +297,7 @@ fn validate_current_schema(transaction: &Transaction<'_>) -> Result<(), Migratio
             ColumnSpec::new("started_at_ms", "INTEGER", true, 0),
             ColumnSpec::new("completed_at_ms", "INTEGER", false, 0),
         ],
+        false,
     )?;
     validate_table(
         transaction,
@@ -255,6 +308,7 @@ fn validate_current_schema(transaction: &Transaction<'_>) -> Result<(), Migratio
             ColumnSpec::new("brief_json", "TEXT", true, 0),
             ColumnSpec::new("updated_at_ms", "INTEGER", true, 0),
         ],
+        false,
     )?;
     validate_table(
         transaction,
@@ -266,6 +320,7 @@ fn validate_current_schema(transaction: &Transaction<'_>) -> Result<(), Migratio
             ColumnSpec::new("turn_id", "TEXT", true, 0),
             ColumnSpec::new("created_at_ms", "INTEGER", true, 0),
         ],
+        false,
     )?;
     validate_table(
         transaction,
@@ -284,6 +339,7 @@ fn validate_current_schema(transaction: &Transaction<'_>) -> Result<(), Migratio
             ColumnSpec::new("turn_id", "TEXT", false, 0),
             ColumnSpec::new("payload_json", "TEXT", true, 0),
         ],
+        false,
     )?;
     validate_table(
         transaction,
@@ -293,6 +349,7 @@ fn validate_current_schema(transaction: &Transaction<'_>) -> Result<(), Migratio
             ColumnSpec::new("setting_key", "TEXT", true, 2),
             ColumnSpec::new("value_json", "TEXT", true, 0),
         ],
+        false,
     )?;
 
     validate_unique_indexes(
@@ -325,6 +382,16 @@ fn validate_current_schema(transaction: &Transaction<'_>) -> Result<(), Migratio
         transaction,
         "settings",
         &[UniqueIndexSpec::new("pk", &["workspace_id", "setting_key"])],
+    )?;
+    validate_no_owned_table_triggers(
+        transaction,
+        &[
+            "sessions",
+            "session_briefs",
+            "timeline_events",
+            "request_turn_associations",
+            "settings",
+        ],
     )?;
 
     for table in ["sessions", "settings"] {
@@ -369,6 +436,7 @@ fn validate_v1_schema(transaction: &Transaction<'_>) -> Result<(), MigrationErro
             ColumnSpec::new("started_at_ms", "INTEGER", true, 0),
             ColumnSpec::new("completed_at_ms", "INTEGER", false, 0),
         ],
+        true,
     )?;
     validate_table(
         transaction,
@@ -379,6 +447,7 @@ fn validate_v1_schema(transaction: &Transaction<'_>) -> Result<(), MigrationErro
             ColumnSpec::new("summary", "TEXT", true, 0),
             ColumnSpec::new("updated_at_ms", "INTEGER", true, 0),
         ],
+        true,
     )?;
     validate_table(
         transaction,
@@ -397,6 +466,7 @@ fn validate_v1_schema(transaction: &Transaction<'_>) -> Result<(), MigrationErro
             ColumnSpec::new("turn_id", "TEXT", false, 0),
             ColumnSpec::new("payload_json", "TEXT", true, 0),
         ],
+        true,
     )?;
     validate_table(
         transaction,
@@ -406,6 +476,7 @@ fn validate_v1_schema(transaction: &Transaction<'_>) -> Result<(), MigrationErro
             ColumnSpec::new("setting_key", "TEXT", true, 2),
             ColumnSpec::new("value_json", "TEXT", true, 0),
         ],
+        true,
     )?;
     validate_unique_indexes(
         transaction,
@@ -429,6 +500,10 @@ fn validate_v1_schema(transaction: &Transaction<'_>) -> Result<(), MigrationErro
         transaction,
         "settings",
         &[UniqueIndexSpec::new("pk", &["workspace_id", "setting_key"])],
+    )?;
+    validate_no_owned_table_triggers(
+        transaction,
+        &["sessions", "session_briefs", "timeline_events", "settings"],
     )?;
     for table in ["sessions", "settings"] {
         if !foreign_keys(transaction, table)?.is_empty() {
@@ -497,6 +572,7 @@ fn validate_table(
     transaction: &Transaction<'_>,
     table: &str,
     required_columns: &[ColumnSpec],
+    reject_extra_columns: bool,
 ) -> Result<(), MigrationError> {
     let exists: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
@@ -557,7 +633,7 @@ fn validate_table(
         let required = required_columns
             .iter()
             .any(|required| required.name == column.name);
-        if !required && !extra_column_is_insert_compatible(column) {
+        if !required && (reject_extra_columns || !extra_column_is_insert_compatible(column)) {
             return Err(MigrationError::SchemaIntegrity {
                 reason: format!(
                     "extra column {table}.{} cannot be populated by current writes",
@@ -603,6 +679,29 @@ fn extra_column_is_insert_compatible(column: &TableColumn) -> bool {
             .default_value
             .as_deref()
             .is_some_and(is_provably_non_null_literal)
+}
+
+fn validate_no_owned_table_triggers(
+    transaction: &Transaction<'_>,
+    tables: &[&str],
+) -> Result<(), MigrationError> {
+    for table in tables {
+        let has_trigger: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?1
+                UNION ALL
+                SELECT 1 FROM sqlite_temp_master WHERE type = 'trigger' AND tbl_name = ?1
+            )",
+            [table],
+            |row| row.get(0),
+        )?;
+        if has_trigger {
+            return Err(MigrationError::SchemaIntegrity {
+                reason: format!("{table} has unexpected triggers"),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn is_provably_non_null_literal(default_value: &str) -> bool {
@@ -1049,6 +1148,35 @@ fn validate_current_rows(transaction: &Transaction<'_>) -> Result<(), MigrationE
 mod tests {
     use super::{has_workspace_session_cascade, migrate, MigrationError, SCHEMA_VERSION};
     use rusqlite::Connection;
+
+    fn create_v1_schema(connection: &Connection) {
+        connection
+            .execute_batch(
+                "CREATE TABLE sessions (
+                    workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, title TEXT, language TEXT NOT NULL,
+                    started_at_ms INTEGER NOT NULL, completed_at_ms INTEGER, PRIMARY KEY (workspace_id, session_id)
+                );
+                CREATE TABLE session_briefs (
+                    workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, summary TEXT NOT NULL, updated_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (workspace_id, session_id),
+                    FOREIGN KEY (workspace_id, session_id) REFERENCES sessions(workspace_id, session_id) ON DELETE CASCADE
+                );
+                CREATE TABLE timeline_events (
+                    event_id TEXT PRIMARY KEY NOT NULL, workspace_id TEXT NOT NULL, session_id TEXT NOT NULL,
+                    host_sequence INTEGER NOT NULL, source_generation INTEGER NOT NULL, source_sequence INTEGER NOT NULL,
+                    timestamp_ms INTEGER NOT NULL, kind TEXT NOT NULL, correlation_id TEXT, request_id TEXT, turn_id TEXT,
+                    payload_json TEXT NOT NULL,
+                    UNIQUE (workspace_id, session_id, host_sequence),
+                    FOREIGN KEY (workspace_id, session_id) REFERENCES sessions(workspace_id, session_id) ON DELETE CASCADE
+                );
+                CREATE TABLE settings (
+                    workspace_id TEXT NOT NULL, setting_key TEXT NOT NULL, value_json TEXT NOT NULL,
+                    PRIMARY KEY (workspace_id, setting_key)
+                );",
+            )
+            .unwrap();
+    }
+
     #[test]
     fn empty_database_migrates_to_current_owned_schema() {
         let mut connection = Connection::open_in_memory().unwrap();
@@ -1077,35 +1205,18 @@ mod tests {
     #[test]
     fn owned_v1_schema_migrates_to_v2_without_losing_sessions_briefs_or_timeline() {
         let mut connection = Connection::open_in_memory().unwrap();
+        create_v1_schema(&connection);
         connection
             .execute_batch(
-                "CREATE TABLE sessions (
-                    workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, title TEXT, language TEXT NOT NULL,
-                    started_at_ms INTEGER NOT NULL, completed_at_ms INTEGER, PRIMARY KEY (workspace_id, session_id)
-                );
-                CREATE TABLE session_briefs (
-                    workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, summary TEXT NOT NULL, updated_at_ms INTEGER NOT NULL,
-                    PRIMARY KEY (workspace_id, session_id),
-                    FOREIGN KEY (workspace_id, session_id) REFERENCES sessions(workspace_id, session_id) ON DELETE CASCADE
-                );
-                CREATE TABLE timeline_events (
-                    event_id TEXT PRIMARY KEY NOT NULL, workspace_id TEXT NOT NULL, session_id TEXT NOT NULL,
-                    host_sequence INTEGER NOT NULL, source_generation INTEGER NOT NULL, source_sequence INTEGER NOT NULL,
-                    timestamp_ms INTEGER NOT NULL, kind TEXT NOT NULL, correlation_id TEXT, request_id TEXT, turn_id TEXT,
-                    payload_json TEXT NOT NULL,
-                    UNIQUE (workspace_id, session_id, host_sequence),
-                    FOREIGN KEY (workspace_id, session_id) REFERENCES sessions(workspace_id, session_id) ON DELETE CASCADE
-                );
-                CREATE TABLE settings (
-                    workspace_id TEXT NOT NULL, setting_key TEXT NOT NULL, value_json TEXT NOT NULL,
-                    PRIMARY KEY (workspace_id, setting_key)
-                );
-                INSERT INTO sessions VALUES
+                "INSERT INTO sessions VALUES
                     ('workspace-a', 'active', 'legacy active', 'en-US', 100, NULL),
-                    ('workspace-a', 'completed', 'legacy completed', 'ur-PK', 200, 300);
+                    ('workspace-a', 'completed', 'legacy completed', 'ur-PK', 200, 300),
+                    ('workspace-a', 'empty-title', '', 'en-US', 250, NULL);
                 INSERT INTO session_briefs VALUES ('workspace-a', 'active', 'legacy brief', 400);
                 INSERT INTO timeline_events VALUES
-                    ('event-a', 'workspace-a', 'active', 1, 2, 3, 500, 'note', NULL, NULL, NULL, '{\"note\":true}');
+                    ('event-a', 'workspace-a', 'active', 1, 2, 3, 500, 'note', NULL, NULL, NULL, '{\"note\":true}'),
+                    ('assoc-late', 'workspace-a', 'active', 2, 2, 4, 700, 'note', NULL, 'request-a', 'turn-a', '{}'),
+                    ('assoc-early', 'workspace-a', 'active', 3, 2, 5, 600, 'note', NULL, 'request-a', 'turn-a', '{}');
                 PRAGMA user_version = 1;",
             )
             .unwrap();
@@ -1141,7 +1252,29 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "{\"summary\":\"legacy brief\"}"
+            "{\"summary\":\"legacy brief\",\"title\":\"legacy active\"}"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT brief_json, updated_at_ms FROM session_briefs
+                     WHERE workspace_id = 'workspace-a' AND session_id = 'completed'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            ("{\"title\":\"legacy completed\"}".into(), 200)
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT brief_json, updated_at_ms FROM session_briefs
+                     WHERE workspace_id = 'workspace-a' AND session_id = 'empty-title'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            ("{\"title\":\"\"}".into(), 250)
         );
         assert_eq!(
             connection
@@ -1153,6 +1286,118 @@ mod tests {
                 .unwrap(),
             "{\"note\":true}"
         );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT turn_id, created_at_ms FROM request_turn_associations
+                     WHERE workspace_id = 'workspace-a' AND session_id = 'active' AND request_id = 'request-a'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            ("turn-a".into(), 600)
+        );
+    }
+
+    #[test]
+    fn v1_migration_rejects_insert_compatible_extension_columns_without_mutation() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_v1_schema(&connection);
+        connection
+            .execute_batch(
+                "ALTER TABLE sessions ADD COLUMN extension_value TEXT;
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            migrate(&mut connection),
+            Err(MigrationError::SchemaIntegrity { .. })
+        ));
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(connection
+            .prepare("PRAGMA table_info(sessions)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .any(|column| column.unwrap() == "extension_value"));
+    }
+
+    #[test]
+    fn conflicting_v1_request_turn_rows_roll_back_the_migration() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        create_v1_schema(&connection);
+        connection
+            .execute_batch(
+                "INSERT INTO sessions VALUES
+                    ('workspace-a', 'session-a', 'legacy', 'en', 100, NULL);
+                 INSERT INTO timeline_events VALUES
+                    ('event-a', 'workspace-a', 'session-a', 1, 1, 1, 200, 'note', NULL, 'request-a', 'turn-a', '{}'),
+                    ('event-b', 'workspace-a', 'session-a', 2, 1, 2, 300, 'note', NULL, 'request-a', 'turn-b', '{}');
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            migrate(&mut connection),
+            Err(MigrationError::SchemaIntegrity { .. })
+        ));
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT title FROM sessions WHERE session_id = 'session-a'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "legacy"
+        );
+        assert!(!connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'request_turn_associations')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn v1_and_v2_schemas_reject_destructive_owned_table_triggers() {
+        let mut v1 = Connection::open_in_memory().unwrap();
+        create_v1_schema(&v1);
+        v1.execute_batch(
+            "CREATE TRIGGER destroy_v1_settings AFTER INSERT ON sessions
+             BEGIN DELETE FROM settings; END;
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        assert!(matches!(
+            migrate(&mut v1),
+            Err(MigrationError::SchemaIntegrity { .. })
+        ));
+
+        let mut v2 = Connection::open_in_memory().unwrap();
+        migrate(&mut v2).unwrap();
+        v2.execute_batch(
+            "CREATE TRIGGER destroy_v2_sessions AFTER INSERT ON request_turn_associations
+             BEGIN DELETE FROM sessions; END;",
+        )
+        .unwrap();
+        assert!(matches!(
+            migrate(&mut v2),
+            Err(MigrationError::SchemaIntegrity { .. })
+        ));
     }
     #[test]
     fn unowned_legacy_schema_fails_closed() {

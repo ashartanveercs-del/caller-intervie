@@ -184,7 +184,7 @@ impl NewSessionBrief {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredSessionBrief {
     pub brief: Value,
     pub updated_at_ms: i64,
@@ -290,7 +290,10 @@ pub enum AppendEventResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{ModelError, NewSessionBrief, NewTimelineEvent, TimelineEventKind};
+    use super::{
+        ModelError, NewSessionBrief, NewTimelineEvent, StoredSession, StoredSessionBrief,
+        TimelineEventKind,
+    };
     use serde_json::json;
 
     fn event(kind: TimelineEventKind) -> NewTimelineEvent {
@@ -351,5 +354,22 @@ mod tests {
             updated_at_ms: 1,
         };
         assert_eq!(brief.validate(), Err(ModelError::BriefMustBeObject));
+    }
+
+    #[test]
+    fn stored_sessions_are_equatable_when_they_include_a_brief() {
+        fn requires_eq<T: Eq>() {}
+
+        requires_eq::<StoredSession>();
+        assert_eq!(
+            StoredSessionBrief {
+                brief: json!({"title": "stored"}),
+                updated_at_ms: 1,
+            },
+            StoredSessionBrief {
+                brief: json!({"title": "stored"}),
+                updated_at_ms: 1,
+            }
+        );
     }
 }

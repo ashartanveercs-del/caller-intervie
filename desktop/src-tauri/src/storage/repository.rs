@@ -31,13 +31,9 @@ pub enum RepositoryError {
     #[error("session brief could not be encoded as JSON")]
     BriefSerialization,
     #[error("request id is already associated with a different turn")]
-    RequestTurnAssociationConflict {
-        workspace_id: String,
-        session_id: String,
-        request_id: String,
-        existing_turn_id: String,
-        requested_turn_id: String,
-    },
+    RequestTurnAssociationConflict,
+    #[error("session has already completed with a different terminal status")]
+    SessionCompletionConflict,
     #[error(transparent)]
     Migration(#[from] MigrationError),
     #[error(transparent)]
@@ -145,14 +141,37 @@ impl SessionRepository {
         if matches!(status, SessionStatus::Active) {
             return Err(RepositoryError::InvalidCompletionStatus);
         }
-        let connection = self
+        let mut connection = self
             .connection
             .lock()
             .map_err(|_| RepositoryError::ConnectionUnavailable)?;
-        Ok(connection.execute(
-            "UPDATE sessions SET status = ?3, completed_at_ms = ?4 WHERE workspace_id = ?1 AND session_id = ?2",
-            params![workspace_id, session_id, status.as_db(), completed_at_ms],
-        )? > 0)
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<String> = transaction
+            .query_row(
+                "SELECT status FROM sessions WHERE workspace_id = ?1 AND session_id = ?2",
+                params![workspace_id, session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(existing) = existing else {
+            return Ok(false);
+        };
+        let existing = SessionStatus::from_db(&existing)?;
+        match existing {
+            SessionStatus::Active => {
+                transaction.execute(
+                    "UPDATE sessions SET status = ?3, completed_at_ms = ?4 WHERE workspace_id = ?1 AND session_id = ?2 AND status = 'active'",
+                    params![workspace_id, session_id, status.as_db(), completed_at_ms],
+                )?;
+                transaction.commit()?;
+                Ok(true)
+            }
+            existing if existing == status => {
+                transaction.commit()?;
+                Ok(true)
+            }
+            _ => Err(RepositoryError::SessionCompletionConflict),
+        }
     }
 
     pub fn list_sessions(
@@ -168,7 +187,7 @@ impl SessionRepository {
             .lock()
             .map_err(|_| RepositoryError::ConnectionUnavailable)?;
         let mut statement = connection.prepare(&session_query(
-            "WHERE sessions.workspace_id = ?1 ORDER BY sessions.started_at_ms DESC LIMIT ?2",
+            "WHERE sessions.workspace_id = ?1 ORDER BY sessions.started_at_ms DESC, sessions.session_id ASC LIMIT ?2",
         ))?;
         let sessions = statement
             .query_map(params![workspace_id, limit as i64], session_from_row)?
@@ -221,7 +240,7 @@ impl SessionRepository {
             .connection
             .lock()
             .map_err(|_| RepositoryError::ConnectionUnavailable)?;
-        connection.query_row(&session_query("WHERE sessions.workspace_id = ?1 AND sessions.status = 'active' ORDER BY sessions.started_at_ms DESC LIMIT 1"), [workspace_id], session_from_row).optional().map_err(Into::into)
+        connection.query_row(&session_query("WHERE sessions.workspace_id = ?1 AND sessions.status = 'active' ORDER BY sessions.started_at_ms DESC, sessions.session_id ASC LIMIT 1"), [workspace_id], session_from_row).optional().map_err(Into::into)
     }
 
     pub fn delete_session(
@@ -265,13 +284,7 @@ impl SessionRepository {
             if existing_turn_id == association.turn_id {
                 return Ok(AssociateRequestResult::Duplicate);
             }
-            return Err(RepositoryError::RequestTurnAssociationConflict {
-                workspace_id: association.workspace_id.clone(),
-                session_id: association.session_id.clone(),
-                request_id: association.request_id.clone(),
-                existing_turn_id,
-                requested_turn_id: association.turn_id.clone(),
-            });
+            return Err(RepositoryError::RequestTurnAssociationConflict);
         }
         transaction.execute(
             "INSERT INTO request_turn_associations (workspace_id, session_id, request_id, turn_id, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -573,20 +586,52 @@ mod tests {
     fn encrypted_file_does_not_leak_payload_marker() {
         let (_temp, path, repository) = repository();
         repository.create_session(&session(WORKSPACE_A)).unwrap();
+        repository
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode = PERSIST;")
+            .unwrap();
+        repository
+            .save_session_brief(&NewSessionBrief {
+                workspace_id: WORKSPACE_A.into(),
+                session_id: SESSION.into(),
+                brief: json!({"marker": "CONFIDENTIAL_BRIEF_MARKER_47"}),
+                updated_at_ms: 1_700_000_000_002,
+            })
+            .unwrap();
+        repository
+            .associate_request_with_turn(&RequestTurnAssociation {
+                workspace_id: WORKSPACE_A.into(),
+                session_id: SESSION.into(),
+                request_id: "CONFIDENTIAL_REQUEST_MARKER_47".into(),
+                turn_id: "CONFIDENTIAL_TURN_MARKER_47".into(),
+                created_at_ms: 1_700_000_000_003,
+            })
+            .unwrap();
         let mut transcript = event("event-a", TimelineEventKind::TranscriptFinal);
         transcript.turn_id = Some("turn-a".into());
         repository.append_event(&transcript).unwrap();
         drop(repository);
+        assert!(path.with_extension("db-journal").exists());
         for sidecar in [
             path.clone(),
+            path.with_extension("db-journal"),
             path.with_extension("db-wal"),
             path.with_extension("db-shm"),
         ] {
             if sidecar.exists() {
                 let bytes = fs::read(sidecar).unwrap();
-                assert!(!bytes
-                    .windows(b"CONFIDENTIAL_MARKER_47".len())
-                    .any(|window| window == b"CONFIDENTIAL_MARKER_47"));
+                for marker in [
+                    "CONFIDENTIAL_MARKER_47",
+                    "CONFIDENTIAL_BRIEF_MARKER_47",
+                    "CONFIDENTIAL_REQUEST_MARKER_47",
+                    "CONFIDENTIAL_TURN_MARKER_47",
+                ] {
+                    assert!(!bytes
+                        .windows(marker.len())
+                        .any(|window| window == marker.as_bytes()));
+                }
             }
         }
     }
@@ -894,6 +939,46 @@ mod tests {
     }
 
     #[test]
+    fn complete_session_is_idempotent_for_the_same_terminal_status_and_rejects_changes() {
+        let (_temp, _path, repository) = repository();
+        repository.create_session(&session(WORKSPACE_A)).unwrap();
+
+        assert!(repository
+            .complete_session(
+                WORKSPACE_A,
+                SESSION,
+                SessionStatus::Completed,
+                1_700_000_000_050,
+            )
+            .unwrap());
+        assert!(repository
+            .complete_session(
+                WORKSPACE_A,
+                SESSION,
+                SessionStatus::Completed,
+                1_700_000_000_060,
+            )
+            .unwrap());
+        let error = repository
+            .complete_session(
+                WORKSPACE_A,
+                SESSION,
+                SessionStatus::Interrupted,
+                1_700_000_000_070,
+            )
+            .unwrap_err();
+        assert!(matches!(error, RepositoryError::SessionCompletionConflict));
+        assert_eq!(format!("{error:?}"), "SessionCompletionConflict");
+
+        let stored = repository
+            .get_session(WORKSPACE_A, SESSION)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, SessionStatus::Completed);
+        assert_eq!(stored.completed_at_ms, Some(1_700_000_000_050));
+    }
+
+    #[test]
     fn list_sessions_rejects_out_of_range_limits() {
         let (_temp, _path, repository) = repository();
         assert!(matches!(
@@ -931,10 +1016,14 @@ mod tests {
         );
         let mut conflicting = association.clone();
         conflicting.turn_id = "turn-b".into();
+        let error = repository
+            .associate_request_with_turn(&conflicting)
+            .unwrap_err();
         assert!(matches!(
-            repository.associate_request_with_turn(&conflicting),
-            Err(RepositoryError::RequestTurnAssociationConflict { .. })
+            error,
+            RepositoryError::RequestTurnAssociationConflict
         ));
+        assert_eq!(format!("{error:?}"), "RequestTurnAssociationConflict");
         assert_eq!(
             repository
                 .resolve_request_turn(WORKSPACE_A, SESSION, "request-a")
@@ -979,5 +1068,34 @@ mod tests {
             .get_request_turn_associations(WORKSPACE_A, SESSION)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn session_queries_break_timestamp_ties_by_session_id() {
+        let (_temp, _path, repository) = repository();
+        let mut first = session(WORKSPACE_A);
+        first.session_id = "session-a".into();
+        let mut second = session(WORKSPACE_A);
+        second.session_id = "session-b".into();
+        repository.create_session(&second).unwrap();
+        repository.create_session(&first).unwrap();
+
+        assert_eq!(
+            repository
+                .list_sessions(WORKSPACE_A, 10)
+                .unwrap()
+                .into_iter()
+                .map(|session| session.session_id)
+                .collect::<Vec<_>>(),
+            ["session-a", "session-b"]
+        );
+        assert_eq!(
+            repository
+                .restore_active_session(WORKSPACE_A)
+                .unwrap()
+                .unwrap()
+                .session_id,
+            "session-a"
+        );
     }
 }
