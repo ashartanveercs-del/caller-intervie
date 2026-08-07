@@ -24,6 +24,11 @@ $script:BuildContract = [pscustomobject]@{
     MsBuildVersion = '17.14.51.32402'
     VcToolsVersion = '14.44.35207'
     LinkVersion = '14.44.35228.0'
+    OpenSslVersion = '3.6.3'
+    OpenSslSourcePackageVersion = '300.6.1+3.6.3'
+    OpenSslSourcePackageChecksum = '46eb8fb9fb3b61ce1c0f8a026c4c1a0714d3a9e138e7fbde78753ce2babc3846'
+    OpenSslWindowsMakefileSha256 = 'e1a8d9a44afb425c84a02e98d68527bcbdf098efbcd614445b596b210ba829d2'
+    OpenSslPatchedWindowsMakefileSha256 = 'b6d42fcf197b702217439a810a8a12a3173297b5246c8613146131dc2d875c62'
 }
 
 function Get-WindowsNativeBuildContract {
@@ -85,6 +90,180 @@ function Convert-LibsodiumReleaseDebugInformationToEmbedded {
     $content = $content.Replace($externalNode, $embeddedNode)
     [System.IO.File]::WriteAllText($Path, $content, [System.Text.UTF8Encoding]::new($true))
     return 1
+}
+
+function Convert-OpenSslWindowsMakefileToEmbeddedDebug {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $SourceTemplatePath,
+
+        [Parameter(Mandatory = $true)]
+        [string] $DestinationTemplatePath
+    )
+
+    if (-not (Test-Path -LiteralPath $SourceTemplatePath -PathType Leaf)) {
+        throw "The pinned OpenSSL Windows makefile template is missing: $SourceTemplatePath"
+    }
+
+    $content = [System.IO.File]::ReadAllText($SourceTemplatePath)
+    $externalDebugFlags = 'LIB_CFLAGS={- join('' '', $target{lib_cflags} || (),'
+    $embeddedDebugFlags = @'
+LIB_CFLAGS={- die "Unexpected OpenSSL static-library flags for VC-WIN64A"
+                    unless $config{target} eq "VC-WIN64A"
+                        && ($target{lib_cflags} // "") eq "/Zi /Fdossl_static.pdb /MT /Zl";
+                join(' ', '/Z7 /MT /Zl',
+'@
+    $externalDebugCount = [regex]::Matches(
+        $content,
+        [regex]::Escape($externalDebugFlags)
+    ).Count
+    $pdbInstallPattern = '(?m)^\t@if "\$\(SHLIBS\)"=="" \\\r?\n\t "\$\(PERL\)" "\$\(SRCDIR\)\\util\\copy\.pl" ossl_static\.pdb "\$\(libdir\)"\r?\n?'
+    $pdbInstallCount = [regex]::Matches($content, $pdbInstallPattern).Count
+
+    if ($externalDebugCount -ne 1 -or $pdbInstallCount -ne 1) {
+        throw "OpenSSL Windows makefile template drift detected; expected one static debug-flag block and one static PDB install command, found $externalDebugCount and $pdbInstallCount."
+    }
+
+    $content = $content.Replace($externalDebugFlags, $embeddedDebugFlags)
+    $content = [regex]::Replace(
+        $content,
+        $pdbInstallPattern,
+        "# Static-library debug data is embedded by /Z7; no compiler PDB is installed.$([Environment]::NewLine)"
+    )
+
+    $destinationDirectory = Split-Path -Parent $DestinationTemplatePath
+    New-Item -ItemType Directory -Path $destinationDirectory -Force | Out-Null
+    $temporaryPath = "$DestinationTemplatePath.tmp.$([guid]::NewGuid().ToString('N'))"
+    try {
+        [System.IO.File]::WriteAllText(
+            $temporaryPath,
+            $content,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        Move-Item -LiteralPath $temporaryPath -Destination $DestinationTemplatePath -Force
+    }
+    finally {
+        Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+    }
+
+    return 2
+}
+
+function Assert-PinnedOpenSslCargoPackage {
+    param(
+        [Parameter(Mandatory = $true)] [string] $CargoLockPath,
+        [Parameter(Mandatory = $true)] [string] $PackageVersion,
+        [Parameter(Mandatory = $true)] [string] $PackageChecksum
+    )
+
+    if (-not (Test-Path -LiteralPath $CargoLockPath -PathType Leaf)) {
+        throw "Cargo.lock is missing: $CargoLockPath"
+    }
+
+    $content = [System.IO.File]::ReadAllText($CargoLockPath)
+    $packageBlocks = @([regex]::Matches(
+            $content,
+            '(?ms)^\[\[package\]\]\r?\n.*?(?=^\[\[package\]\]|\z)'
+        ) | Where-Object { $_.Value -match '(?m)^name = "openssl-src"\r?$' })
+    if ($packageBlocks.Count -ne 1) {
+        throw "Cargo.lock must contain exactly one openssl-src package; found $($packageBlocks.Count)."
+    }
+
+    $block = $packageBlocks[0].Value
+    $expectedVersionLine = "version = `"$PackageVersion`""
+    $expectedChecksumLine = "checksum = `"$PackageChecksum`""
+    if ($block -notmatch "(?m)^$([regex]::Escape($expectedVersionLine))\r?$" -or
+        $block -notmatch "(?m)^$([regex]::Escape($expectedChecksumLine))\r?$") {
+        throw "Cargo.lock does not pin the approved openssl-src $PackageVersion package and checksum."
+    }
+}
+
+function Get-DefaultCargoHomePath {
+    if ($env:CARGO_HOME) {
+        return [System.IO.Path]::GetFullPath($env:CARGO_HOME)
+    }
+    return Join-Path ([Environment]::GetFolderPath('UserProfile')) '.cargo'
+}
+
+function Get-PinnedOpenSslWindowsMakefileTemplate {
+    param(
+        [Parameter(Mandatory = $true)] [string] $CargoPath,
+        [Parameter(Mandatory = $true)] [string] $ManifestRoot,
+        [Parameter(Mandatory = $true)] [string] $CargoHomePath,
+        [Parameter(Mandatory = $true)] [string] $PackageVersion,
+        [Parameter(Mandatory = $true)] [string] $ExpectedTemplateSha256
+    )
+
+    if ($ExpectedTemplateSha256 -notmatch '^[0-9a-fA-F]{64}$') {
+        throw 'The approved OpenSSL Windows template hash is invalid.'
+    }
+
+    $findCandidates = {
+        $registrySourceRoot = Join-Path $CargoHomePath 'registry\src'
+        if (-not (Test-Path -LiteralPath $registrySourceRoot -PathType Container)) {
+            return
+        }
+        foreach ($registryDirectory in @(Get-ChildItem -LiteralPath $registrySourceRoot -Directory -ErrorAction Stop)) {
+            $candidate = Join-Path $registryDirectory.FullName "openssl-src-$PackageVersion\openssl\Configurations\windows-makefile.tmpl"
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                $candidate
+            }
+        }
+    }
+
+    $candidates = @(& $findCandidates)
+    if ($candidates.Count -eq 0) {
+        $fetchExitCode = Invoke-NativeCommandWithOutput `
+            -ExecutablePath $CargoPath `
+            -Arguments @('fetch', '--locked', '--manifest-path', (Join-Path $ManifestRoot 'Cargo.toml'))
+        if ($fetchExitCode -ne 0) {
+            throw "Unable to fetch the pinned OpenSSL source package (cargo fetch exit $fetchExitCode)."
+        }
+        $candidates = @(& $findCandidates)
+    }
+
+    if ($candidates.Count -eq 0) {
+        throw "The pinned openssl-src $PackageVersion Windows template was not found under $CargoHomePath."
+    }
+
+    $matchingCandidates = @($candidates | Where-Object {
+            (Get-FileHash -Algorithm SHA256 -LiteralPath $_).Hash.ToLowerInvariant() -ceq $ExpectedTemplateSha256.ToLowerInvariant()
+        } | Sort-Object)
+    if ($matchingCandidates.Count -eq 0) {
+        throw "OpenSSL Windows makefile template hash mismatch for cached openssl-src $PackageVersion; refusing source drift."
+    }
+    return [string] $matchingCandidates[0]
+}
+
+function Initialize-OpenSslLocalConfiguration {
+    param(
+        [Parameter(Mandatory = $true)] [string] $CargoPath,
+        [Parameter(Mandatory = $true)] [string] $ManifestRoot
+    )
+
+    $contract = Get-WindowsNativeBuildContract
+    Assert-PinnedOpenSslCargoPackage `
+        -CargoLockPath (Join-Path $ManifestRoot 'Cargo.lock') `
+        -PackageVersion $contract.OpenSslSourcePackageVersion `
+        -PackageChecksum $contract.OpenSslSourcePackageChecksum
+    $sourceTemplate = Get-PinnedOpenSslWindowsMakefileTemplate `
+        -CargoPath $CargoPath `
+        -ManifestRoot $ManifestRoot `
+        -CargoHomePath (Get-DefaultCargoHomePath) `
+        -PackageVersion $contract.OpenSslSourcePackageVersion `
+        -ExpectedTemplateSha256 $contract.OpenSslWindowsMakefileSha256
+    $templateRevision = $contract.OpenSslPatchedWindowsMakefileSha256.Substring(0, 12)
+    $configurationDirectory = Join-Path $ManifestRoot ".native\openssl-config-$($contract.OpenSslVersion)-$templateRevision"
+    $destinationTemplate = Join-Path $configurationDirectory 'windows-makefile.tmpl'
+    Convert-OpenSslWindowsMakefileToEmbeddedDebug `
+        -SourceTemplatePath $sourceTemplate `
+        -DestinationTemplatePath $destinationTemplate | Out-Null
+    $patchedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $destinationTemplate).Hash.ToLowerInvariant()
+    if ($patchedHash -cne $contract.OpenSslPatchedWindowsMakefileSha256) {
+        throw "The generated OpenSSL Windows makefile template hash is $patchedHash; expected $($contract.OpenSslPatchedWindowsMakefileSha256)."
+    }
+    return $configurationDirectory
 }
 
 function Assert-LibsodiumArchiveInspection {
@@ -1090,6 +1269,84 @@ function Add-CargoArgumentsBeforeApplicationBoundary {
     return $result
 }
 
+function ConvertTo-CargoTomlBasicString {
+    param(
+        [Parameter(Mandatory = $true)] [AllowEmptyString()] [string] $Value
+    )
+
+    if ($Value -match '[\x00-\x1f]') {
+        throw 'A controlled Cargo environment value contains an unsupported control character.'
+    }
+    return '"' + $Value.Replace('\', '\\').Replace('"', '\"') + '"'
+}
+
+function Initialize-ControlledCargoConfiguration {
+    param(
+        [Parameter(Mandatory = $true)] [string] $ManifestRoot,
+        [Parameter(Mandatory = $true)] [string] $OpenSslConfigurationDirectory
+    )
+
+    $nativeRoot = Join-Path $ManifestRoot '.native'
+    New-Item -ItemType Directory -Path $nativeRoot -Force | Out-Null
+    $configurationPath = Join-Path $nativeRoot 'windows-cargo-config.toml'
+    $openSslConfigurationValue = ConvertTo-CargoTomlBasicString -Value $OpenSslConfigurationDirectory
+    $content = @(
+        '[env]'
+        'CFLAGS = { value = "", force = true }'
+        'CXXFLAGS = { value = "", force = true }'
+        'OPENSSL_NO_VENDOR = { value = "0", force = true }'
+        'X86_64_PC_WINDOWS_MSVC_OPENSSL_NO_VENDOR = { value = "0", force = true }'
+        "OPENSSL_CONFIG_DIR = { value = $openSslConfigurationValue, force = true }"
+        "X86_64_PC_WINDOWS_MSVC_OPENSSL_CONFIG_DIR = { value = $openSslConfigurationValue, force = true }"
+        "OPENSSL_LOCAL_CONFIG_DIR = { value = $openSslConfigurationValue, force = true }"
+    ) -join [Environment]::NewLine
+    $content += [Environment]::NewLine
+
+    $temporaryPath = "$configurationPath.tmp.$([guid]::NewGuid().ToString('N'))"
+    try {
+        [System.IO.File]::WriteAllText(
+            $temporaryPath,
+            $content,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        Move-Item -LiteralPath $temporaryPath -Destination $configurationPath -Force
+    }
+    finally {
+        Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+    }
+    if ([System.IO.File]::ReadAllText($configurationPath) -cne $content) {
+        throw 'The controlled Cargo configuration was not published exactly.'
+    }
+    return $configurationPath
+}
+
+function Add-CargoLockedArgument {
+    param(
+        [Parameter(Mandatory = $true)] [string[]] $CargoArguments
+    )
+
+    $boundary = [array]::IndexOf($CargoArguments, '--')
+    $commandArguments = if ($boundary -lt 0) {
+        @($CargoArguments)
+    }
+    elseif ($boundary -eq 0) {
+        @()
+    }
+    else {
+        @($CargoArguments[0..($boundary - 1)])
+    }
+    $lockedCount = @($commandArguments | Where-Object { $_ -ceq '--locked' }).Count
+    if ($lockedCount -gt 1) {
+        throw 'Cargo --locked may be supplied only once.'
+    }
+    if ($lockedCount -eq 1) {
+        return @($CargoArguments)
+    }
+    return @(Add-CargoArgumentsBeforeApplicationBoundary `
+            -CargoArguments $CargoArguments `
+            -ArgumentsToAdd @('--locked'))
+}
+
 function Get-CargoSubcommand {
     param(
         [Parameter(Mandatory = $true)] [string[]] $CargoArguments
@@ -1190,11 +1447,19 @@ function New-ControlledCargoInvocation {
                 -CargoArguments $controlledArguments `
                 -ArgumentsToAdd @('--target-dir', $targetRoot))
     }
+    $controlledArguments = [string[]] @(Add-CargoLockedArgument -CargoArguments $controlledArguments)
 
     foreach ($variable in @(
         'RUSTFLAGS',
         'CARGO_BUILD_RUSTFLAGS',
-        'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS'
+        'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS',
+        'CFLAGS',
+        'CXXFLAGS',
+        'OPENSSL_NO_VENDOR',
+        'X86_64_PC_WINDOWS_MSVC_OPENSSL_NO_VENDOR',
+        'OPENSSL_CONFIG_DIR',
+        'X86_64_PC_WINDOWS_MSVC_OPENSSL_CONFIG_DIR',
+        'OPENSSL_LOCAL_CONFIG_DIR'
     )) {
         Remove-Item -LiteralPath "Env:$variable" -ErrorAction SilentlyContinue
     }
@@ -1202,8 +1467,16 @@ function New-ControlledCargoInvocation {
     $env:CARGO_TARGET_DIR = $targetRoot
     $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $LinkPath
     $env:CARGO_ENCODED_RUSTFLAGS = '-Ctarget-feature=-crt-static'
-    $env:CFLAGS = '/Z7'
-    $env:CXXFLAGS = '/Z7'
+    $templateRevision = $contract.OpenSslPatchedWindowsMakefileSha256.Substring(0, 12)
+    $openSslConfigurationDirectory = Join-Path $ManifestRoot ".native\openssl-config-$($contract.OpenSslVersion)-$templateRevision"
+    $env:OPENSSL_CONFIG_DIR = $openSslConfigurationDirectory
+    $env:OPENSSL_LOCAL_CONFIG_DIR = $openSslConfigurationDirectory
+    $controlledCargoConfiguration = Initialize-ControlledCargoConfiguration `
+        -ManifestRoot $ManifestRoot `
+        -OpenSslConfigurationDirectory $openSslConfigurationDirectory
+    $controlledArguments = [string[]] @(Add-CargoArgumentsBeforeApplicationBoundary `
+            -CargoArguments $controlledArguments `
+            -ArgumentsToAdd @('--config', $controlledCargoConfiguration))
 
     return [pscustomobject]@{
         CargoArguments = $controlledArguments
@@ -1470,6 +1743,11 @@ function Invoke-WindowsNativeBuild {
         if ($null -eq $cargo) {
             throw 'cargo.exe was not found on PATH.'
         }
+
+        $openSslConfigurationDirectory = Initialize-OpenSslLocalConfiguration `
+            -CargoPath $cargo.Source `
+            -ManifestRoot $manifestRootFull
+        Write-Host "Prepared pinned OpenSSL $((Get-WindowsNativeBuildContract).OpenSslVersion) embedded-debug configuration at $openSslConfigurationDirectory."
 
         $env:SODIUM_LIB_DIR = $artifact.LibraryDirectory
         $env:DESKTOP_LIBSODIUM_RECEIPT = $artifact.ReceiptPath

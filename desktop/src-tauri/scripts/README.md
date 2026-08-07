@@ -40,7 +40,7 @@ backup. After validation commits the replacement, backup cleanup is best-effort.
 and leaves backup remnants for later cleanup. It does not roll back the validated replacement. No libsodium DLL is
 built or packaged.
 
-Every requested Cargo command targets `x86_64-pc-windows-msvc` explicitly. When the caller omits
+Every requested Cargo command uses `--locked` and targets `x86_64-pc-windows-msvc` explicitly. When the caller omits
 `--target-dir`, the wrapper intentionally selects the short `.native/t`; output is therefore under
 `.native/t/x86_64-pc-windows-msvc/<profile>`. An explicit caller `--target-dir` is preserved and
 resolved exactly. The selective `cargo clean -p libsodium-sys-stable`, requested command, and
@@ -59,9 +59,20 @@ The wrapper rejects `cargo rustc`, `cargo bench`, Cargo `--config`, non-x86_64 W
 linker codegen overrides, and `+crt-static`. It replaces ambient Cargo target, target-directory,
 linker, and Rust flag settings. `CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER` names the approved linker,
 `CARGO_ENCODED_RUSTFLAGS=-Ctarget-feature=-crt-static`, and ambient `RUSTFLAGS` plus target
-rustflags are removed. Vendored OpenSSL 3.6.3 builds receive controlled `CFLAGS=/Z7` and
-`CXXFLAGS=/Z7`, overriding ambient values so debug information is embedded in objects instead of
-requiring `ossl_static.pdb`. No linker-warning suppression is part of the recipe.
+rustflags are removed. Vendored OpenSSL is pinned to `openssl-src 300.6.1+3.6.3` and the wrapper
+verifies both its Cargo checksum and the SHA-256 of the upstream Windows makefile template. It then
+uses OpenSSL's `OPENSSL_LOCAL_CONFIG_DIR` mechanism to publish a project-local template under a
+content-addressed `.native/openssl-config-3.6.3-<hash>` directory. The same path is supplied through
+tracked `OPENSSL_CONFIG_DIR`, so changing the pinned transformed-template hash invalidates Cargo's
+`openssl-sys` cache. Global and target-prefixed `OPENSSL_NO_VENDOR` contamination and the
+target-prefixed config override are removed from the parent process. The requested command also receives a
+highest-precedence generated Cargo config that force-pins vendoring, the global and target-prefixed config paths,
+and empty `CFLAGS`/`CXXFLAGS`, so an ambient Cargo `[env]` table cannot restore those inputs.
+That fail-closed transform preserves OpenSSL's complete static
+library CRT/default-library flags, replaces only `/Zi /Fdossl_static.pdb` with embedded `/Z7`, and
+removes the now-impossible `ossl_static.pdb` install command. Ambient `CFLAGS` and `CXXFLAGS` are cleared
+so OpenSSL retains its pinned `/O2` release configuration. The Cargo registry source is
+never modified, and no linker-warning suppression is part of the recipe.
 
 Example:
 

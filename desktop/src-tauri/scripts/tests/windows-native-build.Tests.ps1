@@ -393,7 +393,7 @@ try {
         }
     }
 
-    Invoke-Test 'the Rust build contract rejects unsupported Windows targets and suppresses no linker warnings' {
+    Invoke-Test 'the Rust build contract rejects unsupported Windows targets without suppressing linker diagnostics' {
         $manifestRoot = Split-Path -Parent $scriptsRoot
         $buildScriptPath = Join-Path $manifestRoot 'build.rs'
         $cargoManifestPath = Join-Path $manifestRoot 'Cargo.toml'
@@ -416,6 +416,8 @@ try {
             '/dump',
             '/directives',
             '/headers',
+            'cargo:rustc-link-arg-cdylib=/NOIMPLIB',
+            'cargo:rustc-link-arg-cdylib=/NOEXP',
             'sha2',
             'serde_json'
         )) {
@@ -785,6 +787,100 @@ try {
         } '260.*shorter absolute --target-dir'
     }
 
+    Invoke-Test 'the OpenSSL local template preserves CRT flags and removes the external PDB contract' {
+        $nativeBuildModule = Get-Module | Where-Object { $_.Path -eq $modulePath } | Select-Object -First 1
+        $sourcePath = Join-Path $testRoot 'windows-makefile.tmpl'
+        $destinationPath = Join-Path $testRoot 'openssl-local-config\windows-makefile.tmpl'
+        $source = @'
+LIB_CFLAGS={- join(' ', $target{lib_cflags} || (),
+                        $target{shared_cflag} || (),
+                        @{$config{lib_cflags}},
+                        @{$config{shared_cflag}},
+                        '$(CNF_CFLAGS)', '$(CFLAGS)') -}
+	@if "$(SHLIBS)"=="" \
+	 "$(PERL)" "$(SRCDIR)\util\copy.pl" ossl_static.pdb "$(libdir)"
+'@
+        [System.IO.File]::WriteAllText($sourcePath, $source)
+
+        $result = & $nativeBuildModule {
+            param($sourceTemplate, $destinationTemplate)
+            Convert-OpenSslWindowsMakefileToEmbeddedDebug `
+                -SourceTemplatePath $sourceTemplate `
+                -DestinationTemplatePath $destinationTemplate
+        } $sourcePath $destinationPath
+
+        $transformed = [System.IO.File]::ReadAllText($destinationPath)
+        Assert-Equal 2 $result 'The transform did not report both controlled replacements.'
+        Assert-Equal 1 ([regex]::Matches($transformed, [regex]::Escape("join(' ', '/Z7 /MT /Zl',")).Count) 'The embedded debug flags do not preserve the MSVC CRT/default-library contract.'
+        Assert-Equal 1 ([regex]::Matches($transformed, [regex]::Escape('($target{lib_cflags} // "") eq "/Zi /Fdossl_static.pdb /MT /Zl"')).Count) 'The transform does not fail closed on unexpected upstream flags.'
+        Assert-Equal 0 ([regex]::Matches($transformed, [regex]::Escape('ossl_static.pdb "$(libdir)"')).Count) 'The invalid static PDB install command remains.'
+        Assert-Equal $source ([System.IO.File]::ReadAllText($sourcePath)) 'The Cargo registry source template was modified in place.'
+    }
+
+    Invoke-Test 'the OpenSSL local template transform rejects upstream source drift' {
+        $nativeBuildModule = Get-Module | Where-Object { $_.Path -eq $modulePath } | Select-Object -First 1
+        $sourcePath = Join-Path $testRoot 'windows-makefile-drifted.tmpl'
+        $destinationPath = Join-Path $testRoot 'openssl-local-config-drifted\windows-makefile.tmpl'
+        [System.IO.File]::WriteAllText($sourcePath, 'LIB_CFLAGS=unexpected')
+
+        Assert-Throws {
+            & $nativeBuildModule {
+                param($sourceTemplate, $destinationTemplate)
+                Convert-OpenSslWindowsMakefileToEmbeddedDebug `
+                    -SourceTemplatePath $sourceTemplate `
+                    -DestinationTemplatePath $destinationTemplate
+            } $sourcePath $destinationPath
+        } 'OpenSSL.*template.*drift'
+        Assert-Equal $false (Test-Path -LiteralPath $destinationPath) 'A local OpenSSL template was published after drift detection.'
+    }
+
+    Invoke-Test 'the pinned OpenSSL template lookup selects only the expected source bytes' {
+        $nativeBuildModule = Get-Module | Where-Object { $_.Path -eq $modulePath } | Select-Object -First 1
+        $cargoHome = Join-Path $testRoot 'cargo-home-openssl-match'
+        $packageVersion = 'fixture-version'
+        $templatePath = Join-Path $cargoHome "registry\src\fixture-index\openssl-src-$packageVersion\openssl\Configurations\windows-makefile.tmpl"
+        New-Item -ItemType Directory -Path (Split-Path -Parent $templatePath) -Force | Out-Null
+        [System.IO.File]::WriteAllText($templatePath, 'pinned template bytes')
+        $expectedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $templatePath).Hash.ToLowerInvariant()
+
+        $selected = & $nativeBuildModule {
+            param($home, $version, $hash)
+            Get-PinnedOpenSslWindowsMakefileTemplate `
+                -CargoPath 'unused-cargo.exe' `
+                -ManifestRoot 'unused-manifest-root' `
+                -CargoHomePath $home `
+                -PackageVersion $version `
+                -ExpectedTemplateSha256 $hash
+        } $cargoHome $packageVersion $expectedHash
+
+        Assert-Equal $templatePath $selected 'The exact pinned OpenSSL template was not selected.'
+    }
+
+    Invoke-Test 'the pinned OpenSSL template lookup rejects cached source drift without invoking Cargo' {
+        $nativeBuildModule = Get-Module | Where-Object { $_.Path -eq $modulePath } | Select-Object -First 1
+        $cargoHome = Join-Path $testRoot 'cargo-home-openssl-drift'
+        $packageVersion = 'fixture-version'
+        $templatePath = Join-Path $cargoHome "registry\src\fixture-index\openssl-src-$packageVersion\openssl\Configurations\windows-makefile.tmpl"
+        $cargoCalls = Join-Path $testRoot 'unexpected-openssl-fetch.txt'
+        $fakeCargo = Join-Path $testRoot 'unexpected-openssl-fetch.cmd'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $templatePath) -Force | Out-Null
+        [System.IO.File]::WriteAllText($templatePath, 'drifted template bytes')
+        [System.IO.File]::WriteAllText($fakeCargo, "@echo off`r`necho invoked>`"$cargoCalls`"`r`nexit /b 0`r`n")
+
+        Assert-Throws {
+            & $nativeBuildModule {
+                param($cargo, $home, $version)
+                Get-PinnedOpenSslWindowsMakefileTemplate `
+                    -CargoPath $cargo `
+                    -ManifestRoot 'unused-manifest-root' `
+                    -CargoHomePath $home `
+                    -PackageVersion $version `
+                    -ExpectedTemplateSha256 ('0' * 64)
+            } $fakeCargo $cargoHome $packageVersion
+        } 'OpenSSL.*template.*hash'
+        Assert-Equal $false (Test-Path -LiteralPath $cargoCalls) 'Cargo fetch ran even though a mismatched cached source was present.'
+    }
+
     Invoke-Test 'the controlled Cargo environment overrides configured native-build inputs' {
         $nativeBuildModule = Get-Module | Where-Object { $_.Path -eq $modulePath } | Select-Object -First 1
         $manifestRoot = Join-Path $testRoot 'cargo-environment'
@@ -800,7 +896,12 @@ try {
             'CARGO_ENCODED_RUSTFLAGS',
             'RUSTFLAGS',
             'CFLAGS',
-            'CXXFLAGS'
+            'CXXFLAGS',
+            'OPENSSL_NO_VENDOR',
+            'X86_64_PC_WINDOWS_MSVC_OPENSSL_NO_VENDOR',
+            'OPENSSL_CONFIG_DIR',
+            'X86_64_PC_WINDOWS_MSVC_OPENSSL_CONFIG_DIR',
+            'OPENSSL_LOCAL_CONFIG_DIR'
         )
         $previousValues = @{}
         try {
@@ -826,25 +927,60 @@ try {
             Assert-Equal $expectedTargetRoot $env:CARGO_TARGET_DIR 'Ambient Cargo target-dir won.'
             Assert-Equal $selectedLinker $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER 'The selected linker was not pinned through the target environment.'
             Assert-Equal '-Ctarget-feature=-crt-static' $env:CARGO_ENCODED_RUSTFLAGS 'The controlled dynamic-CRT rustflag is wrong.'
-            Assert-Equal '/Z7' $env:CFLAGS 'Ambient OpenSSL CFLAGS were not replaced.'
-            Assert-Equal '/Z7' $env:CXXFLAGS 'Ambient OpenSSL CXXFLAGS were not replaced.'
-            foreach ($clearedVariable in @('RUSTFLAGS', 'CARGO_BUILD_RUSTFLAGS', 'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS')) {
+            $templateRevision = $contract.OpenSslPatchedWindowsMakefileSha256.Substring(0, 12)
+            $expectedOpenSslConfig = Join-Path $manifestRoot ".native\openssl-config-3.6.3-$templateRevision"
+            Assert-Equal $expectedOpenSslConfig $env:OPENSSL_CONFIG_DIR 'The tracked OpenSSL cache key is wrong.'
+            Assert-Equal $expectedOpenSslConfig $env:OPENSSL_LOCAL_CONFIG_DIR 'Ambient OpenSSL local configuration won.'
+            foreach ($clearedVariable in @(
+                    'RUSTFLAGS',
+                    'CARGO_BUILD_RUSTFLAGS',
+                    'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS',
+                    'CFLAGS',
+                    'CXXFLAGS',
+                    'OPENSSL_NO_VENDOR',
+                    'X86_64_PC_WINDOWS_MSVC_OPENSSL_NO_VENDOR',
+                    'X86_64_PC_WINDOWS_MSVC_OPENSSL_CONFIG_DIR'
+                )) {
                 if ([System.Environment]::GetEnvironmentVariable($clearedVariable, 'Process')) {
                     throw "$clearedVariable was not cleared."
                 }
             }
 
             $boundary = [array]::IndexOf($invocation.CargoArguments, '--')
+            $lockedFlags = @($invocation.CargoArguments | Where-Object { $_ -ceq '--locked' })
+            Assert-Equal 1 $lockedFlags.Count 'The requested Cargo command is not locked exactly once.'
             $targetFlag = [array]::IndexOf($invocation.CargoArguments, '--target')
             $targetDirectoryFlag = [array]::IndexOf($invocation.CargoArguments, '--target-dir')
+            $configFlag = [array]::IndexOf($invocation.CargoArguments, '--config')
             if ($targetFlag -lt 0 -or $targetFlag -gt $boundary) {
                 throw 'The explicit Cargo target was not inserted before application arguments.'
             }
             if ($targetDirectoryFlag -lt 0 -or $targetDirectoryFlag -gt $boundary) {
                 throw 'The controlled Cargo target directory was not inserted before application arguments.'
             }
+            if ($configFlag -lt 0 -or $configFlag -gt $boundary) {
+                throw 'The controlled Cargo config was not inserted before application arguments.'
+            }
             Assert-Equal $contract.CargoTarget $invocation.CargoArguments[$targetFlag + 1] 'The explicit Cargo target argument is wrong.'
             Assert-Equal $expectedTargetRoot $invocation.CargoArguments[$targetDirectoryFlag + 1] 'The explicit Cargo target-dir argument is wrong.'
+            $expectedCargoConfig = Join-Path $manifestRoot '.native\windows-cargo-config.toml'
+            Assert-Equal $expectedCargoConfig $invocation.CargoArguments[$configFlag + 1] 'The requested Cargo command does not use the controlled config file.'
+            $cargoConfig = [System.IO.File]::ReadAllText($expectedCargoConfig)
+            foreach ($requiredConfig in @(
+                    'CFLAGS = { value = "", force = true }',
+                    'CXXFLAGS = { value = "", force = true }',
+                    'OPENSSL_NO_VENDOR = { value = "0", force = true }',
+                    'X86_64_PC_WINDOWS_MSVC_OPENSSL_NO_VENDOR = { value = "0", force = true }',
+                    'OPENSSL_CONFIG_DIR = { value = ',
+                    'X86_64_PC_WINDOWS_MSVC_OPENSSL_CONFIG_DIR = { value = ',
+                    'OPENSSL_LOCAL_CONFIG_DIR = { value = '
+                )) {
+                if ($cargoConfig -notmatch [regex]::Escape($requiredConfig)) {
+                    throw "The controlled Cargo config does not pin '$requiredConfig'."
+                }
+            }
+            $escapedOpenSslConfig = $expectedOpenSslConfig.Replace('\', '\\')
+            Assert-Equal 3 ([regex]::Matches($cargoConfig, [regex]::Escape("value = `"$escapedOpenSslConfig`", force = true")).Count) 'The controlled OpenSSL config path is not pinned for every Cargo/OpenSSL lookup.'
         }
         finally {
             foreach ($variable in $variables) {
@@ -946,19 +1082,40 @@ try {
         }
     }
 
-    Invoke-Test 'Cargo subcommand detection preserves build test and clippy application arguments' {
+    Invoke-Test 'Cargo build test and clippy commands are locked without changing application arguments' {
         $nativeBuildModule = Get-Module | Where-Object { $_.Path -eq $modulePath } | Select-Object -First 1
+        $manifestRoot = Join-Path $testRoot 'cargo-locked-commands'
+        $selectedLinker = Join-Path $testRoot 'locked-link.exe'
+        New-Item -ItemType Directory -Path $manifestRoot -Force | Out-Null
+        [System.IO.File]::WriteAllText($selectedLinker, '')
         $cases = @(
             @{ Arguments = [string[]] @('build', '--release') },
+            @{ Arguments = [string[]] @('build', '--locked', '--release') },
             @{ Arguments = [string[]] @('--color', 'always', 'test', '--', 'bench') },
             @{ Arguments = [string[]] @('-v', 'clippy', '--', 'bench', 'rustc') }
         )
 
         foreach ($case in $cases) {
-            & $nativeBuildModule {
-                param($arguments)
-                Assert-SafeCargoArguments -CargoArguments $arguments
-            } ([string[]] $case.Arguments)
+            $originalBoundary = [array]::IndexOf($case.Arguments, '--')
+            [string[]] $expectedApplicationArguments = @()
+            if ($originalBoundary -ge 0) {
+                $expectedApplicationArguments = @($case.Arguments[$originalBoundary..($case.Arguments.Count - 1)])
+            }
+            $invocation = & $nativeBuildModule {
+                param($root, $linker, $arguments)
+                New-ControlledCargoInvocation `
+                    -ManifestRoot $root `
+                    -LinkPath $linker `
+                    -CargoArguments $arguments
+            } $manifestRoot $selectedLinker ([string[]] $case.Arguments)
+
+            $lockedFlags = @($invocation.CargoArguments | Where-Object { $_ -ceq '--locked' })
+            Assert-Equal 1 $lockedFlags.Count 'Cargo --locked was not enforced exactly once.'
+            if ($expectedApplicationArguments.Count -gt 0) {
+                $actualBoundary = [array]::IndexOf($invocation.CargoArguments, '--')
+                $actualApplicationArguments = @($invocation.CargoArguments[$actualBoundary..($invocation.CargoArguments.Count - 1)])
+                Assert-Equal ($expectedApplicationArguments -join "`0") ($actualApplicationArguments -join "`0") 'Cargo application arguments changed while enforcing the lock.'
+            }
         }
     }
 
@@ -1321,8 +1478,9 @@ exit /b 0
             'shorter absolute `--target-dir`',
             'before `cargo clean` or the requested Cargo command',
             'cargo bench',
-            'CFLAGS=/Z7',
-            'CXXFLAGS=/Z7',
+            'OPENSSL_LOCAL_CONFIG_DIR',
+            'OPENSSL_CONFIG_DIR',
+            'Ambient `CFLAGS` and `CXXFLAGS` are cleared',
             'lock-protected',
             'rollback-safe',
             'backup cleanup is best-effort',
