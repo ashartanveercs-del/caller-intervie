@@ -7,7 +7,8 @@ use serde_json::Value;
 
 use super::{
     migrations::{migrate, MigrationError},
-    AppendEventResult, ModelError, NewSession, NewSessionBrief, NewTimelineEvent, StoredSession,
+    AppendEventResult, AssociateRequestResult, ModelError, NewSession, NewSessionBrief,
+    NewTimelineEvent, RequestTurnAssociation, SessionStatus, StoredSession, StoredSessionBrief,
     StoredTimelineEvent, TimelineEventKind,
 };
 
@@ -23,6 +24,20 @@ pub enum RepositoryError {
     EventContentCollision { event_id: String },
     #[error("the requested workspace-owned session was not found")]
     NotFound,
+    #[error("session list limit must be between 1 and 100")]
+    InvalidSessionLimit { limit: usize },
+    #[error("completed sessions must have completed or interrupted status")]
+    InvalidCompletionStatus,
+    #[error("session brief could not be encoded as JSON")]
+    BriefSerialization,
+    #[error("request id is already associated with a different turn")]
+    RequestTurnAssociationConflict {
+        workspace_id: String,
+        session_id: String,
+        request_id: String,
+        existing_turn_id: String,
+        requested_turn_id: String,
+    },
     #[error(transparent)]
     Migration(#[from] MigrationError),
     #[error(transparent)]
@@ -68,7 +83,7 @@ impl SessionRepository {
             .connection
             .lock()
             .map_err(|_| RepositoryError::ConnectionUnavailable)?;
-        connection.execute("INSERT INTO sessions (workspace_id, session_id, title, language, started_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)", params![session.workspace_id, session.session_id, session.title, session.language, session.started_at_ms])?;
+        connection.execute("INSERT INTO sessions (workspace_id, session_id, mode, status, ui_language, input_language, response_language, review_language, started_at_ms, completed_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)", params![session.workspace_id, session.session_id, session.mode, session.status.as_db(), session.ui_language, session.input_language, session.response_language, session.review_language, session.started_at_ms, session.completed_at_ms])?;
         Ok(())
     }
 
@@ -78,7 +93,9 @@ impl SessionRepository {
             .connection
             .lock()
             .map_err(|_| RepositoryError::ConnectionUnavailable)?;
-        let updated = connection.execute("INSERT INTO session_briefs (workspace_id, session_id, summary, updated_at_ms) SELECT workspace_id, session_id, ?3, ?4 FROM sessions WHERE workspace_id = ?1 AND session_id = ?2 ON CONFLICT(workspace_id, session_id) DO UPDATE SET summary = excluded.summary, updated_at_ms = excluded.updated_at_ms", params![brief.workspace_id, brief.session_id, brief.summary, brief.updated_at_ms])?;
+        let brief_json =
+            serde_json::to_string(&brief.brief).map_err(|_| RepositoryError::BriefSerialization)?;
+        let updated = connection.execute("INSERT INTO session_briefs (workspace_id, session_id, brief_json, updated_at_ms) SELECT workspace_id, session_id, ?3, ?4 FROM sessions WHERE workspace_id = ?1 AND session_id = ?2 ON CONFLICT(workspace_id, session_id) DO UPDATE SET brief_json = excluded.brief_json, updated_at_ms = excluded.updated_at_ms", params![brief.workspace_id, brief.session_id, brief_json, brief.updated_at_ms])?;
         if updated == 0 {
             return Err(RepositoryError::NotFound);
         }
@@ -122,26 +139,39 @@ impl SessionRepository {
         &self,
         workspace_id: &str,
         session_id: &str,
+        status: SessionStatus,
         completed_at_ms: i64,
     ) -> Result<bool, RepositoryError> {
+        if matches!(status, SessionStatus::Active) {
+            return Err(RepositoryError::InvalidCompletionStatus);
+        }
         let connection = self
             .connection
             .lock()
             .map_err(|_| RepositoryError::ConnectionUnavailable)?;
         Ok(connection.execute(
-            "UPDATE sessions SET completed_at_ms = ?3 WHERE workspace_id = ?1 AND session_id = ?2",
-            params![workspace_id, session_id, completed_at_ms],
+            "UPDATE sessions SET status = ?3, completed_at_ms = ?4 WHERE workspace_id = ?1 AND session_id = ?2",
+            params![workspace_id, session_id, status.as_db(), completed_at_ms],
         )? > 0)
     }
 
-    pub fn list_sessions(&self, workspace_id: &str) -> Result<Vec<StoredSession>, RepositoryError> {
+    pub fn list_sessions(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StoredSession>, RepositoryError> {
+        if !(1..=100).contains(&limit) {
+            return Err(RepositoryError::InvalidSessionLimit { limit });
+        }
         let connection = self
             .connection
             .lock()
             .map_err(|_| RepositoryError::ConnectionUnavailable)?;
-        let mut statement = connection.prepare("SELECT workspace_id, session_id, title, language, started_at_ms, completed_at_ms FROM sessions WHERE workspace_id = ?1 ORDER BY started_at_ms DESC")?;
+        let mut statement = connection.prepare(&session_query(
+            "WHERE sessions.workspace_id = ?1 ORDER BY sessions.started_at_ms DESC LIMIT ?2",
+        ))?;
         let sessions = statement
-            .query_map([workspace_id], session_from_row)?
+            .query_map(params![workspace_id, limit as i64], session_from_row)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(RepositoryError::from)?;
         Ok(sessions)
@@ -156,7 +186,14 @@ impl SessionRepository {
             .connection
             .lock()
             .map_err(|_| RepositoryError::ConnectionUnavailable)?;
-        connection.query_row("SELECT workspace_id, session_id, title, language, started_at_ms, completed_at_ms FROM sessions WHERE workspace_id = ?1 AND session_id = ?2", params![workspace_id, session_id], session_from_row).optional().map_err(Into::into)
+        connection
+            .query_row(
+                &session_query("WHERE sessions.workspace_id = ?1 AND sessions.session_id = ?2"),
+                params![workspace_id, session_id],
+                session_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn get_timeline(
@@ -184,7 +221,7 @@ impl SessionRepository {
             .connection
             .lock()
             .map_err(|_| RepositoryError::ConnectionUnavailable)?;
-        connection.query_row("SELECT workspace_id, session_id, title, language, started_at_ms, completed_at_ms FROM sessions WHERE workspace_id = ?1 AND completed_at_ms IS NULL ORDER BY started_at_ms DESC LIMIT 1", [workspace_id], session_from_row).optional().map_err(Into::into)
+        connection.query_row(&session_query("WHERE sessions.workspace_id = ?1 AND sessions.status = 'active' ORDER BY sessions.started_at_ms DESC LIMIT 1"), [workspace_id], session_from_row).optional().map_err(Into::into)
     }
 
     pub fn delete_session(
@@ -200,6 +237,84 @@ impl SessionRepository {
             "DELETE FROM sessions WHERE workspace_id = ?1 AND session_id = ?2",
             params![workspace_id, session_id],
         )? > 0)
+    }
+
+    pub fn associate_request_with_turn(
+        &self,
+        association: &RequestTurnAssociation,
+    ) -> Result<AssociateRequestResult, RepositoryError> {
+        association.validate()?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| RepositoryError::ConnectionUnavailable)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_session(
+            &transaction,
+            &association.workspace_id,
+            &association.session_id,
+        )?;
+        let existing_turn_id: Option<String> = transaction
+            .query_row(
+                "SELECT turn_id FROM request_turn_associations WHERE workspace_id = ?1 AND session_id = ?2 AND request_id = ?3",
+                params![association.workspace_id, association.session_id, association.request_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing_turn_id) = existing_turn_id {
+            if existing_turn_id == association.turn_id {
+                return Ok(AssociateRequestResult::Duplicate);
+            }
+            return Err(RepositoryError::RequestTurnAssociationConflict {
+                workspace_id: association.workspace_id.clone(),
+                session_id: association.session_id.clone(),
+                request_id: association.request_id.clone(),
+                existing_turn_id,
+                requested_turn_id: association.turn_id.clone(),
+            });
+        }
+        transaction.execute(
+            "INSERT INTO request_turn_associations (workspace_id, session_id, request_id, turn_id, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![association.workspace_id, association.session_id, association.request_id, association.turn_id, association.created_at_ms],
+        )?;
+        transaction.commit()?;
+        Ok(AssociateRequestResult::Inserted)
+    }
+
+    pub fn resolve_request_turn(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+        request_id: &str,
+    ) -> Result<Option<String>, RepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| RepositoryError::ConnectionUnavailable)?;
+        connection
+            .query_row(
+                "SELECT turn_id FROM request_turn_associations WHERE workspace_id = ?1 AND session_id = ?2 AND request_id = ?3",
+                params![workspace_id, session_id, request_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn get_request_turn_associations(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+    ) -> Result<Vec<RequestTurnAssociation>, RepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| RepositoryError::ConnectionUnavailable)?;
+        let mut statement = connection.prepare("SELECT workspace_id, session_id, request_id, turn_id, created_at_ms FROM request_turn_associations WHERE workspace_id = ?1 AND session_id = ?2 ORDER BY created_at_ms, request_id")?;
+        statement
+            .query_map(params![workspace_id, session_id], association_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 }
 
@@ -298,14 +413,53 @@ fn existing_event(
     }).optional().map_err(Into::into)
 }
 
+fn session_query(suffix: &str) -> String {
+    format!(
+        "SELECT sessions.workspace_id, sessions.session_id, sessions.mode, sessions.status,
+                sessions.ui_language, sessions.input_language, sessions.response_language,
+                sessions.review_language, sessions.started_at_ms, sessions.completed_at_ms,
+                session_briefs.brief_json, session_briefs.updated_at_ms
+         FROM sessions LEFT JOIN session_briefs
+           ON session_briefs.workspace_id = sessions.workspace_id
+          AND session_briefs.session_id = sessions.session_id {suffix}"
+    )
+}
+
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredSession> {
+    let status: String = row.get(3)?;
+    let brief_json: Option<String> = row.get(10)?;
+    let brief = brief_json
+        .map(|brief_json| {
+            Ok(StoredSessionBrief {
+                brief: serde_json::from_str(&brief_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(10, Type::Text, Box::new(error))
+                })?,
+                updated_at_ms: row.get(11)?,
+            })
+        })
+        .transpose()?;
     Ok(StoredSession {
         workspace_id: row.get(0)?,
         session_id: row.get(1)?,
-        title: row.get(2)?,
-        language: row.get(3)?,
-        started_at_ms: row.get(4)?,
-        completed_at_ms: row.get(5)?,
+        mode: row.get(2)?,
+        status: SessionStatus::from_db(&status).map_err(|_| rusqlite::Error::InvalidQuery)?,
+        ui_language: row.get(4)?,
+        input_language: row.get(5)?,
+        response_language: row.get(6)?,
+        review_language: row.get(7)?,
+        started_at_ms: row.get(8)?,
+        completed_at_ms: row.get(9)?,
+        brief,
+    })
+}
+
+fn association_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestTurnAssociation> {
+    Ok(RequestTurnAssociation {
+        workspace_id: row.get(0)?,
+        session_id: row.get(1)?,
+        request_id: row.get(2)?,
+        turn_id: row.get(3)?,
+        created_at_ms: row.get(4)?,
     })
 }
 fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTimelineEvent> {
@@ -329,10 +483,10 @@ fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTimelineEve
 
 #[cfg(test)]
 mod tests {
-    use super::{RepositoryError, SessionRepository};
+    use super::{AssociateRequestResult, RepositoryError, SessionRepository};
     use crate::{
         AppendEventResult, ModelError, NewSession, NewSessionBrief, NewTimelineEvent,
-        TimelineEventKind,
+        RequestTurnAssociation, SessionStatus, TimelineEventKind,
     };
     use rusqlite::params;
     use serde_json::json;
@@ -380,9 +534,14 @@ mod tests {
         NewSession {
             workspace_id: workspace_id.into(),
             session_id: SESSION.into(),
-            title: Some("Interview".into()),
-            language: "en-US".into(),
+            mode: "interview".into(),
+            status: SessionStatus::Active,
+            ui_language: Some("en-US".into()),
+            input_language: "en-US".into(),
+            response_language: "en-US".into(),
+            review_language: "en-US".into(),
             started_at_ms: 1_700_000_000_000,
+            completed_at_ms: None,
         }
     }
     fn event(event_id: &str, kind: TimelineEventKind) -> NewTimelineEvent {
@@ -443,7 +602,7 @@ mod tests {
         }
 
         let reopened = SessionRepository::open(&path, &key(0x41)).unwrap();
-        assert_eq!(reopened.list_sessions(WORKSPACE_A).unwrap().len(), 1);
+        assert_eq!(reopened.list_sessions(WORKSPACE_A, 10).unwrap().len(), 1);
     }
 
     #[test]
@@ -527,7 +686,7 @@ mod tests {
         let invalid_brief = NewSessionBrief {
             workspace_id: WORKSPACE_A.into(),
             session_id: String::new(),
-            summary: "brief".into(),
+            brief: json!({"summary": "brief"}),
             updated_at_ms: 1,
         };
         assert!(matches!(
@@ -604,7 +763,7 @@ mod tests {
             .save_session_brief(&NewSessionBrief {
                 workspace_id: WORKSPACE_A.into(),
                 session_id: SESSION.into(),
-                summary: "private brief".into(),
+                brief: json!({"summary": "private brief"}),
                 updated_at_ms: 1_700_000_000_002,
             })
             .unwrap();
@@ -643,7 +802,12 @@ mod tests {
         repository.create_session(&older).unwrap();
         repository.create_session(&newer).unwrap();
         repository
-            .complete_session(WORKSPACE_A, "newer", 1_700_000_000_020)
+            .complete_session(
+                WORKSPACE_A,
+                "newer",
+                SessionStatus::Completed,
+                1_700_000_000_020,
+            )
             .unwrap();
         assert_eq!(
             repository
@@ -666,10 +830,154 @@ mod tests {
         let note = event("list-and-timeline", TimelineEventKind::Note);
         repository.append_event(&note).unwrap();
 
-        assert_eq!(repository.list_sessions(WORKSPACE_A).unwrap().len(), 1);
+        assert_eq!(repository.list_sessions(WORKSPACE_A, 10).unwrap().len(), 1);
         assert_eq!(
             repository.get_timeline(WORKSPACE_A, SESSION).unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn sessions_materialize_json_briefs_and_restore_only_active_status() {
+        let (_temp, _path, repository) = repository();
+        let mut interrupted = session(WORKSPACE_A);
+        interrupted.session_id = "interrupted".into();
+        interrupted.status = SessionStatus::Interrupted;
+        interrupted.completed_at_ms = Some(1_700_000_000_020);
+        repository.create_session(&interrupted).unwrap();
+        repository.create_session(&session(WORKSPACE_A)).unwrap();
+        let brief = json!({"role": "staff engineer", "topics": ["Rust", "SQLite"]});
+        repository
+            .save_session_brief(&NewSessionBrief {
+                workspace_id: WORKSPACE_A.into(),
+                session_id: SESSION.into(),
+                brief: brief.clone(),
+                updated_at_ms: 1_700_000_000_030,
+            })
+            .unwrap();
+
+        let stored = repository
+            .get_session(WORKSPACE_A, SESSION)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, SessionStatus::Active);
+        assert_eq!(stored.brief.unwrap().brief, brief);
+        assert_eq!(
+            repository
+                .restore_active_session(WORKSPACE_A)
+                .unwrap()
+                .unwrap()
+                .session_id,
+            SESSION
+        );
+    }
+
+    #[test]
+    fn complete_session_accepts_interrupted_status() {
+        let (_temp, _path, repository) = repository();
+        repository.create_session(&session(WORKSPACE_A)).unwrap();
+
+        assert!(repository
+            .complete_session(
+                WORKSPACE_A,
+                SESSION,
+                SessionStatus::Interrupted,
+                1_700_000_000_050,
+            )
+            .unwrap());
+        let stored = repository
+            .get_session(WORKSPACE_A, SESSION)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, SessionStatus::Interrupted);
+        assert_eq!(stored.completed_at_ms, Some(1_700_000_000_050));
+    }
+
+    #[test]
+    fn list_sessions_rejects_out_of_range_limits() {
+        let (_temp, _path, repository) = repository();
+        assert!(matches!(
+            repository.list_sessions(WORKSPACE_A, 0),
+            Err(RepositoryError::InvalidSessionLimit { limit: 0 })
+        ));
+        assert!(matches!(
+            repository.list_sessions(WORKSPACE_A, 101),
+            Err(RepositoryError::InvalidSessionLimit { limit: 101 })
+        ));
+    }
+
+    #[test]
+    fn request_turn_association_is_idempotent_and_rejects_conflicts() {
+        let (_temp, _path, repository) = repository();
+        repository.create_session(&session(WORKSPACE_A)).unwrap();
+        let association = RequestTurnAssociation {
+            workspace_id: WORKSPACE_A.into(),
+            session_id: SESSION.into(),
+            request_id: "request-a".into(),
+            turn_id: "turn-a".into(),
+            created_at_ms: 1_700_000_000_040,
+        };
+        assert_eq!(
+            repository
+                .associate_request_with_turn(&association)
+                .unwrap(),
+            AssociateRequestResult::Inserted
+        );
+        assert_eq!(
+            repository
+                .associate_request_with_turn(&association)
+                .unwrap(),
+            AssociateRequestResult::Duplicate
+        );
+        let mut conflicting = association.clone();
+        conflicting.turn_id = "turn-b".into();
+        assert!(matches!(
+            repository.associate_request_with_turn(&conflicting),
+            Err(RepositoryError::RequestTurnAssociationConflict { .. })
+        ));
+        assert_eq!(
+            repository
+                .resolve_request_turn(WORKSPACE_A, SESSION, "request-a")
+                .unwrap()
+                .as_deref(),
+            Some("turn-a")
+        );
+    }
+
+    #[test]
+    fn request_turn_associations_persist_and_cascade_with_owned_session() {
+        let (_temp, path, repository) = repository();
+        repository.create_session(&session(WORKSPACE_A)).unwrap();
+        let association = RequestTurnAssociation {
+            workspace_id: WORKSPACE_A.into(),
+            session_id: SESSION.into(),
+            request_id: "request-a".into(),
+            turn_id: "turn-a".into(),
+            created_at_ms: 1_700_000_000_040,
+        };
+        repository
+            .associate_request_with_turn(&association)
+            .unwrap();
+        assert!(matches!(
+            repository.associate_request_with_turn(&RequestTurnAssociation {
+                workspace_id: WORKSPACE_B.into(),
+                ..association.clone()
+            }),
+            Err(RepositoryError::NotFound)
+        ));
+        drop(repository);
+
+        let reopened = SessionRepository::open(&path, &key(0x41)).unwrap();
+        assert_eq!(
+            reopened
+                .get_request_turn_associations(WORKSPACE_A, SESSION)
+                .unwrap(),
+            vec![association]
+        );
+        assert!(reopened.delete_session(WORKSPACE_A, SESSION).unwrap());
+        assert!(reopened
+            .get_request_turn_associations(WORKSPACE_A, SESSION)
+            .unwrap()
+            .is_empty());
     }
 }

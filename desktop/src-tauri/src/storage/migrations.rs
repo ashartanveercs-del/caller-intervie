@@ -1,8 +1,11 @@
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 
-use super::models::{NewSession, NewSessionBrief, NewTimelineEvent, TimelineEventKind};
+use super::models::{
+    NewSession, NewSessionBrief, NewTimelineEvent, RequestTurnAssociation, SessionStatus,
+    TimelineEventKind,
+};
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MigrationError {
@@ -19,7 +22,7 @@ pub enum MigrationError {
 pub fn migrate(connection: &mut Connection) -> Result<(), MigrationError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let version: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version != 0 && version != SCHEMA_VERSION {
+    if !(0..=SCHEMA_VERSION).contains(&version) {
         return Err(MigrationError::UnsupportedSchemaVersion { found: version });
     }
     for table in ["sessions", "session_briefs", "timeline_events", "settings"] {
@@ -43,33 +46,186 @@ pub fn migrate(connection: &mut Connection) -> Result<(), MigrationError> {
         }
     }
     if version == 0 {
-        transaction.execute_batch(
-            "CREATE TABLE sessions (
-                workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, title TEXT, language TEXT NOT NULL,
-                started_at_ms INTEGER NOT NULL, completed_at_ms INTEGER, PRIMARY KEY (workspace_id, session_id)
-            );
-            CREATE TABLE session_briefs (
-                workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, summary TEXT NOT NULL, updated_at_ms INTEGER NOT NULL,
-                PRIMARY KEY (workspace_id, session_id),
-                FOREIGN KEY (workspace_id, session_id) REFERENCES sessions(workspace_id, session_id) ON DELETE CASCADE
-            );
-            CREATE TABLE timeline_events (
-                event_id TEXT PRIMARY KEY NOT NULL, workspace_id TEXT NOT NULL, session_id TEXT NOT NULL,
-                host_sequence INTEGER NOT NULL, source_generation INTEGER NOT NULL, source_sequence INTEGER NOT NULL,
-                timestamp_ms INTEGER NOT NULL, kind TEXT NOT NULL, correlation_id TEXT, request_id TEXT, turn_id TEXT,
-                payload_json TEXT NOT NULL,
-                UNIQUE (workspace_id, session_id, host_sequence),
-                FOREIGN KEY (workspace_id, session_id) REFERENCES sessions(workspace_id, session_id) ON DELETE CASCADE
-            );
-            CREATE TABLE settings (
-                workspace_id TEXT NOT NULL, setting_key TEXT NOT NULL, value_json TEXT NOT NULL,
-                PRIMARY KEY (workspace_id, setting_key)
-            );"
-        )?;
+        create_v2_schema(&transaction)?;
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    } else if version == 1 {
+        migrate_v1_to_v2(&transaction)?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
     validate_current_schema(&transaction)?;
     transaction.commit()?;
+    Ok(())
+}
+
+fn create_v2_schema(transaction: &Transaction<'_>) -> Result<(), MigrationError> {
+    transaction.execute_batch(
+        "CREATE TABLE sessions (
+            workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, mode TEXT NOT NULL, status TEXT NOT NULL,
+            ui_language TEXT, input_language TEXT NOT NULL, response_language TEXT NOT NULL,
+            review_language TEXT NOT NULL, started_at_ms INTEGER NOT NULL, completed_at_ms INTEGER,
+            PRIMARY KEY (workspace_id, session_id)
+        );
+        CREATE TABLE session_briefs (
+            workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, brief_json TEXT NOT NULL,
+            updated_at_ms INTEGER NOT NULL, PRIMARY KEY (workspace_id, session_id),
+            FOREIGN KEY (workspace_id, session_id) REFERENCES sessions(workspace_id, session_id) ON DELETE CASCADE
+        );
+        CREATE TABLE timeline_events (
+            event_id TEXT PRIMARY KEY NOT NULL, workspace_id TEXT NOT NULL, session_id TEXT NOT NULL,
+            host_sequence INTEGER NOT NULL, source_generation INTEGER NOT NULL, source_sequence INTEGER NOT NULL,
+            timestamp_ms INTEGER NOT NULL, kind TEXT NOT NULL, correlation_id TEXT, request_id TEXT, turn_id TEXT,
+            payload_json TEXT NOT NULL, UNIQUE (workspace_id, session_id, host_sequence),
+            FOREIGN KEY (workspace_id, session_id) REFERENCES sessions(workspace_id, session_id) ON DELETE CASCADE
+        );
+        CREATE TABLE request_turn_associations (
+            workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, request_id TEXT NOT NULL, turn_id TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL, PRIMARY KEY (workspace_id, session_id, request_id),
+            FOREIGN KEY (workspace_id, session_id) REFERENCES sessions(workspace_id, session_id) ON DELETE CASCADE
+        );
+        CREATE TABLE settings (
+            workspace_id TEXT NOT NULL, setting_key TEXT NOT NULL, value_json TEXT NOT NULL,
+            PRIMARY KEY (workspace_id, setting_key)
+        );",
+    )?;
+    Ok(())
+}
+
+fn migrate_v1_to_v2(transaction: &Transaction<'_>) -> Result<(), MigrationError> {
+    validate_v1_schema(transaction)?;
+    let sessions = {
+        let mut statement = transaction.prepare(
+            "SELECT workspace_id, session_id, language, started_at_ms, completed_at_ms FROM sessions",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let briefs = {
+        let mut statement = transaction.prepare(
+            "SELECT workspace_id, session_id, summary, updated_at_ms FROM session_briefs",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let events = {
+        let mut statement = transaction.prepare("SELECT event_id, workspace_id, session_id, host_sequence, source_generation, source_sequence, timestamp_ms, kind, correlation_id, request_id, turn_id, payload_json FROM timeline_events")?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, String>(11)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    transaction.execute_batch(
+        "ALTER TABLE session_briefs RENAME TO session_briefs_v1;
+         ALTER TABLE timeline_events RENAME TO timeline_events_v1;
+         ALTER TABLE sessions RENAME TO sessions_v1;",
+    )?;
+    create_v2_schema_without_settings(transaction)?;
+    for (workspace_id, session_id, language, started_at_ms, completed_at_ms) in sessions {
+        let status = if completed_at_ms.is_some() {
+            SessionStatus::Completed
+        } else {
+            SessionStatus::Active
+        };
+        transaction.execute(
+            "INSERT INTO sessions (workspace_id, session_id, mode, status, ui_language, input_language, response_language, review_language, started_at_ms, completed_at_ms) VALUES (?1, ?2, 'interview', ?3, NULL, ?4, ?4, ?4, ?5, ?6)",
+            rusqlite::params![workspace_id, session_id, status.as_db(), language, started_at_ms, completed_at_ms],
+        )?;
+    }
+    for (workspace_id, session_id, summary, updated_at_ms) in briefs {
+        let brief_json = serde_json::to_string(&serde_json::json!({ "summary": summary }))
+            .map_err(|error| MigrationError::SchemaIntegrity {
+                reason: error.to_string(),
+            })?;
+        transaction.execute(
+            "INSERT INTO session_briefs (workspace_id, session_id, brief_json, updated_at_ms) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![workspace_id, session_id, brief_json, updated_at_ms],
+        )?;
+    }
+    for (
+        event_id,
+        workspace_id,
+        session_id,
+        host_sequence,
+        source_generation,
+        source_sequence,
+        timestamp_ms,
+        kind,
+        correlation_id,
+        request_id,
+        turn_id,
+        payload_json,
+    ) in events
+    {
+        transaction.execute(
+            "INSERT INTO timeline_events (event_id, workspace_id, session_id, host_sequence, source_generation, source_sequence, timestamp_ms, kind, correlation_id, request_id, turn_id, payload_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![event_id, workspace_id, session_id, host_sequence, source_generation, source_sequence, timestamp_ms, kind, correlation_id, request_id, turn_id, payload_json],
+        )?;
+    }
+    transaction.execute_batch(
+        "DROP TABLE session_briefs_v1;
+         DROP TABLE timeline_events_v1;
+         DROP TABLE sessions_v1;",
+    )?;
+    Ok(())
+}
+
+fn create_v2_schema_without_settings(transaction: &Transaction<'_>) -> Result<(), MigrationError> {
+    transaction.execute_batch(
+        "CREATE TABLE sessions (
+            workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, mode TEXT NOT NULL, status TEXT NOT NULL,
+            ui_language TEXT, input_language TEXT NOT NULL, response_language TEXT NOT NULL,
+            review_language TEXT NOT NULL, started_at_ms INTEGER NOT NULL, completed_at_ms INTEGER,
+            PRIMARY KEY (workspace_id, session_id)
+        );
+        CREATE TABLE session_briefs (
+            workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, brief_json TEXT NOT NULL,
+            updated_at_ms INTEGER NOT NULL, PRIMARY KEY (workspace_id, session_id),
+            FOREIGN KEY (workspace_id, session_id) REFERENCES sessions(workspace_id, session_id) ON DELETE CASCADE
+        );
+        CREATE TABLE timeline_events (
+            event_id TEXT PRIMARY KEY NOT NULL, workspace_id TEXT NOT NULL, session_id TEXT NOT NULL,
+            host_sequence INTEGER NOT NULL, source_generation INTEGER NOT NULL, source_sequence INTEGER NOT NULL,
+            timestamp_ms INTEGER NOT NULL, kind TEXT NOT NULL, correlation_id TEXT, request_id TEXT, turn_id TEXT,
+            payload_json TEXT NOT NULL, UNIQUE (workspace_id, session_id, host_sequence),
+            FOREIGN KEY (workspace_id, session_id) REFERENCES sessions(workspace_id, session_id) ON DELETE CASCADE
+        );
+        CREATE TABLE request_turn_associations (
+            workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, request_id TEXT NOT NULL, turn_id TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL, PRIMARY KEY (workspace_id, session_id, request_id),
+            FOREIGN KEY (workspace_id, session_id) REFERENCES sessions(workspace_id, session_id) ON DELETE CASCADE
+        );",
+    )?;
     Ok(())
 }
 
@@ -80,8 +236,12 @@ fn validate_current_schema(transaction: &Transaction<'_>) -> Result<(), Migratio
         &[
             ColumnSpec::new("workspace_id", "TEXT", true, 1).with_binary_collation(),
             ColumnSpec::new("session_id", "TEXT", true, 2).with_binary_collation(),
-            ColumnSpec::new("title", "TEXT", false, 0),
-            ColumnSpec::new("language", "TEXT", true, 0),
+            ColumnSpec::new("mode", "TEXT", true, 0),
+            ColumnSpec::new("status", "TEXT", true, 0),
+            ColumnSpec::new("ui_language", "TEXT", false, 0),
+            ColumnSpec::new("input_language", "TEXT", true, 0),
+            ColumnSpec::new("response_language", "TEXT", true, 0),
+            ColumnSpec::new("review_language", "TEXT", true, 0),
             ColumnSpec::new("started_at_ms", "INTEGER", true, 0),
             ColumnSpec::new("completed_at_ms", "INTEGER", false, 0),
         ],
@@ -92,8 +252,19 @@ fn validate_current_schema(transaction: &Transaction<'_>) -> Result<(), Migratio
         &[
             ColumnSpec::new("workspace_id", "TEXT", true, 1).with_binary_collation(),
             ColumnSpec::new("session_id", "TEXT", true, 2).with_binary_collation(),
-            ColumnSpec::new("summary", "TEXT", true, 0),
+            ColumnSpec::new("brief_json", "TEXT", true, 0),
             ColumnSpec::new("updated_at_ms", "INTEGER", true, 0),
+        ],
+    )?;
+    validate_table(
+        transaction,
+        "request_turn_associations",
+        &[
+            ColumnSpec::new("workspace_id", "TEXT", true, 1).with_binary_collation(),
+            ColumnSpec::new("session_id", "TEXT", true, 2).with_binary_collation(),
+            ColumnSpec::new("request_id", "TEXT", true, 3),
+            ColumnSpec::new("turn_id", "TEXT", true, 0),
+            ColumnSpec::new("created_at_ms", "INTEGER", true, 0),
         ],
     )?;
     validate_table(
@@ -144,6 +315,14 @@ fn validate_current_schema(transaction: &Transaction<'_>) -> Result<(), Migratio
     )?;
     validate_unique_indexes(
         transaction,
+        "request_turn_associations",
+        &[UniqueIndexSpec::new(
+            "pk",
+            &["workspace_id", "session_id", "request_id"],
+        )],
+    )?;
+    validate_unique_indexes(
+        transaction,
         "settings",
         &[UniqueIndexSpec::new("pk", &["workspace_id", "setting_key"])],
     )?;
@@ -155,7 +334,11 @@ fn validate_current_schema(transaction: &Transaction<'_>) -> Result<(), Migratio
             });
         }
     }
-    for table in ["session_briefs", "timeline_events"] {
+    for table in [
+        "session_briefs",
+        "timeline_events",
+        "request_turn_associations",
+    ] {
         if !has_workspace_session_cascade(transaction, table)? {
             return Err(MigrationError::SchemaIntegrity {
                 reason: format!(
@@ -172,6 +355,102 @@ fn validate_current_schema(transaction: &Transaction<'_>) -> Result<(), Migratio
     }
     validate_current_rows(transaction)?;
     Ok(())
+}
+
+fn validate_v1_schema(transaction: &Transaction<'_>) -> Result<(), MigrationError> {
+    validate_table(
+        transaction,
+        "sessions",
+        &[
+            ColumnSpec::new("workspace_id", "TEXT", true, 1).with_binary_collation(),
+            ColumnSpec::new("session_id", "TEXT", true, 2).with_binary_collation(),
+            ColumnSpec::new("title", "TEXT", false, 0),
+            ColumnSpec::new("language", "TEXT", true, 0),
+            ColumnSpec::new("started_at_ms", "INTEGER", true, 0),
+            ColumnSpec::new("completed_at_ms", "INTEGER", false, 0),
+        ],
+    )?;
+    validate_table(
+        transaction,
+        "session_briefs",
+        &[
+            ColumnSpec::new("workspace_id", "TEXT", true, 1).with_binary_collation(),
+            ColumnSpec::new("session_id", "TEXT", true, 2).with_binary_collation(),
+            ColumnSpec::new("summary", "TEXT", true, 0),
+            ColumnSpec::new("updated_at_ms", "INTEGER", true, 0),
+        ],
+    )?;
+    validate_table(
+        transaction,
+        "timeline_events",
+        &[
+            ColumnSpec::new("event_id", "TEXT", true, 1),
+            ColumnSpec::new("workspace_id", "TEXT", true, 0).with_binary_collation(),
+            ColumnSpec::new("session_id", "TEXT", true, 0).with_binary_collation(),
+            ColumnSpec::new("host_sequence", "INTEGER", true, 0),
+            ColumnSpec::new("source_generation", "INTEGER", true, 0),
+            ColumnSpec::new("source_sequence", "INTEGER", true, 0),
+            ColumnSpec::new("timestamp_ms", "INTEGER", true, 0),
+            ColumnSpec::new("kind", "TEXT", true, 0),
+            ColumnSpec::new("correlation_id", "TEXT", false, 0),
+            ColumnSpec::new("request_id", "TEXT", false, 0),
+            ColumnSpec::new("turn_id", "TEXT", false, 0),
+            ColumnSpec::new("payload_json", "TEXT", true, 0),
+        ],
+    )?;
+    validate_table(
+        transaction,
+        "settings",
+        &[
+            ColumnSpec::new("workspace_id", "TEXT", true, 1).with_binary_collation(),
+            ColumnSpec::new("setting_key", "TEXT", true, 2),
+            ColumnSpec::new("value_json", "TEXT", true, 0),
+        ],
+    )?;
+    validate_unique_indexes(
+        transaction,
+        "sessions",
+        &[UniqueIndexSpec::new("pk", &["workspace_id", "session_id"])],
+    )?;
+    validate_unique_indexes(
+        transaction,
+        "session_briefs",
+        &[UniqueIndexSpec::new("pk", &["workspace_id", "session_id"])],
+    )?;
+    validate_unique_indexes(
+        transaction,
+        "timeline_events",
+        &[
+            UniqueIndexSpec::new("pk", &["event_id"]),
+            UniqueIndexSpec::new("u", &["workspace_id", "session_id", "host_sequence"]),
+        ],
+    )?;
+    validate_unique_indexes(
+        transaction,
+        "settings",
+        &[UniqueIndexSpec::new("pk", &["workspace_id", "setting_key"])],
+    )?;
+    for table in ["sessions", "settings"] {
+        if !foreign_keys(transaction, table)?.is_empty() {
+            return Err(MigrationError::SchemaIntegrity {
+                reason: format!("{table} has unexpected foreign keys"),
+            });
+        }
+    }
+    for table in ["session_briefs", "timeline_events"] {
+        if !has_workspace_session_cascade(transaction, table)? {
+            return Err(MigrationError::SchemaIntegrity {
+                reason: format!("{table} must have an ownership cascade"),
+            });
+        }
+    }
+    let mut foreign_key_check = transaction.prepare("PRAGMA foreign_key_check")?;
+    if foreign_key_check.query([])?.next()?.is_some() {
+        return Err(MigrationError::SchemaIntegrity {
+            reason: "the database contains rows that violate ownership relationships".to_owned(),
+        });
+    }
+    validate_v1_rows(transaction)
 }
 
 #[derive(Clone, Copy)]
@@ -544,16 +823,98 @@ fn validate_unique_indexes(
     Ok(())
 }
 
+fn validate_v1_rows(transaction: &Transaction<'_>) -> Result<(), MigrationError> {
+    let mut sessions =
+        transaction.prepare("SELECT workspace_id, session_id, language FROM sessions")?;
+    for row in sessions.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })? {
+        let (workspace_id, session_id, language) = row?;
+        if workspace_id.is_empty() || session_id.is_empty() || language.is_empty() {
+            return Err(MigrationError::SchemaIntegrity {
+                reason: "sessions contains an invalid row".to_owned(),
+            });
+        }
+    }
+    let mut briefs = transaction.prepare("SELECT workspace_id, session_id FROM session_briefs")?;
+    for row in briefs.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (workspace_id, session_id) = row?;
+        if workspace_id.is_empty() || session_id.is_empty() {
+            return Err(MigrationError::SchemaIntegrity {
+                reason: "session_briefs contains an invalid row".to_owned(),
+            });
+        }
+    }
+    let mut events = transaction.prepare(
+        "SELECT workspace_id, session_id, event_id, source_generation, source_sequence,
+                timestamp_ms, kind, correlation_id, request_id, turn_id, payload_json
+         FROM timeline_events",
+    )?;
+    for event in events.query_map([], |row| {
+        let kind: String = row.get(6)?;
+        let payload_json: String = row.get(10)?;
+        Ok(NewTimelineEvent {
+            workspace_id: row.get(0)?,
+            session_id: row.get(1)?,
+            event_id: row.get(2)?,
+            source_generation: row.get(3)?,
+            source_sequence: row.get(4)?,
+            timestamp_ms: row.get(5)?,
+            kind: TimelineEventKind::from_db(&kind).map_err(|_| rusqlite::Error::InvalidQuery)?,
+            correlation_id: row.get(7)?,
+            request_id: row.get(8)?,
+            turn_id: row.get(9)?,
+            payload: serde_json::from_str(&payload_json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    10,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+        })
+    })? {
+        let event = event?;
+        if !event.kind.is_durable() || event.validate().is_err() {
+            return Err(MigrationError::SchemaIntegrity {
+                reason: "timeline_events contains an invalid row".to_owned(),
+            });
+        }
+    }
+    let mut settings = transaction.prepare("SELECT workspace_id FROM settings")?;
+    for workspace_id in settings.query_map([], |row| row.get::<_, String>(0))? {
+        if workspace_id?.is_empty() {
+            return Err(MigrationError::SchemaIntegrity {
+                reason: "settings contains an empty workspace id".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_current_rows(transaction: &Transaction<'_>) -> Result<(), MigrationError> {
-    let mut sessions = transaction
-        .prepare("SELECT workspace_id, session_id, title, language, started_at_ms FROM sessions")?;
+    let mut sessions = transaction.prepare(
+        "SELECT workspace_id, session_id, mode, status, ui_language, input_language,
+                response_language, review_language, started_at_ms, completed_at_ms FROM sessions",
+    )?;
     for session in sessions.query_map([], |row| {
         Ok(NewSession {
             workspace_id: row.get(0)?,
             session_id: row.get(1)?,
-            title: row.get(2)?,
-            language: row.get(3)?,
-            started_at_ms: row.get(4)?,
+            mode: row.get(2)?,
+            status: SessionStatus::from_db(&row.get::<_, String>(3)?)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+            ui_language: row.get(4)?,
+            input_language: row.get(5)?,
+            response_language: row.get(6)?,
+            review_language: row.get(7)?,
+            started_at_ms: row.get(8)?,
+            completed_at_ms: row.get(9)?,
         })
     })? {
         session?
@@ -563,13 +924,20 @@ fn validate_current_rows(transaction: &Transaction<'_>) -> Result<(), MigrationE
             })?;
     }
 
-    let mut briefs = transaction
-        .prepare("SELECT workspace_id, session_id, summary, updated_at_ms FROM session_briefs")?;
+    let mut briefs = transaction.prepare(
+        "SELECT workspace_id, session_id, brief_json, updated_at_ms FROM session_briefs",
+    )?;
     for brief in briefs.query_map([], |row| {
         Ok(NewSessionBrief {
             workspace_id: row.get(0)?,
             session_id: row.get(1)?,
-            summary: row.get(2)?,
+            brief: serde_json::from_str(&row.get::<_, String>(2)?).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
             updated_at_ms: row.get(3)?,
         })
     })? {
@@ -646,6 +1014,26 @@ fn validate_current_rows(transaction: &Transaction<'_>) -> Result<(), MigrationE
         })?;
     }
 
+    let mut associations = transaction.prepare(
+        "SELECT workspace_id, session_id, request_id, turn_id, created_at_ms
+         FROM request_turn_associations",
+    )?;
+    for association in associations.query_map([], |row| {
+        Ok(RequestTurnAssociation {
+            workspace_id: row.get(0)?,
+            session_id: row.get(1)?,
+            request_id: row.get(2)?,
+            turn_id: row.get(3)?,
+            created_at_ms: row.get(4)?,
+        })
+    })? {
+        association?
+            .validate()
+            .map_err(|error| MigrationError::SchemaIntegrity {
+                reason: format!("request_turn_associations contains an invalid row: {error}"),
+            })?;
+    }
+
     let mut settings = transaction.prepare("SELECT workspace_id FROM settings")?;
     for workspace_id in settings.query_map([], |row| row.get::<_, String>(0))? {
         if workspace_id?.is_empty() {
@@ -669,7 +1057,13 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        for table in ["sessions", "session_briefs", "timeline_events", "settings"] {
+        for table in [
+            "sessions",
+            "session_briefs",
+            "timeline_events",
+            "request_turn_associations",
+            "settings",
+        ] {
             let has_workspace = connection
                 .prepare(&format!("PRAGMA table_info({table})"))
                 .unwrap()
@@ -678,6 +1072,87 @@ mod tests {
                 .any(|column| column.unwrap() == "workspace_id");
             assert!(has_workspace, "{table} must carry workspace ownership");
         }
+    }
+
+    #[test]
+    fn owned_v1_schema_migrates_to_v2_without_losing_sessions_briefs_or_timeline() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE sessions (
+                    workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, title TEXT, language TEXT NOT NULL,
+                    started_at_ms INTEGER NOT NULL, completed_at_ms INTEGER, PRIMARY KEY (workspace_id, session_id)
+                );
+                CREATE TABLE session_briefs (
+                    workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, summary TEXT NOT NULL, updated_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (workspace_id, session_id),
+                    FOREIGN KEY (workspace_id, session_id) REFERENCES sessions(workspace_id, session_id) ON DELETE CASCADE
+                );
+                CREATE TABLE timeline_events (
+                    event_id TEXT PRIMARY KEY NOT NULL, workspace_id TEXT NOT NULL, session_id TEXT NOT NULL,
+                    host_sequence INTEGER NOT NULL, source_generation INTEGER NOT NULL, source_sequence INTEGER NOT NULL,
+                    timestamp_ms INTEGER NOT NULL, kind TEXT NOT NULL, correlation_id TEXT, request_id TEXT, turn_id TEXT,
+                    payload_json TEXT NOT NULL,
+                    UNIQUE (workspace_id, session_id, host_sequence),
+                    FOREIGN KEY (workspace_id, session_id) REFERENCES sessions(workspace_id, session_id) ON DELETE CASCADE
+                );
+                CREATE TABLE settings (
+                    workspace_id TEXT NOT NULL, setting_key TEXT NOT NULL, value_json TEXT NOT NULL,
+                    PRIMARY KEY (workspace_id, setting_key)
+                );
+                INSERT INTO sessions VALUES
+                    ('workspace-a', 'active', 'legacy active', 'en-US', 100, NULL),
+                    ('workspace-a', 'completed', 'legacy completed', 'ur-PK', 200, 300);
+                INSERT INTO session_briefs VALUES ('workspace-a', 'active', 'legacy brief', 400);
+                INSERT INTO timeline_events VALUES
+                    ('event-a', 'workspace-a', 'active', 1, 2, 3, 500, 'note', NULL, NULL, NULL, '{\"note\":true}');
+                PRAGMA user_version = 1;",
+            )
+            .unwrap();
+
+        migrate(&mut connection).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT mode, status, ui_language, input_language, response_language, review_language, completed_at_ms
+                     FROM sessions WHERE workspace_id = 'workspace-a' AND session_id = 'active'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, Option<i64>>(6)?)),
+                )
+                .unwrap(),
+            ("interview".into(), "active".into(), None, "en-US".into(), "en-US".into(), "en-US".into(), None)
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status, completed_at_ms FROM sessions WHERE workspace_id = 'workspace-a' AND session_id = 'completed'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+                )
+                .unwrap(),
+            ("completed".into(), Some(300))
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT brief_json FROM session_briefs WHERE workspace_id = 'workspace-a' AND session_id = 'active'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "{\"summary\":\"legacy brief\"}"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT payload_json FROM timeline_events WHERE event_id = 'event-a'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "{\"note\":true}"
+        );
     }
     #[test]
     fn unowned_legacy_schema_fails_closed() {
@@ -987,9 +1462,47 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO sessions (
-                    workspace_id, session_id, title, language, started_at_ms
-                ) VALUES ('', '', NULL, '', 1)",
+                    workspace_id, session_id, mode, status, ui_language, input_language,
+                    response_language, review_language, started_at_ms, completed_at_ms
+                ) VALUES ('', '', '', 'active', NULL, '', '', '', 1, NULL)",
                 [],
+            )
+            .unwrap();
+
+        assert!(migrate(&mut connection).is_err());
+    }
+
+    #[test]
+    fn current_schema_rejects_invalid_json_briefs() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO sessions (
+                    workspace_id, session_id, mode, status, ui_language, input_language,
+                    response_language, review_language, started_at_ms, completed_at_ms
+                ) VALUES ('workspace-a', 'session-a', 'interview', 'active', NULL, 'en', 'en', 'en', 1, NULL);
+                INSERT INTO session_briefs (workspace_id, session_id, brief_json, updated_at_ms)
+                VALUES ('workspace-a', 'session-a', '{not valid json}', 2);",
+            )
+            .unwrap();
+
+        assert!(migrate(&mut connection).is_err());
+    }
+
+    #[test]
+    fn current_schema_rejects_associations_with_empty_ids() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO sessions (
+                    workspace_id, session_id, mode, status, ui_language, input_language,
+                    response_language, review_language, started_at_ms, completed_at_ms
+                ) VALUES ('workspace-a', 'session-a', 'interview', 'active', NULL, 'en', 'en', 'en', 1, NULL);
+                INSERT INTO request_turn_associations (
+                    workspace_id, session_id, request_id, turn_id, created_at_ms
+                ) VALUES ('workspace-a', 'session-a', '', 'turn-a', 2);",
             )
             .unwrap();
 

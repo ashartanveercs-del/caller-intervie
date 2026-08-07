@@ -58,32 +58,96 @@ pub enum ModelError {
     MissingSessionId,
     #[error("session language is required")]
     MissingLanguage,
+    #[error("session mode is required")]
+    MissingMode,
+    #[error("active sessions cannot have a completion timestamp")]
+    ActiveSessionHasCompletionTimestamp,
+    #[error("completed or interrupted sessions require a completion timestamp")]
+    FinishedSessionMissingCompletionTimestamp,
     #[error("event id is required")]
     MissingEventId,
     #[error("a final transcript requires a turn id")]
     MissingTurnId,
     #[error("a completed suggestion requires request and turn ids")]
     MissingSuggestionAssociation,
+    #[error("request id is required")]
+    MissingRequestId,
+    #[error("session brief must be a JSON object")]
+    BriefMustBeObject,
     #[error("unknown persisted timeline event kind")]
     UnknownTimelineEventKind,
+    #[error("unknown persisted session status")]
+    UnknownSessionStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionStatus {
+    Active,
+    Completed,
+    Interrupted,
+}
+
+impl SessionStatus {
+    pub(crate) fn as_db(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Completed => "completed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    pub(crate) fn from_db(value: &str) -> Result<Self, ModelError> {
+        match value {
+            "active" => Ok(Self::Active),
+            "completed" => Ok(Self::Completed),
+            "interrupted" => Ok(Self::Interrupted),
+            _ => Err(ModelError::UnknownSessionStatus),
+        }
+    }
+}
+
+impl fmt::Display for SessionStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_db())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewSession {
     pub workspace_id: String,
     pub session_id: String,
-    pub title: Option<String>,
-    pub language: String,
+    pub mode: String,
+    pub status: SessionStatus,
+    pub ui_language: Option<String>,
+    pub input_language: String,
+    pub response_language: String,
+    pub review_language: String,
     pub started_at_ms: i64,
+    pub completed_at_ms: Option<i64>,
 }
 
 impl NewSession {
     pub fn validate(&self) -> Result<(), ModelError> {
         validate_ownership(&self.workspace_id, &self.session_id)?;
-        if self.language.is_empty() {
+        if self.mode.is_empty() {
+            return Err(ModelError::MissingMode);
+        }
+        if self.input_language.is_empty()
+            || self.response_language.is_empty()
+            || self.review_language.is_empty()
+            || self.ui_language.as_deref().is_some_and(str::is_empty)
+        {
             return Err(ModelError::MissingLanguage);
         }
-        Ok(())
+        match (&self.status, self.completed_at_ms) {
+            (SessionStatus::Active, Some(_)) => {
+                Err(ModelError::ActiveSessionHasCompletionTimestamp)
+            }
+            (SessionStatus::Completed | SessionStatus::Interrupted, None) => {
+                Err(ModelError::FinishedSessionMissingCompletionTimestamp)
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -91,24 +155,67 @@ impl NewSession {
 pub struct StoredSession {
     pub workspace_id: String,
     pub session_id: String,
-    pub title: Option<String>,
-    pub language: String,
+    pub mode: String,
+    pub status: SessionStatus,
+    pub ui_language: Option<String>,
+    pub input_language: String,
+    pub response_language: String,
+    pub review_language: String,
     pub started_at_ms: i64,
     pub completed_at_ms: Option<i64>,
+    pub brief: Option<StoredSessionBrief>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewSessionBrief {
     pub workspace_id: String,
     pub session_id: String,
-    pub summary: String,
+    pub brief: Value,
     pub updated_at_ms: i64,
 }
 
 impl NewSessionBrief {
     pub fn validate(&self) -> Result<(), ModelError> {
-        validate_ownership(&self.workspace_id, &self.session_id)
+        validate_ownership(&self.workspace_id, &self.session_id)?;
+        if !self.brief.is_object() {
+            return Err(ModelError::BriefMustBeObject);
+        }
+        Ok(())
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredSessionBrief {
+    pub brief: Value,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestTurnAssociation {
+    pub workspace_id: String,
+    pub session_id: String,
+    pub request_id: String,
+    pub turn_id: String,
+    pub created_at_ms: i64,
+}
+
+impl RequestTurnAssociation {
+    pub fn validate(&self) -> Result<(), ModelError> {
+        validate_ownership(&self.workspace_id, &self.session_id)?;
+        if self.request_id.is_empty() {
+            return Err(ModelError::MissingRequestId);
+        }
+        if self.turn_id.is_empty() {
+            return Err(ModelError::MissingTurnId);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AssociateRequestResult {
+    Inserted,
+    Duplicate,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -183,7 +290,7 @@ pub enum AppendEventResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{ModelError, NewTimelineEvent, TimelineEventKind};
+    use super::{ModelError, NewSessionBrief, NewTimelineEvent, TimelineEventKind};
     use serde_json::json;
 
     fn event(kind: TimelineEventKind) -> NewTimelineEvent {
@@ -233,5 +340,16 @@ mod tests {
         transcript.turn_id = Some("turn-a".into());
         transcript.workspace_id.clear();
         assert_eq!(transcript.validate(), Err(ModelError::MissingWorkspaceId));
+    }
+
+    #[test]
+    fn session_briefs_require_json_objects() {
+        let brief = NewSessionBrief {
+            workspace_id: "workspace-a".into(),
+            session_id: "session-a".into(),
+            brief: json!("legacy summary"),
+            updated_at_ms: 1,
+        };
+        assert_eq!(brief.validate(), Err(ModelError::BriefMustBeObject));
     }
 }
