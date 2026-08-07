@@ -75,8 +75,12 @@ export function RuntimeProvider({ children, platform: suppliedPlatform }: Runtim
     }
     startedRef.current = true;
     const restoreVersion = ++lifecycle.version;
-    const restoreRevision = store.getState().sessionRevision;
+    let restoreWatermark = store.getState().sessionRevision;
     const isCurrent = () => lifecycle!.users > 0 && lifecycle!.version === restoreVersion;
+    const ownsRestoredSession = (sessionId: string) => {
+      const state = store.getState();
+      return isCurrent() && state.session?.id === sessionId && state.sessionRevision === restoreWatermark;
+    };
 
     void platform.sidecarStatus()
       .then((status) => {
@@ -88,20 +92,21 @@ export function RuntimeProvider({ children, platform: suppliedPlatform }: Runtim
 
     void platform.restoreActiveSession()
       .then(async (session) => {
-        if (!session || !isCurrent() || store.getState().sessionRevision !== restoreRevision || store.getState().session) {
+        if (!session || !isCurrent() || store.getState().sessionRevision !== restoreWatermark || store.getState().session) {
           return;
         }
         store.getState().restoreSession(session);
-        const restoredRevision = store.getState().sessionRevision;
+        restoreWatermark = store.getState().sessionRevision;
         const associations = await platform.getRequestTurnAssociations(session.id);
-        if (!isCurrent() || store.getState().session?.id !== session.id || store.getState().sessionRevision !== restoredRevision) {
+        if (!ownsRestoredSession(session.id)) {
           return;
         }
         for (const association of associations) {
           store.getState().associateRequestWithTurn(association.requestId, association.turnId);
         }
+        restoreWatermark = store.getState().sessionRevision;
         const timeline = await platform.getTimeline(session.id);
-        if (!isCurrent() || store.getState().session?.id !== session.id || store.getState().sessionRevision !== restoredRevision) {
+        if (!ownsRestoredSession(session.id)) {
           return;
         }
         store.getState().restoreReplay(timeline);

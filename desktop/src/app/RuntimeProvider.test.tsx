@@ -415,6 +415,122 @@ describe("RuntimeProvider", () => {
       .toMatchObject({ text: "Recovered answer" });
   });
 
+  it("abandons restore when the session changes while associations are loading", async () => {
+    const platform = fakePlatform();
+    const associations = deferred<Array<{ requestId: string; turnId: string }>>();
+    vi.mocked(platform.restoreActiveSession).mockResolvedValueOnce(session(sessionId));
+    vi.mocked(platform.getRequestTurnAssociations).mockReturnValueOnce(associations.promise);
+    vi.mocked(platform.getTimeline).mockResolvedValueOnce([]);
+    let runtime: ReturnType<typeof useRuntime> | undefined;
+    render(
+      <RuntimeProvider platform={platform}>
+        <SessionStarter id={sessionId} onRuntime={(value) => { runtime = value; }} />
+      </RuntimeProvider>,
+    );
+    await waitFor(() => expect(platform.getRequestTurnAssociations).toHaveBeenCalledWith(sessionId));
+
+    act(() => runtime?.store.getState().endSession("completed"));
+    await act(async () => {
+      associations.resolve([]);
+      await Promise.resolve();
+    });
+
+    expect(runtime?.store.getState().session?.status).toBe("completed");
+    expect(platform.getTimeline).not.toHaveBeenCalled();
+  });
+
+  it("does not let a deferred timeline overwrite a newer live transcript", async () => {
+    const platform = fakePlatform();
+    const timeline = deferred<Envelope[]>();
+    const turnId = "018f0000-0000-7000-8000-000000000050";
+    vi.mocked(platform.restoreActiveSession).mockResolvedValueOnce(session(sessionId));
+    vi.mocked(platform.getRequestTurnAssociations).mockResolvedValueOnce([]);
+    vi.mocked(platform.getTimeline).mockReturnValueOnce(timeline.promise);
+    let runtime: ReturnType<typeof useRuntime> | undefined;
+    render(
+      <RuntimeProvider platform={platform}>
+        <SessionStarter id={sessionId} onRuntime={(value) => { runtime = value; }} />
+      </RuntimeProvider>,
+    );
+    await waitFor(() => expect(platform.getTimeline).toHaveBeenCalledWith(sessionId));
+
+    act(() => platform.emit({
+      version: 1,
+      id: "018f0000-0000-7000-8000-000000000051",
+      session_id: sessionId,
+      sequence: 11,
+      timestamp_ms: 11,
+      kind: EventKind.TRANSCRIPT_UPDATED,
+      payload: {
+        turn_id: turnId,
+        text: "New live text",
+        is_final: true,
+        speech_final: true,
+        speaker_role: "interviewer",
+      },
+      correlation_id: null,
+    }));
+    await act(async () => {
+      timeline.resolve([{
+        version: 1,
+        id: "018f0000-0000-7000-8000-000000000052",
+        session_id: sessionId,
+        sequence: 10,
+        timestamp_ms: 10,
+        kind: EventKind.TRANSCRIPT_UPDATED,
+        payload: {
+          turn_id: turnId,
+          text: "Old snapshot text",
+          is_final: true,
+          speech_final: true,
+          speaker_role: "interviewer",
+        },
+        correlation_id: null,
+      }]);
+      await Promise.resolve();
+    });
+
+    expect(runtime?.store.getState().turns).toMatchObject([{ id: turnId, text: "New live text" }]);
+    expect(runtime?.store.getState().lastSequence).toBe(11);
+  });
+
+  it("does not let a deferred timeline undo a user-ended session", async () => {
+    const platform = fakePlatform();
+    const timeline = deferred<Envelope[]>();
+    vi.mocked(platform.restoreActiveSession).mockResolvedValueOnce(session(sessionId));
+    vi.mocked(platform.getRequestTurnAssociations).mockResolvedValueOnce([]);
+    vi.mocked(platform.getTimeline).mockReturnValueOnce(timeline.promise);
+    let runtime: ReturnType<typeof useRuntime> | undefined;
+    render(
+      <RuntimeProvider platform={platform}>
+        <SessionStarter id={sessionId} onRuntime={(value) => { runtime = value; }} />
+      </RuntimeProvider>,
+    );
+    await waitFor(() => expect(platform.getTimeline).toHaveBeenCalledWith(sessionId));
+
+    act(() => runtime?.store.getState().endSession("completed"));
+    await act(async () => {
+      timeline.resolve([{
+        version: 1,
+        id: "018f0000-0000-7000-8000-000000000053",
+        session_id: sessionId,
+        sequence: 10,
+        timestamp_ms: 10,
+        kind: EventKind.SESSION_STATE,
+        payload: {
+          state: "active",
+          input_language: "en",
+          response_language: "ur",
+          review_language: "en",
+        },
+        correlation_id: null,
+      }]);
+      await Promise.resolve();
+    });
+
+    expect(runtime?.store.getState().session?.status).toBe("completed");
+  });
+
   it("records startup, restart, and status errors without throwing", async () => {
     const platform = fakePlatform();
     vi.mocked(platform.sidecarStatus).mockRejectedValueOnce(new Error("status unavailable"));

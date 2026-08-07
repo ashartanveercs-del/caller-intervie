@@ -47,9 +47,9 @@ describe("browser platform", () => {
     await expect(platform.getSession(session.id)).rejects.toThrow(/not found/i);
   });
 
-  it("restores the newest incomplete session", async () => {
+  it("restores the newest active session when multiple sessions remain active", async () => {
     const platform = createBrowserPlatform();
-    const first = await platform.createSession({
+    await platform.createSession({
       mode: "interview",
       inputLanguage: "en",
       responseLanguage: "en",
@@ -61,8 +61,6 @@ describe("browser platform", () => {
       responseLanguage: "ur",
       reviewLanguage: "en",
     });
-    await platform.completeSession(first.id, "completed");
-
     expect(await platform.restoreActiveSession()).toMatchObject({ id: second.id, status: "active" });
   });
 

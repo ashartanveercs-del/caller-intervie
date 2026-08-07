@@ -128,6 +128,9 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
       if (source === "live") {
         set({ lastSequence: envelope.sequence });
       }
+      if (envelope.session_id !== null) {
+        set((state) => ({ sessionRevision: state.sessionRevision + 1 }));
+      }
 
       switch (envelope.kind) {
         case EventKind.SIDECAR_READY:
@@ -209,6 +212,7 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
             };
           }
           return {
+            sessionRevision: state.sessionRevision + 1,
             requestToTurn: { ...state.requestToTurn, [requestId]: turnId },
             partialSuggestionsById,
             partialSuggestionIdByCorrelation,
@@ -226,13 +230,19 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
       endSession(status) {
         set((state) => ({
           session: state.session ? { ...state.session, status } : null,
+          sessionRevision: state.session ? state.sessionRevision + 1 : state.sessionRevision,
         }));
       },
       restoreSession(session) {
         const restoresCurrentSession = get().session?.id === session.id;
         if (!restoresCurrentSession) persistedSeenEventIds.clear();
         set((state) => restoresCurrentSession
-          ? { session, languages: languagesFromSession(session, state.languages.ui), lastError: null }
+          ? {
+              session,
+              sessionRevision: state.sessionRevision + 1,
+              languages: languagesFromSession(session, state.languages.ui),
+              lastError: null,
+            }
           : resetForSession(state, session));
       },
       restoreReplay(events) {
@@ -246,13 +256,14 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
           partialSuggestionsById: {},
           partialSuggestionIdByCorrelation: {},
           health: { ...unknownHealth(), storage: state.health.storage, sidecar: { status: "pending" } },
+          sessionRevision: state.sessionRevision + 1,
           sidecarGeneration: state.sidecarGeneration + 1,
           lastSequence: -1,
           lastError: null,
         }));
       },
       setLanguages(languages) {
-        set({ languages });
+        set((state) => ({ languages, sessionRevision: state.sessionRevision + 1 }));
       },
       setSidecarStatus(status) {
         set((state) => ({

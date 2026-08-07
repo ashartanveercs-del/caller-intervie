@@ -18,6 +18,7 @@ const initialStorageHealth: StorageHealth = { status: "ready", recoverable: fals
 
 export function createBrowserPlatform(): BrowserPlatform {
   const sessions = new Map<string, SessionRecord>();
+  const sessionCreationOrder = new Map<string, number>();
   const timelines = new Map<string, Envelope[]>();
   const requestTurnAssociations = new Map<string, Map<string, string>>();
   const listeners = new Set<(event: Envelope) => void>();
@@ -90,6 +91,7 @@ export function createBrowserPlatform(): BrowserPlatform {
         reviewLanguage: input.reviewLanguage,
       };
       sessions.set(id, session);
+      sessionCreationOrder.set(id, nextSession - 1);
       return cloneSession(session);
     },
     async saveSessionBrief(input) {
@@ -111,12 +113,20 @@ export function createBrowserPlatform(): BrowserPlatform {
       return [...(timelines.get(sessionId) ?? [])];
     },
     async restoreActiveSession() {
-      const active = [...sessions.values()].find((session) => session.status === "active");
+      const active = [...sessions.values()]
+        .filter((session) => session.status === "active")
+        .reduce<SessionRecord | null>((newest, candidate) => {
+          if (!newest) return candidate;
+          return (sessionCreationOrder.get(candidate.id) ?? -1) > (sessionCreationOrder.get(newest.id) ?? -1)
+            ? candidate
+            : newest;
+        }, null);
       return active ? cloneSession(active) : null;
     },
     async deleteSession(sessionId) {
       requireSession(sessions, sessionId);
       sessions.delete(sessionId);
+      sessionCreationOrder.delete(sessionId);
       timelines.delete(sessionId);
       requestTurnAssociations.delete(sessionId);
     },
