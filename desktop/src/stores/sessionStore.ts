@@ -57,7 +57,8 @@ export type UnresolvedCompletedSuggestion = Suggestion & {
 
 export type SessionStoreState = {
   session: SessionRecord | null;
-  sessionRevision: number;
+  sessionEpoch: number;
+  isRestoringSession: boolean;
   turns: TranscriptTurn[];
   partialTurnsById: Record<string, TranscriptTurn>;
   suggestionsByTurn: Record<string, Suggestion>;
@@ -78,6 +79,7 @@ export type SessionStoreState = {
   endSession(status: "completed" | "interrupted"): void;
   restoreSession(session: SessionRecord): void;
   restoreReplay(events: readonly unknown[]): void;
+  cancelRestoreReplay(): void;
   clearTransientState(): void;
   setLanguages(languages: SessionLanguages): void;
   setSidecarStatus(status: SidecarStatus): void;
@@ -85,7 +87,7 @@ export type SessionStoreState = {
   recordError(error: unknown): void;
 };
 
-type IngestionSource = "live" | "persisted";
+type IngestionSource = "live" | "persisted" | "reconciled-live";
 
 const initialLanguages: SessionLanguages = { ui: "en", input: "en", response: "en", review: "en" };
 
@@ -103,8 +105,18 @@ function unknownHealth(): RuntimeHealth {
 export function createSessionStore(): StoreApi<SessionStoreState> {
   const liveSeenEventIds = new Set<string>();
   const persistedSeenEventIds = new Set<string>();
+  let collectingRestoreEvents = false;
+  let liveEventsDuringRestore: Envelope[] = [];
+  let restoreLanguagesChanged = false;
 
   return createStore<SessionStoreState>((set, get) => {
+    const cancelRestoreReplay = () => {
+      collectingRestoreEvents = false;
+      liveEventsDuringRestore = [];
+      restoreLanguagesChanged = false;
+      set({ isRestoringSession: false });
+    };
+
     const ingest = (value: unknown, source: IngestionSource) => {
       let envelope: Envelope;
       try {
@@ -113,8 +125,8 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
         get().recordError(error);
         return;
       }
-      const seenEventIds = source === "live" ? liveSeenEventIds : persistedSeenEventIds;
-      if (!acceptsEnvelope(get(), envelope) || seenEventIds.has(envelope.id)) {
+      const seenEventIds = source === "persisted" ? persistedSeenEventIds : liveSeenEventIds;
+      if (!acceptsEnvelope(get(), envelope) || (source !== "reconciled-live" && seenEventIds.has(envelope.id))) {
         return;
       }
       if (source === "live" && envelope.kind !== EventKind.SIDECAR_READY && envelope.sequence <= get().lastSequence) {
@@ -128,8 +140,9 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
       if (source === "live") {
         set({ lastSequence: envelope.sequence });
       }
-      if (envelope.session_id !== null) {
-        set((state) => ({ sessionRevision: state.sessionRevision + 1 }));
+      if (source === "live" && collectingRestoreEvents && envelope.session_id !== null) {
+        liveEventsDuringRestore.push(envelope);
+        if (envelope.kind === EventKind.SESSION_STATE) restoreLanguagesChanged = true;
       }
 
       switch (envelope.kind) {
@@ -156,7 +169,8 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
           applyHealth(set, envelope);
           return;
         case EventKind.SESSION_STATE:
-          applySessionState(get, set, envelope);
+          applySessionState(set, envelope);
+          if (source === "live" && get().session?.status !== "active") cancelRestoreReplay();
           return;
         case EventKind.RUNTIME_ERROR:
           get().recordError(stringPayload(envelope.payload, "message") ?? "runtime error");
@@ -168,7 +182,8 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
 
     return {
       session: null,
-      sessionRevision: 0,
+      sessionEpoch: 0,
+      isRestoringSession: false,
       turns: [],
       partialTurnsById: {},
       suggestionsByTurn: {},
@@ -212,7 +227,6 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
             };
           }
           return {
-            sessionRevision: state.sessionRevision + 1,
             requestToTurn: { ...state.requestToTurn, [requestId]: turnId },
             partialSuggestionsById,
             partialSuggestionIdByCorrelation,
@@ -224,46 +238,72 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
         });
       },
       beginSession(session) {
+        cancelRestoreReplay();
         persistedSeenEventIds.clear();
         set((state) => resetForSession(state, session));
       },
       endSession(status) {
+        cancelRestoreReplay();
         set((state) => ({
           session: state.session ? { ...state.session, status } : null,
-          sessionRevision: state.session ? state.sessionRevision + 1 : state.sessionRevision,
+          sessionEpoch: state.session && state.session.status !== status
+            ? state.sessionEpoch + 1
+            : state.sessionEpoch,
         }));
       },
       restoreSession(session) {
         const restoresCurrentSession = get().session?.id === session.id;
+        collectingRestoreEvents = true;
+        liveEventsDuringRestore = [];
+        restoreLanguagesChanged = false;
         if (!restoresCurrentSession) persistedSeenEventIds.clear();
         set((state) => restoresCurrentSession
           ? {
               session,
-              sessionRevision: state.sessionRevision + 1,
+              sessionEpoch: state.session?.status !== session.status
+                ? state.sessionEpoch + 1
+                : state.sessionEpoch,
+              isRestoringSession: true,
               languages: languagesFromSession(session, state.languages.ui),
               lastError: null,
             }
-          : resetForSession(state, session));
+          : { ...resetForSession(state, session), isRestoringSession: true });
       },
       restoreReplay(events) {
+        if (collectingRestoreEvents) {
+          const concurrentLiveEvents = liveEventsDuringRestore;
+          const concurrentLanguages = restoreLanguagesChanged ? get().languages : null;
+          cancelRestoreReplay();
+          persistedSeenEventIds.clear();
+          set(clearReplayState());
+          for (const event of events) {
+            ingest(event, "persisted");
+          }
+          for (const event of concurrentLiveEvents) {
+            ingest(event, "reconciled-live");
+          }
+          if (concurrentLanguages) set({ languages: concurrentLanguages });
+          return;
+        }
         for (const event of events) {
           ingest(event, "persisted");
         }
       },
+      cancelRestoreReplay,
       clearTransientState() {
         set((state) => ({
           partialTurnsById: {},
           partialSuggestionsById: {},
           partialSuggestionIdByCorrelation: {},
           health: { ...unknownHealth(), storage: state.health.storage, sidecar: { status: "pending" } },
-          sessionRevision: state.sessionRevision + 1,
           sidecarGeneration: state.sidecarGeneration + 1,
           lastSequence: -1,
           lastError: null,
         }));
       },
       setLanguages(languages) {
-        set((state) => ({ languages, sessionRevision: state.sessionRevision + 1 }));
+        if (collectingRestoreEvents) restoreLanguagesChanged = true;
+        set({ languages });
       },
       setSidecarStatus(status) {
         set((state) => ({
@@ -296,7 +336,8 @@ function acceptsEnvelope(state: SessionStoreState, envelope: Envelope): boolean 
 function resetForSession(state: SessionStoreState, session: SessionRecord): Partial<SessionStoreState> {
   return {
     session,
-    sessionRevision: state.sessionRevision + 1,
+    sessionEpoch: state.sessionEpoch + 1,
+    isRestoringSession: false,
     turns: [],
     partialTurnsById: {},
     suggestionsByTurn: {},
@@ -307,6 +348,18 @@ function resetForSession(state: SessionStoreState, session: SessionRecord): Part
     unresolvedSuggestionCorrelations: [],
     languages: languagesFromSession(session, state.languages.ui),
     lastError: null,
+  };
+}
+
+function clearReplayState(): Partial<SessionStoreState> {
+  return {
+    turns: [],
+    partialTurnsById: {},
+    suggestionsByTurn: {},
+    partialSuggestionsById: {},
+    partialSuggestionIdByCorrelation: {},
+    unresolvedCompletedSuggestionsById: {},
+    unresolvedSuggestionCorrelations: [],
   };
 }
 
@@ -471,21 +524,22 @@ function applyHealth(set: StoreApi<SessionStoreState>["setState"], envelope: Env
 }
 
 function applySessionState(
-  get: () => SessionStoreState,
   set: StoreApi<SessionStoreState>["setState"],
   envelope: Envelope,
 ) {
-  const current = get();
   const state = sessionStatus(stringPayload(envelope.payload, "state"));
-  set({
+  set((current) => ({
     session: current.session && state ? { ...current.session, status: state } : current.session,
+    sessionEpoch: current.session && state && current.session.status !== state
+      ? current.sessionEpoch + 1
+      : current.sessionEpoch,
     languages: {
       ui: current.languages.ui,
       input: stringPayload(envelope.payload, "input_language") ?? current.languages.input,
       response: stringPayload(envelope.payload, "response_language") ?? current.languages.response,
       review: stringPayload(envelope.payload, "review_language") ?? current.languages.review,
     },
-  });
+  }));
 }
 
 function languagesFromSession(session: SessionRecord, uiFallback: string): SessionLanguages {

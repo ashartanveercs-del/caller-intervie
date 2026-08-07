@@ -78,10 +78,16 @@ function session(id: string): SessionRecord {
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((next) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((next, fail) => {
     resolve = next;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, reject, resolve };
+}
+
+function isRestoringSession(runtime: ReturnType<typeof useRuntime> | undefined) {
+  return runtime?.store.getState().isRestoringSession;
 }
 
 function SessionStarter({ id, onRuntime }: { id: string; onRuntime(runtime: ReturnType<typeof useRuntime>): void }) {
@@ -255,6 +261,63 @@ describe("RuntimeProvider", () => {
     expect(runtime?.store.getState().lastError).toMatch(/question turn/i);
   });
 
+  it("does not send or associate a query when its session ends while persistence is pending", async () => {
+    const platform = fakePlatform();
+    const association = deferred<void>();
+    vi.mocked(platform.associateRequestWithTurn).mockReturnValueOnce(association.promise);
+    let runtime: ReturnType<typeof useRuntime> | undefined;
+    render(
+      <RuntimeProvider platform={platform}>
+        <SessionStarter id={sessionId} onRuntime={(value) => { runtime = value; }} />
+      </RuntimeProvider>,
+    );
+    await waitFor(() => expect(platform.subscribe).toHaveBeenCalledTimes(1));
+    runtime?.store.getState().beginSession(session(sessionId));
+    const request = query(sessionId, "018f0000-0000-7000-8000-000000000064");
+    const pendingSend = runtime!.send(request, "018f0000-0000-7000-8000-000000000065");
+    const rejection = expect(pendingSend).rejects.toThrow(/active session/i);
+    await waitFor(() => expect(platform.associateRequestWithTurn).toHaveBeenCalledTimes(1));
+
+    act(() => runtime?.store.getState().endSession("completed"));
+    await act(async () => {
+      association.resolve(undefined);
+      await rejection;
+    });
+
+    expect(platform.send).not.toHaveBeenCalled();
+    expect(runtime?.store.getState().requestToTurn[request.id]).toBeUndefined();
+    expect(runtime?.store.getState().session?.status).toBe("completed");
+  });
+
+  it("does not send or leak a query association after another session replaces it", async () => {
+    const platform = fakePlatform();
+    const association = deferred<void>();
+    const replacementSessionId = "018f0000-0000-7000-8000-000000000066";
+    vi.mocked(platform.associateRequestWithTurn).mockReturnValueOnce(association.promise);
+    let runtime: ReturnType<typeof useRuntime> | undefined;
+    render(
+      <RuntimeProvider platform={platform}>
+        <SessionStarter id={sessionId} onRuntime={(value) => { runtime = value; }} />
+      </RuntimeProvider>,
+    );
+    await waitFor(() => expect(platform.subscribe).toHaveBeenCalledTimes(1));
+    runtime?.store.getState().beginSession(session(sessionId));
+    const request = query(sessionId, "018f0000-0000-7000-8000-000000000067");
+    const pendingSend = runtime!.send(request, "018f0000-0000-7000-8000-000000000068");
+    const rejection = expect(pendingSend).rejects.toThrow(/active session/i);
+    await waitFor(() => expect(platform.associateRequestWithTurn).toHaveBeenCalledTimes(1));
+
+    act(() => runtime?.store.getState().beginSession(session(replacementSessionId)));
+    await act(async () => {
+      association.resolve(undefined);
+      await rejection;
+    });
+
+    expect(platform.send).not.toHaveBeenCalled();
+    expect(runtime?.store.getState().requestToTurn[request.id]).toBeUndefined();
+    expect(runtime?.store.getState().session?.id).toBe(replacementSessionId);
+  });
+
   it("applies an initial storage snapshot when an event predates the query", async () => {
     const platform = fakePlatform();
     const subscription = deferred<() => void>();
@@ -415,6 +478,151 @@ describe("RuntimeProvider", () => {
       .toMatchObject({ text: "Recovered answer" });
   });
 
+  it("reconciles a live completion received while durable associations are loading", async () => {
+    const platform = fakePlatform();
+    const associations = deferred<Array<{ requestId: string; turnId: string }>>();
+    const requestId = "018f0000-0000-7000-8000-000000000054";
+    const turnId = "018f0000-0000-7000-8000-000000000055";
+    const historicalTurnId = "018f0000-0000-7000-8000-000000000056";
+    vi.mocked(platform.restoreActiveSession).mockResolvedValueOnce(session(sessionId));
+    vi.mocked(platform.getRequestTurnAssociations).mockReturnValueOnce(associations.promise);
+    vi.mocked(platform.getTimeline).mockResolvedValueOnce([{
+      version: 1,
+      id: "018f0000-0000-7000-8000-000000000057",
+      session_id: sessionId,
+      sequence: 1,
+      timestamp_ms: 1,
+      kind: EventKind.TRANSCRIPT_UPDATED,
+      payload: {
+        turn_id: historicalTurnId,
+        text: "Persisted earlier question",
+        is_final: true,
+        speech_final: true,
+        speaker_role: "interviewer",
+      },
+      correlation_id: null,
+    }]);
+    let runtime: ReturnType<typeof useRuntime> | undefined;
+    render(
+      <RuntimeProvider platform={platform}>
+        <SessionStarter id={sessionId} onRuntime={(value) => { runtime = value; }} />
+      </RuntimeProvider>,
+    );
+    await waitFor(() => expect(platform.getRequestTurnAssociations).toHaveBeenCalledWith(sessionId));
+
+    act(() => platform.emit({
+      version: 1,
+      id: "018f0000-0000-7000-8000-000000000058",
+      session_id: sessionId,
+      sequence: 20,
+      timestamp_ms: 20,
+      kind: EventKind.SUGGESTION_COMPLETED,
+      payload: { suggestion_id: "suggestion-live", text: "Live answer" },
+      correlation_id: requestId,
+    }));
+    expect(runtime?.store.getState().unresolvedCompletedSuggestionsById["suggestion-live"])
+      .toMatchObject({ text: "Live answer" });
+
+    await act(async () => {
+      associations.resolve([{ requestId, turnId }]);
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(platform.getTimeline).toHaveBeenCalledWith(sessionId));
+    expect(runtime?.store.getState().requestToTurn[requestId]).toBe(turnId);
+    expect(runtime?.store.getState().suggestionsByTurn[turnId]).toMatchObject({ text: "Live answer" });
+    expect(runtime?.store.getState().turns).toMatchObject([{
+      id: historicalTurnId,
+      text: "Persisted earlier question",
+    }]);
+  });
+
+  it("stops collecting live restore events when durable association loading fails", async () => {
+    const platform = fakePlatform();
+    const associations = deferred<Array<{ requestId: string; turnId: string }>>();
+    vi.mocked(platform.restoreActiveSession).mockResolvedValueOnce(session(sessionId));
+    vi.mocked(platform.getRequestTurnAssociations).mockReturnValueOnce(associations.promise);
+    let runtime: ReturnType<typeof useRuntime> | undefined;
+    render(
+      <RuntimeProvider platform={platform}>
+        <SessionStarter id={sessionId} onRuntime={(value) => { runtime = value; }} />
+      </RuntimeProvider>,
+    );
+    await waitFor(() => expect(platform.getRequestTurnAssociations).toHaveBeenCalledWith(sessionId));
+    expect(isRestoringSession(runtime)).toBe(true);
+
+    await act(async () => {
+      associations.reject(new Error("associations unavailable"));
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(runtime?.store.getState().lastError).toBe("associations unavailable"));
+    expect(isRestoringSession(runtime)).toBe(false);
+  });
+
+  it("stops collecting live restore events when timeline loading fails", async () => {
+    const platform = fakePlatform();
+    const timeline = deferred<Envelope[]>();
+    vi.mocked(platform.restoreActiveSession).mockResolvedValueOnce(session(sessionId));
+    vi.mocked(platform.getRequestTurnAssociations).mockResolvedValueOnce([]);
+    vi.mocked(platform.getTimeline).mockReturnValueOnce(timeline.promise);
+    let runtime: ReturnType<typeof useRuntime> | undefined;
+    render(
+      <RuntimeProvider platform={platform}>
+        <SessionStarter id={sessionId} onRuntime={(value) => { runtime = value; }} />
+      </RuntimeProvider>,
+    );
+    await waitFor(() => expect(platform.getTimeline).toHaveBeenCalledWith(sessionId));
+    expect(isRestoringSession(runtime)).toBe(true);
+
+    await act(async () => {
+      timeline.reject(new Error("timeline unavailable"));
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(runtime?.store.getState().lastError).toBe("timeline unavailable"));
+    expect(isRestoringSession(runtime)).toBe(false);
+  });
+
+  it("stops collecting immediately when a terminal live session state invalidates restore", async () => {
+    const platform = fakePlatform();
+    const timeline = deferred<Envelope[]>();
+    vi.mocked(platform.restoreActiveSession).mockResolvedValueOnce(session(sessionId));
+    vi.mocked(platform.getRequestTurnAssociations).mockResolvedValueOnce([]);
+    vi.mocked(platform.getTimeline).mockReturnValueOnce(timeline.promise);
+    let runtime: ReturnType<typeof useRuntime> | undefined;
+    render(
+      <RuntimeProvider platform={platform}>
+        <SessionStarter id={sessionId} onRuntime={(value) => { runtime = value; }} />
+      </RuntimeProvider>,
+    );
+    await waitFor(() => expect(platform.getTimeline).toHaveBeenCalledWith(sessionId));
+    expect(isRestoringSession(runtime)).toBe(true);
+
+    act(() => platform.emit({
+      version: 1,
+      id: "018f0000-0000-7000-8000-000000000069",
+      session_id: sessionId,
+      sequence: 30,
+      timestamp_ms: 30,
+      kind: EventKind.SESSION_STATE,
+      payload: {
+        state: "completed",
+        input_language: "en",
+        response_language: "ur",
+        review_language: "en",
+      },
+      correlation_id: null,
+    }));
+
+    expect(runtime?.store.getState().session?.status).toBe("completed");
+    expect(isRestoringSession(runtime)).toBe(false);
+    await act(async () => {
+      timeline.resolve([]);
+      await Promise.resolve();
+    });
+  });
+
   it("abandons restore when the session changes while associations are loading", async () => {
     const platform = fakePlatform();
     const associations = deferred<Array<{ requestId: string; turnId: string }>>();
@@ -491,6 +699,81 @@ describe("RuntimeProvider", () => {
     });
 
     expect(runtime?.store.getState().turns).toMatchObject([{ id: turnId, text: "New live text" }]);
+    expect(runtime?.store.getState().lastSequence).toBe(11);
+  });
+
+  it("replays unrelated history while a deferred timeline preserves a newer live transcript", async () => {
+    const platform = fakePlatform();
+    const timeline = deferred<Envelope[]>();
+    const historicalTurnId = "018f0000-0000-7000-8000-000000000059";
+    const liveTurnId = "018f0000-0000-7000-8000-000000000060";
+    vi.mocked(platform.restoreActiveSession).mockResolvedValueOnce(session(sessionId));
+    vi.mocked(platform.getRequestTurnAssociations).mockResolvedValueOnce([]);
+    vi.mocked(platform.getTimeline).mockReturnValueOnce(timeline.promise);
+    let runtime: ReturnType<typeof useRuntime> | undefined;
+    render(
+      <RuntimeProvider platform={platform}>
+        <SessionStarter id={sessionId} onRuntime={(value) => { runtime = value; }} />
+      </RuntimeProvider>,
+    );
+    await waitFor(() => expect(platform.getTimeline).toHaveBeenCalledWith(sessionId));
+
+    act(() => platform.emit({
+      version: 1,
+      id: "018f0000-0000-7000-8000-000000000061",
+      session_id: sessionId,
+      sequence: 11,
+      timestamp_ms: 11,
+      kind: EventKind.TRANSCRIPT_UPDATED,
+      payload: {
+        turn_id: liveTurnId,
+        text: "Newest live text",
+        is_final: true,
+        speech_final: true,
+        speaker_role: "interviewer",
+      },
+      correlation_id: null,
+    }));
+    await act(async () => {
+      timeline.resolve([{
+        version: 1,
+        id: "018f0000-0000-7000-8000-000000000062",
+        session_id: sessionId,
+        sequence: 9,
+        timestamp_ms: 9,
+        kind: EventKind.TRANSCRIPT_UPDATED,
+        payload: {
+          turn_id: historicalTurnId,
+          text: "Persisted historical text",
+          is_final: true,
+          speech_final: true,
+          speaker_role: "interviewer",
+        },
+        correlation_id: null,
+      }, {
+        version: 1,
+        id: "018f0000-0000-7000-8000-000000000063",
+        session_id: sessionId,
+        sequence: 10,
+        timestamp_ms: 10,
+        kind: EventKind.TRANSCRIPT_UPDATED,
+        payload: {
+          turn_id: liveTurnId,
+          text: "Stale persisted text",
+          is_final: true,
+          speech_final: true,
+          speaker_role: "interviewer",
+        },
+        correlation_id: null,
+      }]);
+      await Promise.resolve();
+    });
+
+    expect(Object.fromEntries(runtime?.store.getState().turns.map((turn) => [turn.id, turn.text]) ?? []))
+      .toEqual({
+        [historicalTurnId]: "Persisted historical text",
+        [liveTurnId]: "Newest live text",
+      });
     expect(runtime?.store.getState().lastSequence).toBe(11);
   });
 

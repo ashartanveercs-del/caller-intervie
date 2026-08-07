@@ -75,11 +75,14 @@ export function RuntimeProvider({ children, platform: suppliedPlatform }: Runtim
     }
     startedRef.current = true;
     const restoreVersion = ++lifecycle.version;
-    let restoreWatermark = store.getState().sessionRevision;
+    let restoreEpoch = store.getState().sessionEpoch;
     const isCurrent = () => lifecycle!.users > 0 && lifecycle!.version === restoreVersion;
     const ownsRestoredSession = (sessionId: string) => {
       const state = store.getState();
-      return isCurrent() && state.session?.id === sessionId && state.sessionRevision === restoreWatermark;
+      return isCurrent()
+        && state.session?.id === sessionId
+        && state.session.status === "active"
+        && state.sessionEpoch === restoreEpoch;
     };
 
     void platform.sidecarStatus()
@@ -92,11 +95,11 @@ export function RuntimeProvider({ children, platform: suppliedPlatform }: Runtim
 
     void platform.restoreActiveSession()
       .then(async (session) => {
-        if (!session || !isCurrent() || store.getState().sessionRevision !== restoreWatermark || store.getState().session) {
+        if (!session || !isCurrent() || store.getState().sessionEpoch !== restoreEpoch || store.getState().session) {
           return;
         }
         store.getState().restoreSession(session);
-        restoreWatermark = store.getState().sessionRevision;
+        restoreEpoch = store.getState().sessionEpoch;
         const associations = await platform.getRequestTurnAssociations(session.id);
         if (!ownsRestoredSession(session.id)) {
           return;
@@ -104,7 +107,6 @@ export function RuntimeProvider({ children, platform: suppliedPlatform }: Runtim
         for (const association of associations) {
           store.getState().associateRequestWithTurn(association.requestId, association.turnId);
         }
-        restoreWatermark = store.getState().sessionRevision;
         const timeline = await platform.getTimeline(session.id);
         if (!ownsRestoredSession(session.id)) {
           return;
@@ -112,7 +114,10 @@ export function RuntimeProvider({ children, platform: suppliedPlatform }: Runtim
         store.getState().restoreReplay(timeline);
       })
       .catch((error) => {
-        if (isCurrent()) store.getState().recordError(error);
+        if (isCurrent()) {
+          store.getState().cancelRestoreReplay();
+          store.getState().recordError(error);
+        }
       });
 
     return () => releaseRestoreLifecycle(lifecycle!, restoreLifecycleRef);
@@ -229,6 +234,10 @@ export function RuntimeProvider({ children, platform: suppliedPlatform }: Runtim
           requestId: command.id,
           turnId: questionTurnId,
         });
+        const currentSession = store.getState().session;
+        if (!currentSession || currentSession.id !== activeSession.id || currentSession.status !== "active") {
+          throw new Error("query request no longer targets the active session");
+        }
         store.getState().associateRequestWithTurn(command.id, questionTurnId);
       } catch (error) {
         store.getState().recordError(error);
