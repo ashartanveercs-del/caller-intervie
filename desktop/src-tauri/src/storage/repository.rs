@@ -324,10 +324,11 @@ impl SessionRepository {
             .lock()
             .map_err(|_| RepositoryError::ConnectionUnavailable)?;
         let mut statement = connection.prepare("SELECT workspace_id, session_id, request_id, turn_id, created_at_ms FROM request_turn_associations WHERE workspace_id = ?1 AND session_id = ?2 ORDER BY created_at_ms, request_id")?;
-        statement
+        let associations = statement
             .query_map(params![workspace_id, session_id], association_from_row)?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(Into::into)
+            .map_err(RepositoryError::from)?;
+        Ok(associations)
     }
 }
 
@@ -442,7 +443,7 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredSession> 
     let status: String = row.get(3)?;
     let brief_json: Option<String> = row.get(10)?;
     let brief = brief_json
-        .map(|brief_json| {
+        .map(|brief_json| -> rusqlite::Result<StoredSessionBrief> {
             Ok(StoredSessionBrief {
                 brief: serde_json::from_str(&brief_json).map_err(|error| {
                     rusqlite::Error::FromSqlConversionFailure(10, Type::Text, Box::new(error))
@@ -497,7 +498,7 @@ fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTimelineEve
 #[cfg(test)]
 mod tests {
     use super::{AssociateRequestResult, RepositoryError, SessionRepository};
-    use crate::{
+    use crate::storage::{
         AppendEventResult, ModelError, NewSession, NewSessionBrief, NewTimelineEvent,
         RequestTurnAssociation, SessionStatus, TimelineEventKind,
     };

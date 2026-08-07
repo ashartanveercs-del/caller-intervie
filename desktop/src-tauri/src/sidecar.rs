@@ -1,10 +1,11 @@
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Serialize;
+use serde_json::Value;
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -13,11 +14,13 @@ use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex};
 
 use crate::protocol::{
     encode_frame, validate_command, validate_event, CommandKind, Envelope, EventKind, FrameDecoder,
-    MAX_FRAME_BYTES,
+    ProtocolKind, MAX_FRAME_BYTES,
 };
+use crate::storage::{AppendEventResult, NewTimelineEvent, SessionRepository, TimelineEventKind};
 
 pub const SIDECAR_PROGRAM: &str = "callerinterview-sidecar";
 pub const SIDECAR_EVENT: &str = "sidecar://event";
+pub const STORAGE_HEALTH_EVENT: &str = "storage://health";
 pub const PRODUCTION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_DIAGNOSTICS: usize = 20;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -94,15 +97,122 @@ pub trait SidecarLauncher: Send + Sync {
     async fn launch(&self) -> Result<Arc<dyn SidecarPort>, SidecarError>;
 }
 
+#[async_trait]
 pub trait SidecarEventSink: Send + Sync {
-    fn emit(&self, event: &Envelope) -> Result<(), SidecarError>;
+    async fn emit(&self, event: &Envelope) -> Result<(), SidecarError>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageHealthStatus {
+    Pending,
+    Ready,
+    Degraded,
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageHealth {
+    pub status: StorageHealthStatus,
+    pub code: Option<&'static str>,
+    pub message: Option<&'static str>,
+    pub recoverable: bool,
+}
+
+impl StorageHealth {
+    pub fn ready() -> Self {
+        Self {
+            status: StorageHealthStatus::Ready,
+            code: None,
+            message: None,
+            recoverable: false,
+        }
+    }
+
+    fn degraded(code: &'static str) -> Self {
+        Self {
+            status: StorageHealthStatus::Degraded,
+            code: Some(code),
+            message: Some(
+                "Session history could not be saved. The live session is still available.",
+            ),
+            recoverable: true,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct StorageHealthTracker {
+    current: Arc<std::sync::Mutex<StorageHealth>>,
+}
+
+impl StorageHealthTracker {
+    pub fn new(initial: StorageHealth) -> Self {
+        Self {
+            current: Arc::new(std::sync::Mutex::new(initial)),
+        }
+    }
+
+    pub fn current(&self) -> Result<StorageHealth, SidecarError> {
+        self.current
+            .lock()
+            .map(|health| health.clone())
+            .map_err(|_| {
+                SidecarError::new(
+                    "storage_health_unavailable",
+                    "storage health is unavailable",
+                )
+            })
+    }
+
+    fn set(&self, health: StorageHealth) -> Result<(), SidecarError> {
+        *self.current.lock().map_err(|_| {
+            SidecarError::new(
+                "storage_health_unavailable",
+                "storage health is unavailable",
+            )
+        })? = health;
+        Ok(())
+    }
+}
+
+pub trait StorageHealthReporter: Send + Sync {
+    fn report(&self, health: &StorageHealth) -> Result<(), SidecarError>;
+}
+
+pub trait DurableEventStore: Send + Sync {
+    fn append_event(&self, event: &NewTimelineEvent) -> Result<AppendEventResult, ()>;
+    fn resolve_request_turn(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+        request_id: &str,
+    ) -> Result<Option<String>, ()>;
+}
+
+impl DurableEventStore for SessionRepository {
+    fn append_event(&self, event: &NewTimelineEvent) -> Result<AppendEventResult, ()> {
+        SessionRepository::append_event(self, event).map_err(|_| ())
+    }
+
+    fn resolve_request_turn(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+        request_id: &str,
+    ) -> Result<Option<String>, ()> {
+        SessionRepository::resolve_request_turn(self, workspace_id, session_id, request_id)
+            .map_err(|_| ())
+    }
 }
 
 #[derive(Default)]
 struct NoopEventSink;
 
+#[async_trait]
 impl SidecarEventSink for NoopEventSink {
-    fn emit(&self, _event: &Envelope) -> Result<(), SidecarError> {
+    async fn emit(&self, _event: &Envelope) -> Result<(), SidecarError> {
         Ok(())
     }
 }
@@ -142,6 +252,7 @@ impl Default for SupervisorData {
 struct SupervisorInner {
     data: AsyncMutex<SupervisorData>,
     lifecycle: AsyncMutex<()>,
+    delivery: AsyncMutex<()>,
     launcher: Option<Arc<dyn SidecarLauncher>>,
     sink: Arc<dyn SidecarEventSink>,
     restart_delay: Duration,
@@ -168,6 +279,7 @@ impl SidecarSupervisor {
                     ..SupervisorData::default()
                 }),
                 lifecycle: AsyncMutex::new(()),
+                delivery: AsyncMutex::new(()),
                 launcher: None,
                 sink: Arc::new(NoopEventSink),
                 restart_delay: Duration::ZERO,
@@ -190,6 +302,7 @@ impl SidecarSupervisor {
             inner: Arc::new(SupervisorInner {
                 data: AsyncMutex::new(SupervisorData::default()),
                 lifecycle: AsyncMutex::new(()),
+                delivery: AsyncMutex::new(()),
                 launcher: Some(launcher),
                 sink,
                 restart_delay,
@@ -200,6 +313,7 @@ impl SidecarSupervisor {
 
     pub async fn start(&self) -> Result<SidecarStatus, SidecarError> {
         let _lifecycle = self.inner.lifecycle.lock().await;
+        let _delivery = self.inner.delivery.lock().await;
         if let Err(error) = self.launch_internal().await {
             self.fail(&error).await;
             return Err(error);
@@ -247,29 +361,46 @@ impl SidecarSupervisor {
     }
 
     pub async fn accept_stdout(&self, generation: u64, chunk: &[u8]) -> Result<(), SidecarError> {
-        let mut data = self.inner.data.lock().await;
-        if data.generation != generation {
-            return Ok(());
-        }
-        let Some(active) = data.active.as_mut() else {
-            return Ok(());
+        let _delivery = self.inner.delivery.lock().await;
+        let envelopes = {
+            let mut data = self.inner.data.lock().await;
+            if data.generation != generation {
+                return Ok(());
+            }
+            let Some(active) = data.active.as_mut() else {
+                return Ok(());
+            };
+            if active.generation != generation {
+                return Ok(());
+            }
+            let envelopes = active
+                .decoder
+                .push(chunk)
+                .map_err(|error| SidecarError::new(error.code(), error.to_string()))?;
+            envelopes
         };
-        if active.generation != generation {
-            return Ok(());
-        }
-        let envelopes = active
-            .decoder
-            .push(chunk)
-            .map_err(|error| SidecarError::new(error.code(), error.to_string()))?;
         for event in envelopes {
-            self.accept_event_locked(&mut data, generation, event)?;
+            let accepted = {
+                let mut data = self.inner.data.lock().await;
+                self.accept_event_locked(&mut data, generation, event)?
+            };
+            if let Some(event) = accepted {
+                self.inner.sink.emit(&event).await?;
+            }
         }
         Ok(())
     }
 
     pub async fn accept_event(&self, generation: u64, event: Envelope) -> Result<(), SidecarError> {
-        let mut data = self.inner.data.lock().await;
-        self.accept_event_locked(&mut data, generation, event)
+        let _delivery = self.inner.delivery.lock().await;
+        let accepted = {
+            let mut data = self.inner.data.lock().await;
+            self.accept_event_locked(&mut data, generation, event)?
+        };
+        if let Some(event) = accepted {
+            self.inner.sink.emit(&event).await?;
+        }
+        Ok(())
     }
 
     fn accept_event_locked(
@@ -277,22 +408,22 @@ impl SidecarSupervisor {
         data: &mut SupervisorData,
         generation: u64,
         event: Envelope,
-    ) -> Result<(), SidecarError> {
+    ) -> Result<Option<Envelope>, SidecarError> {
         let Some(active) = data.active.as_ref() else {
-            return Ok(());
+            return Ok(None);
         };
         if active.generation != generation || data.generation != generation {
-            return Ok(());
+            return Ok(None);
         }
         validate_event(&event)
             .map_err(|error| SidecarError::new(error.code(), "sidecar event validation failed"))?;
         let is_ready = matches!(
-            event.kind,
+            &event.kind,
             crate::protocol::ProtocolKind::Event(EventKind::SidecarReady)
         );
         if is_ready {
             if active.handshake_id.as_deref() != event.correlation_id.as_deref() {
-                return Ok(());
+                return Ok(None);
             }
             data.state = SidecarState::Ready;
         } else if !matches!(data.state, SidecarState::Ready) {
@@ -301,7 +432,7 @@ impl SidecarSupervisor {
                 "sidecar emitted an event before sidecar.ready",
             ));
         }
-        self.inner.sink.emit(&event)
+        Ok(Some(event))
     }
 
     pub async fn accept_stderr(&self, generation: u64, stderr: &[u8]) {
@@ -327,6 +458,7 @@ impl SidecarSupervisor {
 
     pub async fn handle_unexpected_exit(&self, generation: u64) {
         let _lifecycle = self.inner.lifecycle.lock().await;
+        let _delivery = self.inner.delivery.lock().await;
         let restart = {
             let mut data = self.inner.data.lock().await;
             if data.intentional_exit_generations.remove(&generation) {
@@ -367,6 +499,7 @@ impl SidecarSupervisor {
     }
 
     async fn handle_poisoned_exit(&self, generation: u64) {
+        let _delivery = self.inner.delivery.lock().await;
         let mut data = self.inner.data.lock().await;
         let Some(active) = data.active.as_ref() else {
             return;
@@ -408,6 +541,7 @@ impl SidecarSupervisor {
 
     pub async fn restart(&self) -> Result<SidecarStatus, SidecarError> {
         let _lifecycle = self.inner.lifecycle.lock().await;
+        let _delivery = self.inner.delivery.lock().await;
         self.stop_current_for_restart_internal().await?;
         {
             let mut data = self.inner.data.lock().await;
@@ -424,6 +558,7 @@ impl SidecarSupervisor {
 
     pub async fn shutdown(&self) -> Result<(), SidecarError> {
         let _lifecycle = self.inner.lifecycle.lock().await;
+        let _delivery = self.inner.delivery.lock().await;
         let generation = {
             let mut data = self.inner.data.lock().await;
             data.explicit_shutdown = true;
@@ -499,6 +634,7 @@ impl SidecarSupervisor {
 
     async fn handle_handshake_timeout(&self, generation: u64) {
         let _lifecycle = self.inner.lifecycle.lock().await;
+        let _delivery = self.inner.delivery.lock().await;
         let active = {
             let mut data = self.inner.data.lock().await;
             let Some(active) = data.active.as_ref() else {
@@ -1004,17 +1140,170 @@ impl TauriEventSink {
     }
 }
 
+#[async_trait]
 impl SidecarEventSink for TauriEventSink {
-    fn emit(&self, event: &Envelope) -> Result<(), SidecarError> {
+    async fn emit(&self, event: &Envelope) -> Result<(), SidecarError> {
         self.app
             .emit(SIDECAR_EVENT, event)
             .map_err(|error| SidecarError::new("sidecar_event_emit_failed", error.to_string()))
     }
 }
 
+pub struct TauriStorageHealthReporter {
+    app: AppHandle,
+    tracker: StorageHealthTracker,
+}
+
+impl TauriStorageHealthReporter {
+    pub fn new(app: AppHandle, tracker: StorageHealthTracker) -> Self {
+        Self { app, tracker }
+    }
+}
+
+impl StorageHealthReporter for TauriStorageHealthReporter {
+    fn report(&self, health: &StorageHealth) -> Result<(), SidecarError> {
+        self.tracker.set(health.clone())?;
+        self.app
+            .emit(STORAGE_HEALTH_EVENT, health)
+            .map_err(|error| SidecarError::new("storage_health_emit_failed", error.to_string()))
+    }
+}
+
+pub struct PersistenceAwareEventSink {
+    workspace_id: String,
+    store: Arc<dyn DurableEventStore>,
+    downstream: Arc<dyn SidecarEventSink>,
+    health: Arc<dyn StorageHealthReporter>,
+    source_generation: AtomicU64,
+}
+
+impl PersistenceAwareEventSink {
+    pub fn new(
+        workspace_id: impl Into<String>,
+        store: Arc<dyn DurableEventStore>,
+        downstream: Arc<dyn SidecarEventSink>,
+        health: Arc<dyn StorageHealthReporter>,
+    ) -> Self {
+        Self {
+            workspace_id: workspace_id.into(),
+            store,
+            downstream,
+            health,
+            source_generation: AtomicU64::new(0),
+        }
+    }
+
+    fn is_persistence_candidate(event: &Envelope) -> bool {
+        matches!(
+            &event.kind,
+            ProtocolKind::Event(EventKind::SessionState | EventKind::SuggestionCompleted)
+        ) || matches!(
+            &event.kind,
+            ProtocolKind::Event(EventKind::TranscriptUpdated)
+        ) && event.payload.get("is_final").and_then(Value::as_bool) == Some(true)
+    }
+}
+
+#[async_trait]
+impl SidecarEventSink for PersistenceAwareEventSink {
+    async fn emit(&self, event: &Envelope) -> Result<(), SidecarError> {
+        if matches!(&event.kind, ProtocolKind::Event(EventKind::SidecarReady)) {
+            self.source_generation.fetch_add(1, Ordering::SeqCst);
+        } else if Self::is_persistence_candidate(event) {
+            let store = self.store.clone();
+            let workspace_id = self.workspace_id.clone();
+            let source_generation = self.source_generation.load(Ordering::SeqCst);
+            let durable_event = event.clone();
+            let persistence = tokio::task::spawn_blocking(move || {
+                persist_durable_event(
+                    store.as_ref(),
+                    &workspace_id,
+                    source_generation,
+                    &durable_event,
+                )
+            })
+            .await
+            .unwrap_or(Err(()));
+            match persistence {
+                Ok(()) => {
+                    let _ = self.health.report(&StorageHealth::ready());
+                }
+                Err(()) => {
+                    let code = if matches!(
+                        &event.kind,
+                        ProtocolKind::Event(EventKind::SuggestionCompleted)
+                    ) {
+                        "storage_association_or_write_failed"
+                    } else {
+                        "storage_write_failed"
+                    };
+                    let _ = self.health.report(&StorageHealth::degraded(code));
+                }
+            }
+        }
+        self.downstream.emit(event).await
+    }
+}
+
+fn persist_durable_event(
+    store: &dyn DurableEventStore,
+    workspace_id: &str,
+    source_generation: u64,
+    event: &Envelope,
+) -> Result<(), ()> {
+    let ProtocolKind::Event(kind) = &event.kind else {
+        return Err(());
+    };
+    let session_id = event.session_id.as_deref().ok_or(())?;
+    let timeline_kind = match kind {
+        EventKind::SessionState => TimelineEventKind::SessionState,
+        EventKind::TranscriptUpdated
+            if event.payload.get("is_final").and_then(Value::as_bool) == Some(true) =>
+        {
+            TimelineEventKind::TranscriptFinal
+        }
+        EventKind::SuggestionCompleted => TimelineEventKind::SuggestionCompleted,
+        _ => return Err(()),
+    };
+    let request_id = matches!(kind, EventKind::SuggestionCompleted)
+        .then(|| event.correlation_id.clone())
+        .flatten();
+    let turn_id = match kind {
+        EventKind::TranscriptUpdated => event
+            .payload
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        EventKind::SuggestionCompleted => {
+            let request_id = request_id.as_deref().ok_or(())?;
+            Some(
+                store
+                    .resolve_request_turn(workspace_id, session_id, request_id)?
+                    .ok_or(())?,
+            )
+        }
+        _ => None,
+    };
+    store
+        .append_event(&NewTimelineEvent {
+            workspace_id: workspace_id.to_owned(),
+            session_id: session_id.to_owned(),
+            event_id: event.id.clone(),
+            source_generation: i64::try_from(source_generation).map_err(|_| ())?,
+            source_sequence: i64::try_from(event.sequence).map_err(|_| ())?,
+            timestamp_ms: i64::try_from(event.timestamp_ms).map_err(|_| ())?,
+            kind: timeline_kind,
+            correlation_id: event.correlation_id.clone(),
+            request_id,
+            turn_id,
+            payload: Value::Object(event.payload.clone()),
+        })
+        .map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::future::Future;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
@@ -1029,10 +1318,12 @@ mod tests {
         encode_frame, CommandKind, Envelope, EventKind, FrameDecoder, ProtocolKind,
         MAX_FRAME_BYTES, PROTOCOL_VERSION,
     };
+    use crate::storage::{AppendEventResult, NewTimelineEvent};
 
     use super::{
-        packaged_sidecar_path, redact_diagnostic, ProcessExit, ProcessRequest, SidecarError,
-        SidecarEventSink, SidecarLauncher, SidecarPort, SidecarState, SidecarSupervisor,
+        packaged_sidecar_path, redact_diagnostic, DurableEventStore, PersistenceAwareEventSink,
+        ProcessExit, ProcessRequest, SidecarError, SidecarEventSink, SidecarLauncher, SidecarPort,
+        SidecarState, SidecarSupervisor, StorageHealth, StorageHealthReporter, StorageHealthStatus,
         TokioCommand, TokioSidecarPort, SIDECAR_PROGRAM,
     };
 
@@ -1066,9 +1357,73 @@ mod tests {
         events: Mutex<Vec<Envelope>>,
     }
 
+    #[async_trait]
     impl SidecarEventSink for CollectingEventSink {
-        fn emit(&self, event: &Envelope) -> Result<(), SidecarError> {
+        async fn emit(&self, event: &Envelope) -> Result<(), SidecarError> {
             self.events.lock().unwrap().push(event.clone());
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeDurableEventStore {
+        events: Mutex<Vec<NewTimelineEvent>>,
+        associations: Mutex<HashMap<String, String>>,
+        fail_writes: AtomicBool,
+        order: Arc<Mutex<Vec<String>>>,
+        writer_threads: Mutex<Vec<std::thread::ThreadId>>,
+    }
+
+    impl DurableEventStore for FakeDurableEventStore {
+        fn append_event(&self, event: &NewTimelineEvent) -> Result<AppendEventResult, ()> {
+            self.writer_threads
+                .lock()
+                .unwrap()
+                .push(std::thread::current().id());
+            self.order.lock().unwrap().push("persist".into());
+            if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(());
+            }
+            self.events.lock().unwrap().push(event.clone());
+            Ok(AppendEventResult::Inserted { host_sequence: 1 })
+        }
+
+        fn resolve_request_turn(
+            &self,
+            _workspace_id: &str,
+            _session_id: &str,
+            request_id: &str,
+        ) -> Result<Option<String>, ()> {
+            Ok(self.associations.lock().unwrap().get(request_id).cloned())
+        }
+    }
+
+    struct OrderedEventSink {
+        order: Arc<Mutex<Vec<String>>>,
+        events: Mutex<Vec<Envelope>>,
+    }
+
+    #[async_trait]
+    impl SidecarEventSink for OrderedEventSink {
+        async fn emit(&self, event: &Envelope) -> Result<(), SidecarError> {
+            self.order.lock().unwrap().push("emit".into());
+            self.events.lock().unwrap().push(event.clone());
+            Ok(())
+        }
+    }
+
+    struct RecordingStorageHealthReporter {
+        order: Arc<Mutex<Vec<String>>>,
+        reports: Mutex<Vec<StorageHealth>>,
+    }
+
+    impl StorageHealthReporter for RecordingStorageHealthReporter {
+        fn report(&self, health: &StorageHealth) -> Result<(), SidecarError> {
+            self.order
+                .lock()
+                .unwrap()
+                .push(format!("health:{:?}", health.status).to_lowercase());
+            self.reports.lock().unwrap().push(health.clone());
             Ok(())
         }
     }
@@ -1783,5 +2138,208 @@ mod tests {
         assert!(unrelated.try_wait().unwrap().is_none());
         unrelated.start_kill().unwrap();
         unrelated.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn durable_event_is_committed_before_live_delivery() {
+        let async_executor_thread = std::thread::current().id();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let store = Arc::new(FakeDurableEventStore {
+            order: order.clone(),
+            ..Default::default()
+        });
+        let downstream = Arc::new(OrderedEventSink {
+            order: order.clone(),
+            events: Mutex::new(Vec::new()),
+        });
+        let health = Arc::new(RecordingStorageHealthReporter {
+            order: order.clone(),
+            reports: Mutex::new(Vec::new()),
+        });
+        let sink = PersistenceAwareEventSink::new(
+            "018f0000-0000-7000-8000-000000000099",
+            store.clone(),
+            downstream,
+            health,
+        );
+        let event = session_event(
+            EventKind::TranscriptUpdated,
+            Map::from_iter([
+                (
+                    "turn_id".into(),
+                    Value::String("018f0000-0000-7000-8000-000000000201".into()),
+                ),
+                ("text".into(), Value::String("final answer".into())),
+                ("is_final".into(), Value::Bool(true)),
+            ]),
+        );
+
+        sink.emit(&event).await.unwrap();
+
+        assert_eq!(
+            &*order.lock().unwrap(),
+            &["persist", "health:ready", "emit"]
+        );
+        let stored = store.events.lock().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            stored[0].turn_id.as_deref(),
+            Some("018f0000-0000-7000-8000-000000000201")
+        );
+        assert_ne!(
+            store.writer_threads.lock().unwrap()[0],
+            async_executor_thread,
+            "repository writes must cross the blocking-task boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_transcripts_and_suggestion_chunks_are_never_persisted() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let store = Arc::new(FakeDurableEventStore {
+            order: order.clone(),
+            ..Default::default()
+        });
+        let downstream = Arc::new(OrderedEventSink {
+            order: order.clone(),
+            events: Mutex::new(Vec::new()),
+        });
+        let health = Arc::new(RecordingStorageHealthReporter {
+            order: order.clone(),
+            reports: Mutex::new(Vec::new()),
+        });
+        let sink = PersistenceAwareEventSink::new("workspace", store.clone(), downstream, health);
+        let partial = session_event(
+            EventKind::TranscriptUpdated,
+            Map::from_iter([
+                ("turn_id".into(), Value::String("turn".into())),
+                ("text".into(), Value::String("partial".into())),
+                ("is_final".into(), Value::Bool(false)),
+            ]),
+        );
+        let chunk = session_event(
+            EventKind::SuggestionChunk,
+            Map::from_iter([
+                ("suggestion_id".into(), Value::String("suggestion".into())),
+                ("text".into(), Value::String("chunk".into())),
+            ]),
+        );
+
+        sink.emit(&partial).await.unwrap();
+        sink.emit(&chunk).await.unwrap();
+
+        assert!(store.events.lock().unwrap().is_empty());
+        assert_eq!(&*order.lock().unwrap(), &["emit", "emit"]);
+    }
+
+    #[tokio::test]
+    async fn storage_failure_reports_health_and_still_delivers_then_recovers() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let store = Arc::new(FakeDurableEventStore {
+            order: order.clone(),
+            fail_writes: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let downstream = Arc::new(OrderedEventSink {
+            order: order.clone(),
+            events: Mutex::new(Vec::new()),
+        });
+        let health = Arc::new(RecordingStorageHealthReporter {
+            order: order.clone(),
+            reports: Mutex::new(Vec::new()),
+        });
+        let sink = PersistenceAwareEventSink::new(
+            "workspace",
+            store.clone(),
+            downstream.clone(),
+            health.clone(),
+        );
+        let mut event = session_event(EventKind::SessionState, Map::new());
+
+        sink.emit(&event).await.unwrap();
+        store
+            .fail_writes
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        event.id = "018f0000-0000-7000-8000-000000000009".into();
+        sink.emit(&event).await.unwrap();
+
+        assert_eq!(downstream.events.lock().unwrap().len(), 2);
+        let reports = health.reports.lock().unwrap();
+        assert_eq!(reports[0].status, StorageHealthStatus::Degraded);
+        assert_eq!(reports[0].code, Some("storage_write_failed"));
+        assert!(reports[0].recoverable);
+        assert_eq!(reports[1], StorageHealth::ready());
+        assert_eq!(
+            &*order.lock().unwrap(),
+            &[
+                "persist",
+                "health:degraded",
+                "emit",
+                "persist",
+                "health:ready",
+                "emit",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reverse_suggestion_completion_uses_durable_request_associations() {
+        const REQUEST_A: &str = "018f0000-0000-7000-8000-000000000101";
+        const REQUEST_B: &str = "018f0000-0000-7000-8000-000000000102";
+        const TURN_A: &str = "018f0000-0000-7000-8000-000000000201";
+        const TURN_B: &str = "018f0000-0000-7000-8000-000000000202";
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let store = Arc::new(FakeDurableEventStore {
+            associations: Mutex::new(HashMap::from([
+                (REQUEST_A.into(), TURN_A.into()),
+                (REQUEST_B.into(), TURN_B.into()),
+            ])),
+            order: order.clone(),
+            ..Default::default()
+        });
+        let sink = PersistenceAwareEventSink::new(
+            "workspace",
+            store.clone(),
+            Arc::new(OrderedEventSink {
+                order: order.clone(),
+                events: Mutex::new(Vec::new()),
+            }),
+            Arc::new(RecordingStorageHealthReporter {
+                order,
+                reports: Mutex::new(Vec::new()),
+            }),
+        );
+        let completion = |id: &str, request_id: &str, suggestion_id: &str| Envelope {
+            id: id.into(),
+            correlation_id: Some(request_id.into()),
+            ..session_event(
+                EventKind::SuggestionCompleted,
+                Map::from_iter([
+                    ("suggestion_id".into(), Value::String(suggestion_id.into())),
+                    ("text".into(), Value::String("answer".into())),
+                ]),
+            )
+        };
+
+        sink.emit(&completion(
+            "018f0000-0000-7000-8000-000000000011",
+            REQUEST_B,
+            "018f0000-0000-7000-8000-000000000302",
+        ))
+        .await
+        .unwrap();
+        sink.emit(&completion(
+            "018f0000-0000-7000-8000-000000000010",
+            REQUEST_A,
+            "018f0000-0000-7000-8000-000000000301",
+        ))
+        .await
+        .unwrap();
+
+        let stored = store.events.lock().unwrap();
+        assert_eq!(stored[0].request_id.as_deref(), Some(REQUEST_B));
+        assert_eq!(stored[0].turn_id.as_deref(), Some(TURN_B));
+        assert_eq!(stored[1].request_id.as_deref(), Some(REQUEST_A));
+        assert_eq!(stored[1].turn_id.as_deref(), Some(TURN_A));
     }
 }

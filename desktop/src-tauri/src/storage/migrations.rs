@@ -98,7 +98,7 @@ fn migrate_v1_to_v2(transaction: &Transaction<'_>) -> Result<(), MigrationError>
         let mut statement = transaction.prepare(
             "SELECT workspace_id, session_id, title, language, started_at_ms, completed_at_ms FROM sessions",
         )?;
-        statement
+        let rows = statement
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -109,13 +109,14 @@ fn migrate_v1_to_v2(transaction: &Transaction<'_>) -> Result<(), MigrationError>
                     row.get::<_, Option<i64>>(5)?,
                 ))
             })?
-            .collect::<Result<Vec<_>, _>>()?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
     };
     let briefs = {
         let mut statement = transaction.prepare(
             "SELECT workspace_id, session_id, summary, updated_at_ms FROM session_briefs",
         )?;
-        statement
+        let rows = statement
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -124,7 +125,8 @@ fn migrate_v1_to_v2(transaction: &Transaction<'_>) -> Result<(), MigrationError>
                     row.get::<_, i64>(3)?,
                 ))
             })?
-            .collect::<Result<Vec<_>, _>>()?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
     };
     let mut legacy_briefs = briefs
         .into_iter()
@@ -134,7 +136,7 @@ fn migrate_v1_to_v2(transaction: &Transaction<'_>) -> Result<(), MigrationError>
         .collect::<BTreeMap<_, _>>();
     let events = {
         let mut statement = transaction.prepare("SELECT event_id, workspace_id, session_id, host_sequence, source_generation, source_sequence, timestamp_ms, kind, correlation_id, request_id, turn_id, payload_json FROM timeline_events")?;
-        statement
+        let rows = statement
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -151,7 +153,8 @@ fn migrate_v1_to_v2(transaction: &Transaction<'_>) -> Result<(), MigrationError>
                     row.get::<_, String>(11)?,
                 ))
             })?
-            .collect::<Result<Vec<_>, _>>()?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
     };
 
     let mut associations = BTreeMap::new();

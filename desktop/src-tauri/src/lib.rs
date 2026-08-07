@@ -7,6 +7,7 @@ pub mod commands;
 pub mod protocol;
 pub mod sidecar;
 pub mod state;
+pub mod storage;
 
 fn sidecar_smoke_requested() -> bool {
     std::env::args().any(|argument| argument == "--sidecar-smoke")
@@ -50,7 +51,7 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
-            let state = state::AppState::new(app.handle().clone());
+            let state = state::AppState::new(app.handle().clone())?;
             let sidecar = state.sidecar.clone();
             let app_handle = app.handle().clone();
             app.manage(state);
@@ -75,8 +76,19 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::sidecar_status,
+            commands::storage_health,
             commands::send_sidecar_command,
-            commands::restart_sidecar
+            commands::restart_sidecar,
+            commands::create_session,
+            commands::save_session_brief,
+            commands::complete_session,
+            commands::list_sessions,
+            commands::get_session,
+            commands::get_timeline,
+            commands::restore_active_session,
+            commands::delete_session,
+            commands::associate_request_with_turn,
+            commands::get_request_turn_associations
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -89,6 +101,26 @@ mod tests {
     use async_trait::async_trait;
 
     use crate::sidecar::{SidecarError, SidecarPort, SidecarState, SidecarSupervisor};
+
+    #[test]
+    fn persistent_session_commands_are_registered_with_tauri() {
+        let source = include_str!("lib.rs");
+        for command in [
+            "commands::storage_health",
+            "commands::create_session",
+            "commands::save_session_brief",
+            "commands::complete_session",
+            "commands::list_sessions",
+            "commands::get_session",
+            "commands::get_timeline",
+            "commands::restore_active_session",
+            "commands::delete_session",
+            "commands::associate_request_with_turn",
+            "commands::get_request_turn_associations",
+        ] {
+            assert!(source.contains(command), "missing Tauri command: {command}");
+        }
+    }
 
     #[tokio::test]
     async fn smoke_cleanup_failure_is_reported_as_a_failure() {
