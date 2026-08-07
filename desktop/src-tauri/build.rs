@@ -63,6 +63,8 @@ fn main() {
             panic!("unsupported Windows target; only x86_64-pc-windows-msvc is supported");
         }
         validate_windows_libsodium();
+        println!("cargo:rustc-link-arg-cdylib=/NOIMPLIB");
+        println!("cargo:rustc-link-arg-cdylib=/NOEXP");
     }
 
     tauri_build::build()
