@@ -114,6 +114,8 @@ LIB_CFLAGS={- die "Unexpected OpenSSL static-library flags for VC-WIN64A"
                         && ($target{lib_cflags} // "") eq "/Zi /Fdossl_static.pdb /MT /Zl";
                 join(' ', '/Z7 /MT /Zl',
 '@
+    # Here-string newlines follow the checkout format; normalize injected bytes to the pinned LF template.
+    $embeddedDebugFlags = $embeddedDebugFlags.Replace("`r`n", "`n")
     $externalDebugCount = [regex]::Matches(
         $content,
         [regex]::Escape($externalDebugFlags)

@@ -800,6 +800,7 @@ LIB_CFLAGS={- join(' ', $target{lib_cflags} || (),
 	@if "$(SHLIBS)"=="" \
 	 "$(PERL)" "$(SRCDIR)\util\copy.pl" ossl_static.pdb "$(libdir)"
 '@
+        $source = $source.Replace("`r`n", "`n")
         [System.IO.File]::WriteAllText($sourcePath, $source)
 
         $result = & $nativeBuildModule {
@@ -814,6 +815,7 @@ LIB_CFLAGS={- join(' ', $target{lib_cflags} || (),
         Assert-Equal 1 ([regex]::Matches($transformed, [regex]::Escape("join(' ', '/Z7 /MT /Zl',")).Count) 'The embedded debug flags do not preserve the MSVC CRT/default-library contract.'
         Assert-Equal 1 ([regex]::Matches($transformed, [regex]::Escape('($target{lib_cflags} // "") eq "/Zi /Fdossl_static.pdb /MT /Zl"')).Count) 'The transform does not fail closed on unexpected upstream flags.'
         Assert-Equal 0 ([regex]::Matches($transformed, [regex]::Escape('ossl_static.pdb "$(libdir)"')).Count) 'The invalid static PDB install command remains.'
+        Assert-Equal 1 ([regex]::Matches($transformed, "`r`n").Count) 'Checkout CRLFs leaked into the pinned injected OpenSSL block.'
         Assert-Equal $source ([System.IO.File]::ReadAllText($sourcePath)) 'The Cargo registry source template was modified in place.'
     }
 
