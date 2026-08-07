@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,14 +16,18 @@ use crate::protocol::{
     encode_frame, validate_command, validate_event, CommandKind, Envelope, EventKind, FrameDecoder,
     ProtocolKind, MAX_FRAME_BYTES,
 };
-use crate::storage::{AppendEventResult, NewTimelineEvent, SessionRepository, TimelineEventKind};
+use crate::storage::{
+    AppendEventResult, NewTimelineEvent, SessionRepository, SessionStatus, TimelineEventKind,
+};
 
 pub const SIDECAR_PROGRAM: &str = "callerinterview-sidecar";
 pub const SIDECAR_EVENT: &str = "sidecar://event";
 pub const STORAGE_HEALTH_EVENT: &str = "storage://health";
 pub const PRODUCTION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_DIAGNOSTICS: usize = 20;
+const MAX_PENDING_DURABLE_EVENTS: usize = 1_024;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const STORAGE_PERSIST_TIMEOUT: Duration = Duration::from_secs(5);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn packaged_sidecar_path(host_executable: &std::path::Path) -> std::path::PathBuf {
@@ -183,6 +187,12 @@ pub trait StorageHealthReporter: Send + Sync {
 
 pub trait DurableEventStore: Send + Sync {
     fn append_event(&self, event: &NewTimelineEvent) -> Result<AppendEventResult, ()>;
+    fn append_terminal_event(
+        &self,
+        event: &NewTimelineEvent,
+        status: SessionStatus,
+        completed_at_ms: i64,
+    ) -> Result<AppendEventResult, ()>;
     fn resolve_request_turn(
         &self,
         workspace_id: &str,
@@ -194,6 +204,16 @@ pub trait DurableEventStore: Send + Sync {
 impl DurableEventStore for SessionRepository {
     fn append_event(&self, event: &NewTimelineEvent) -> Result<AppendEventResult, ()> {
         SessionRepository::append_event(self, event).map_err(|_| ())
+    }
+
+    fn append_terminal_event(
+        &self,
+        event: &NewTimelineEvent,
+        status: SessionStatus,
+        completed_at_ms: i64,
+    ) -> Result<AppendEventResult, ()> {
+        SessionRepository::append_terminal_event(self, event, status, completed_at_ms)
+            .map_err(|_| ())
     }
 
     fn resolve_request_turn(
@@ -379,16 +399,25 @@ impl SidecarSupervisor {
                 .map_err(|error| SidecarError::new(error.code(), error.to_string()))?;
             envelopes
         };
+        let mut first_error = None;
         for event in envelopes {
-            let accepted = {
+            let accepted = match {
                 let mut data = self.inner.data.lock().await;
-                self.accept_event_locked(&mut data, generation, event)?
+                self.accept_event_locked(&mut data, generation, event)
+            } {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    continue;
+                }
             };
             if let Some(event) = accepted {
-                self.inner.sink.emit(&event).await?;
+                if let Err(error) = self.inner.sink.emit(&event).await {
+                    first_error.get_or_insert(error);
+                }
             }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     pub async fn accept_event(&self, generation: u64, event: Envelope) -> Result<(), SidecarError> {
@@ -425,6 +454,9 @@ impl SidecarSupervisor {
             if active.handshake_id.as_deref() != event.correlation_id.as_deref() {
                 return Ok(None);
             }
+            if matches!(data.state, SidecarState::Ready) {
+                return Ok(None);
+            }
             data.state = SidecarState::Ready;
         } else if !matches!(data.state, SidecarState::Ready) {
             return Err(SidecarError::new(
@@ -451,8 +483,8 @@ impl SidecarSupervisor {
         while let Some(end) = active.stderr.find(['\n', '\r']) {
             lines.push(active.stderr.drain(..=end).collect::<String>());
         }
-        for line in lines {
-            self.push_diagnostic_locked(&mut data, &format!("stderr: {line}"));
+        for _line in lines {
+            self.push_diagnostic_locked(&mut data, "sidecar stderr output received");
         }
     }
 
@@ -714,7 +746,7 @@ impl SidecarSupervisor {
         }
         let line = std::mem::take(&mut active.stderr);
         if !line.is_empty() {
-            self.push_diagnostic_locked(data, &format!("stderr: {line}"));
+            self.push_diagnostic_locked(data, "sidecar stderr output received");
         }
     }
 
@@ -733,27 +765,23 @@ impl SidecarSupervisor {
 }
 
 pub fn redact_diagnostic(value: &str) -> String {
-    let mut result = value.to_owned();
-    for marker in [
-        "DEEPSEEK_API_KEY=",
-        "DEEPGRAM_API_KEY=",
-        "OPENAI_API_KEY=",
-        "Bearer ",
+    let lowercase = value.to_ascii_lowercase();
+    if [
+        "api_key",
+        "api-key",
+        "authorization",
+        "bearer ",
+        "password",
+        "secret",
+        "token",
         "sk-",
-    ] {
-        let mut cursor = 0;
-        while let Some(offset) = result[cursor..].find(marker) {
-            let start = cursor + offset;
-            let value_start = start + marker.len();
-            let value_end = result[value_start..]
-                .find(char::is_whitespace)
-                .map(|offset| value_start + offset)
-                .unwrap_or(result.len());
-            result.replace_range(value_start..value_end, "<redacted>");
-            cursor = value_start + "<redacted>".len();
-        }
+    ]
+    .iter()
+    .any(|marker| lowercase.contains(marker))
+    {
+        return "<redacted>".to_owned();
     }
-    result
+    value.to_owned()
 }
 
 pub struct TauriSidecarLauncher {
@@ -1175,6 +1203,14 @@ pub struct PersistenceAwareEventSink {
     downstream: Arc<dyn SidecarEventSink>,
     health: Arc<dyn StorageHealthReporter>,
     source_generation: AtomicU64,
+    pending: AsyncMutex<VecDeque<PendingDurableEvent>>,
+    persistence_timeout: Duration,
+}
+
+#[derive(Clone)]
+struct PendingDurableEvent {
+    source_generation: u64,
+    event: Envelope,
 }
 
 impl PersistenceAwareEventSink {
@@ -1184,23 +1220,55 @@ impl PersistenceAwareEventSink {
         downstream: Arc<dyn SidecarEventSink>,
         health: Arc<dyn StorageHealthReporter>,
     ) -> Self {
+        Self::with_persistence_timeout(
+            workspace_id,
+            store,
+            downstream,
+            health,
+            STORAGE_PERSIST_TIMEOUT,
+        )
+    }
+
+    fn with_persistence_timeout(
+        workspace_id: impl Into<String>,
+        store: Arc<dyn DurableEventStore>,
+        downstream: Arc<dyn SidecarEventSink>,
+        health: Arc<dyn StorageHealthReporter>,
+        persistence_timeout: Duration,
+    ) -> Self {
         Self {
             workspace_id: workspace_id.into(),
             store,
             downstream,
             health,
             source_generation: AtomicU64::new(0),
+            pending: AsyncMutex::new(VecDeque::new()),
+            persistence_timeout,
         }
     }
 
     fn is_persistence_candidate(event: &Envelope) -> bool {
-        matches!(
+        matches!(&event.kind, ProtocolKind::Event(EventKind::SessionState))
+            && event.session_id.is_some()
+            || matches!(
+                &event.kind,
+                ProtocolKind::Event(EventKind::SuggestionCompleted)
+            )
+            || matches!(
+                &event.kind,
+                ProtocolKind::Event(EventKind::TranscriptUpdated)
+            ) && event.payload.get("is_final").and_then(Value::as_bool) == Some(true)
+    }
+
+    fn storage_failure_code(event: &Envelope) -> &'static str {
+        if matches!(
             &event.kind,
-            ProtocolKind::Event(EventKind::SessionState | EventKind::SuggestionCompleted)
-        ) || matches!(
-            &event.kind,
-            ProtocolKind::Event(EventKind::TranscriptUpdated)
-        ) && event.payload.get("is_final").and_then(Value::as_bool) == Some(true)
+            ProtocolKind::Event(EventKind::SuggestionCompleted)
+        ) {
+            "storage_association_or_write_failed"
+        } else {
+            "storage_write_failed"
+        }
     }
 }
 
@@ -1210,35 +1278,53 @@ impl SidecarEventSink for PersistenceAwareEventSink {
         if matches!(&event.kind, ProtocolKind::Event(EventKind::SidecarReady)) {
             self.source_generation.fetch_add(1, Ordering::SeqCst);
         } else if Self::is_persistence_candidate(event) {
-            let store = self.store.clone();
-            let workspace_id = self.workspace_id.clone();
-            let source_generation = self.source_generation.load(Ordering::SeqCst);
-            let durable_event = event.clone();
-            let persistence = tokio::task::spawn_blocking(move || {
-                persist_durable_event(
-                    store.as_ref(),
-                    &workspace_id,
-                    source_generation,
-                    &durable_event,
-                )
-            })
-            .await
-            .unwrap_or(Err(()));
-            match persistence {
-                Ok(()) => {
-                    let _ = self.health.report(&StorageHealth::ready());
+            let mut pending = self.pending.lock().await;
+            if !pending.iter().any(|item| item.event.id == event.id) {
+                if pending.len() >= MAX_PENDING_DURABLE_EVENTS {
+                    let _ = self
+                        .health
+                        .report(&StorageHealth::degraded("storage_backlog_full"));
+                    return Err(SidecarError::new(
+                        "storage_backlog_full",
+                        "encrypted session storage backlog is full",
+                    ));
                 }
-                Err(()) => {
-                    let code = if matches!(
-                        &event.kind,
-                        ProtocolKind::Event(EventKind::SuggestionCompleted)
-                    ) {
-                        "storage_association_or_write_failed"
-                    } else {
-                        "storage_write_failed"
-                    };
-                    let _ = self.health.report(&StorageHealth::degraded(code));
+                pending.push_back(PendingDurableEvent {
+                    source_generation: self.source_generation.load(Ordering::SeqCst),
+                    event: event.clone(),
+                });
+            }
+
+            let mut failure_code = None;
+            while let Some(item) = pending.front().cloned() {
+                let store = self.store.clone();
+                let workspace_id = self.workspace_id.clone();
+                let durable_event = item.event.clone();
+                let persistence = tokio::task::spawn_blocking(move || {
+                    persist_durable_event(
+                        store.as_ref(),
+                        &workspace_id,
+                        item.source_generation,
+                        &durable_event,
+                    )
+                });
+                if matches!(
+                    tokio::time::timeout(self.persistence_timeout, persistence).await,
+                    Ok(Ok(Ok(())))
+                ) {
+                    pending.pop_front();
+                } else {
+                    failure_code = Some(Self::storage_failure_code(&item.event));
+                    break;
                 }
+            }
+
+            if pending.is_empty() {
+                let _ = self.health.report(&StorageHealth::ready());
+            } else {
+                let _ = self.health.report(&StorageHealth::degraded(
+                    failure_code.unwrap_or("storage_write_failed"),
+                ));
             }
         }
         self.downstream.emit(event).await
@@ -1284,21 +1370,34 @@ fn persist_durable_event(
         }
         _ => None,
     };
-    store
-        .append_event(&NewTimelineEvent {
-            workspace_id: workspace_id.to_owned(),
-            session_id: session_id.to_owned(),
-            event_id: event.id.clone(),
-            source_generation: i64::try_from(source_generation).map_err(|_| ())?,
-            source_sequence: i64::try_from(event.sequence).map_err(|_| ())?,
-            timestamp_ms: i64::try_from(event.timestamp_ms).map_err(|_| ())?,
-            kind: timeline_kind,
-            correlation_id: event.correlation_id.clone(),
-            request_id,
-            turn_id,
-            payload: Value::Object(event.payload.clone()),
-        })
-        .map(|_| ())
+    let timestamp_ms = i64::try_from(event.timestamp_ms).map_err(|_| ())?;
+    let durable_event = NewTimelineEvent {
+        workspace_id: workspace_id.to_owned(),
+        session_id: session_id.to_owned(),
+        event_id: event.id.clone(),
+        source_generation: i64::try_from(source_generation).map_err(|_| ())?,
+        source_sequence: i64::try_from(event.sequence).map_err(|_| ())?,
+        timestamp_ms,
+        kind: timeline_kind,
+        correlation_id: event.correlation_id.clone(),
+        request_id,
+        turn_id,
+        payload: Value::Object(event.payload.clone()),
+    };
+    let terminal_status = matches!(kind, EventKind::SessionState)
+        .then(|| event.payload.get("state").and_then(Value::as_str))
+        .flatten()
+        .and_then(|state| match state {
+            "stopped" => Some(SessionStatus::Completed),
+            "error" => Some(SessionStatus::Interrupted),
+            _ => None,
+        });
+    match terminal_status {
+        Some(status) => store
+            .append_terminal_event(&durable_event, status, timestamp_ms)
+            .map(|_| ()),
+        None => store.append_event(&durable_event).map(|_| ()),
+    }
 }
 
 #[cfg(test)]
@@ -1318,7 +1417,7 @@ mod tests {
         encode_frame, CommandKind, Envelope, EventKind, FrameDecoder, ProtocolKind,
         MAX_FRAME_BYTES, PROTOCOL_VERSION,
     };
-    use crate::storage::{AppendEventResult, NewTimelineEvent};
+    use crate::storage::{AppendEventResult, NewTimelineEvent, SessionStatus};
 
     use super::{
         packaged_sidecar_path, redact_diagnostic, DurableEventStore, PersistenceAwareEventSink,
@@ -1366,8 +1465,32 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct FailNextEventSink {
+        fail_next: AtomicBool,
+        events: Mutex<Vec<Envelope>>,
+    }
+
+    #[async_trait]
+    impl SidecarEventSink for FailNextEventSink {
+        async fn emit(&self, event: &Envelope) -> Result<(), SidecarError> {
+            if self
+                .fail_next
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(SidecarError::new(
+                    "test_sink_failed",
+                    "test sink rejected one event",
+                ));
+            }
+            self.events.lock().unwrap().push(event.clone());
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
     struct FakeDurableEventStore {
         events: Mutex<Vec<NewTimelineEvent>>,
+        terminal_transitions: Mutex<Vec<(SessionStatus, i64)>>,
         associations: Mutex<HashMap<String, String>>,
         fail_writes: AtomicBool,
         order: Arc<Mutex<Vec<String>>>,
@@ -1388,6 +1511,20 @@ mod tests {
             Ok(AppendEventResult::Inserted { host_sequence: 1 })
         }
 
+        fn append_terminal_event(
+            &self,
+            event: &NewTimelineEvent,
+            status: SessionStatus,
+            completed_at_ms: i64,
+        ) -> Result<AppendEventResult, ()> {
+            let result = self.append_event(event)?;
+            self.terminal_transitions
+                .lock()
+                .unwrap()
+                .push((status, completed_at_ms));
+            Ok(result)
+        }
+
         fn resolve_request_turn(
             &self,
             _workspace_id: &str,
@@ -1395,6 +1532,35 @@ mod tests {
             request_id: &str,
         ) -> Result<Option<String>, ()> {
             Ok(self.associations.lock().unwrap().get(request_id).cloned())
+        }
+    }
+
+    struct SlowDurableEventStore {
+        delay: Duration,
+    }
+
+    impl DurableEventStore for SlowDurableEventStore {
+        fn append_event(&self, _event: &NewTimelineEvent) -> Result<AppendEventResult, ()> {
+            std::thread::sleep(self.delay);
+            Ok(AppendEventResult::Inserted { host_sequence: 1 })
+        }
+
+        fn append_terminal_event(
+            &self,
+            event: &NewTimelineEvent,
+            _status: SessionStatus,
+            _completed_at_ms: i64,
+        ) -> Result<AppendEventResult, ()> {
+            self.append_event(event)
+        }
+
+        fn resolve_request_turn(
+            &self,
+            _workspace_id: &str,
+            _session_id: &str,
+            _request_id: &str,
+        ) -> Result<Option<String>, ()> {
+            Ok(None)
         }
     }
 
@@ -1538,6 +1704,23 @@ mod tests {
             timestamp_ms: 4,
             kind: ProtocolKind::Event(kind),
             payload,
+            correlation_id: None,
+        }
+    }
+
+    fn audio_health_event(id: &str, sequence: u64) -> Envelope {
+        Envelope {
+            version: PROTOCOL_VERSION,
+            id: id.into(),
+            session_id: None,
+            sequence,
+            timestamp_ms: sequence,
+            kind: ProtocolKind::Event(EventKind::AudioHealth),
+            payload: Map::from_iter([
+                ("source".into(), json!("mic")),
+                ("status".into(), json!("ready")),
+                ("message".into(), Value::Null),
+            ]),
             correlation_id: None,
         }
     }
@@ -1694,6 +1877,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(supervisor.status().await.state, SidecarState::Ready);
+    }
+
+    #[tokio::test]
+    async fn duplicate_ready_is_emitted_once_per_generation() {
+        let port = Arc::new(FakeSidecarPort::default());
+        let sink = Arc::new(CollectingEventSink::default());
+        let supervisor = SidecarSupervisor::with_launcher_and_sink(
+            Arc::new(FakeSidecarLauncher {
+                port: port.clone(),
+                launches: Arc::new(Mutex::new(0)),
+            }),
+            sink.clone(),
+            Duration::ZERO,
+            None,
+        );
+
+        supervisor.start().await.unwrap();
+        let handshake_id = last_handshake_id(&port);
+        let first = ready_for(Some(&handshake_id));
+        let mut duplicate = first.clone();
+        duplicate.id = "018f0000-0000-7000-8000-000000000099".into();
+        duplicate.sequence = 1;
+
+        supervisor.accept_event(1, first).await.unwrap();
+        supervisor.accept_event(1, duplicate).await.unwrap();
+
+        assert_eq!(supervisor.status().await.state, SidecarState::Ready);
+        assert_eq!(sink.events.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn multi_frame_chunk_continues_after_first_sink_failure() {
+        let port = Arc::new(FakeSidecarPort::default());
+        let sink = Arc::new(FailNextEventSink::default());
+        let supervisor = SidecarSupervisor::with_launcher_and_sink(
+            Arc::new(FakeSidecarLauncher {
+                port: port.clone(),
+                launches: Arc::new(Mutex::new(0)),
+            }),
+            sink.clone(),
+            Duration::ZERO,
+            None,
+        );
+        supervisor.start().await.unwrap();
+        supervisor
+            .accept_event(1, ready_for(Some(&last_handshake_id(&port))))
+            .await
+            .unwrap();
+        sink.events.lock().unwrap().clear();
+        sink.fail_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let first = audio_health_event("018f0000-0000-7000-8000-000000000021", 2);
+        let second = audio_health_event("018f0000-0000-7000-8000-000000000022", 3);
+        let chunk = [
+            encode_frame(&first).unwrap(),
+            encode_frame(&second).unwrap(),
+        ]
+        .concat();
+
+        let error = supervisor.accept_stdout(1, &chunk).await.unwrap_err();
+
+        assert_eq!(error.code(), "test_sink_failed");
+        assert_eq!(sink.events.lock().unwrap().as_slice(), &[second]);
     }
 
     #[tokio::test]
@@ -2093,13 +2340,43 @@ mod tests {
 
     #[test]
     fn diagnostics_redact_secrets_and_never_treat_stderr_as_protocol() {
-        let diagnostic =
-            redact_diagnostic("DEEPSEEK_API_KEY=secret-value Bearer api-token sk-abcdefghijklmnop");
+        for raw in [
+            "DEEPSEEK_API_KEY=secret-value Bearer api-token sk-abcdefghijklmnop",
+            "ANTHROPIC_API_KEY=second-secret",
+            r#"{"DEEPSEEK_API_KEY":"json-secret"}"#,
+            "Authorization: Bearer header-secret",
+        ] {
+            let diagnostic = redact_diagnostic(raw);
+            assert!(diagnostic.contains("<redacted>"), "{raw}");
+            for secret in [
+                "secret-value",
+                "api-token",
+                "sk-abcdefghijklmnop",
+                "second-secret",
+                "json-secret",
+                "header-secret",
+            ] {
+                assert!(!diagnostic.contains(secret), "{raw}");
+            }
+        }
+    }
 
-        assert!(!diagnostic.contains("secret-value"));
-        assert!(!diagnostic.contains("api-token"));
-        assert!(!diagnostic.contains("sk-abcdefghijklmnop"));
-        assert!(diagnostic.contains("<redacted>"));
+    #[tokio::test]
+    async fn stderr_status_uses_a_fixed_diagnostic_instead_of_raw_provider_output() {
+        let supervisor = SidecarSupervisor::with_port(Arc::new(FakeSidecarPort::default()));
+
+        supervisor
+            .accept_stderr(
+                0,
+                br#"{"DEEPSEEK_API_KEY":"json-secret"}
+"#,
+            )
+            .await;
+
+        let diagnostics = supervisor.status().await.diagnostics.join(" ");
+        assert!(diagnostics.contains("sidecar stderr output received"));
+        assert!(!diagnostics.contains("json-secret"));
+        assert!(!diagnostics.contains("DEEPSEEK_API_KEY"));
     }
 
     #[tokio::test]
@@ -2194,6 +2471,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_session_states_use_the_atomic_store_transition() {
+        for (state, expected_status, event_id) in [
+            (
+                "stopped",
+                SessionStatus::Completed,
+                "018f0000-0000-7000-8000-000000000031",
+            ),
+            (
+                "error",
+                SessionStatus::Interrupted,
+                "018f0000-0000-7000-8000-000000000032",
+            ),
+        ] {
+            let store = Arc::new(FakeDurableEventStore::default());
+            let sink = PersistenceAwareEventSink::new(
+                "workspace",
+                store.clone(),
+                Arc::new(CollectingEventSink::default()),
+                Arc::new(RecordingStorageHealthReporter {
+                    order: Arc::new(Mutex::new(Vec::new())),
+                    reports: Mutex::new(Vec::new()),
+                }),
+            );
+            let mut event = session_event(
+                EventKind::SessionState,
+                Map::from_iter([("state".into(), Value::String(state.into()))]),
+            );
+            event.id = event_id.into();
+
+            sink.emit(&event).await.unwrap();
+
+            assert_eq!(store.events.lock().unwrap().len(), 1);
+            assert_eq!(
+                store.terminal_transitions.lock().unwrap().as_slice(),
+                &[(expected_status, 4)]
+            );
+        }
+
+        let store = Arc::new(FakeDurableEventStore::default());
+        let sink = PersistenceAwareEventSink::new(
+            "workspace",
+            store.clone(),
+            Arc::new(CollectingEventSink::default()),
+            Arc::new(RecordingStorageHealthReporter {
+                order: Arc::new(Mutex::new(Vec::new())),
+                reports: Mutex::new(Vec::new()),
+            }),
+        );
+        sink.emit(&session_event(
+            EventKind::SessionState,
+            Map::from_iter([("state".into(), Value::String("listening".into()))]),
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(store.events.lock().unwrap().len(), 1);
+        assert!(store.terminal_transitions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn partial_transcripts_and_suggestion_chunks_are_never_persisted() {
         let order = Arc::new(Mutex::new(Vec::new()));
         let store = Arc::new(FakeDurableEventStore {
@@ -2233,7 +2570,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn storage_failure_reports_health_and_still_delivers_then_recovers() {
+    async fn idle_session_snapshot_is_live_only_and_does_not_degrade_storage() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let store = Arc::new(FakeDurableEventStore {
+            order: order.clone(),
+            ..Default::default()
+        });
+        let downstream = Arc::new(OrderedEventSink {
+            order: order.clone(),
+            events: Mutex::new(Vec::new()),
+        });
+        let health = Arc::new(RecordingStorageHealthReporter {
+            order: order.clone(),
+            reports: Mutex::new(Vec::new()),
+        });
+        let sink = PersistenceAwareEventSink::new(
+            "workspace",
+            store.clone(),
+            downstream.clone(),
+            health.clone(),
+        );
+        let idle: Envelope = serde_json::from_str(include_str!(
+            "../../../protocol/v1/fixtures/session-state-idle.json"
+        ))
+        .unwrap();
+
+        sink.emit(&idle).await.unwrap();
+
+        assert!(store.events.lock().unwrap().is_empty());
+        assert!(health.reports.lock().unwrap().is_empty());
+        assert_eq!(downstream.events.lock().unwrap().as_slice(), &[idle]);
+        assert_eq!(&*order.lock().unwrap(), &["emit"]);
+    }
+
+    #[tokio::test]
+    async fn storage_failure_retries_the_lost_event_before_reporting_recovery() {
         let order = Arc::new(Mutex::new(Vec::new()));
         let store = Arc::new(FakeDurableEventStore {
             order: order.clone(),
@@ -2269,6 +2640,10 @@ mod tests {
         assert_eq!(reports[0].code, Some("storage_write_failed"));
         assert!(reports[0].recoverable);
         assert_eq!(reports[1], StorageHealth::ready());
+        let stored = store.events.lock().unwrap();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].event_id, "018f0000-0000-7000-8000-000000000008");
+        assert_eq!(stored[1].event_id, "018f0000-0000-7000-8000-000000000009");
         assert_eq!(
             &*order.lock().unwrap(),
             &[
@@ -2276,9 +2651,51 @@ mod tests {
                 "health:degraded",
                 "emit",
                 "persist",
+                "persist",
                 "health:ready",
                 "emit",
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_storage_write_has_a_bounded_acknowledgement() {
+        let downstream = Arc::new(CollectingEventSink::default());
+        let health = Arc::new(RecordingStorageHealthReporter {
+            order: Arc::new(Mutex::new(Vec::new())),
+            reports: Mutex::new(Vec::new()),
+        });
+        let sink = PersistenceAwareEventSink::with_persistence_timeout(
+            "workspace",
+            Arc::new(SlowDurableEventStore {
+                delay: Duration::from_millis(100),
+            }),
+            downstream.clone(),
+            health.clone(),
+            Duration::from_millis(10),
+        );
+        let event = session_event(
+            EventKind::TranscriptUpdated,
+            Map::from_iter([
+                (
+                    "turn_id".into(),
+                    Value::String("018f0000-0000-7000-8000-000000000201".into()),
+                ),
+                ("text".into(), Value::String("final answer".into())),
+                ("is_final".into(), Value::Bool(true)),
+            ]),
+        );
+
+        tokio::time::timeout(Duration::from_millis(50), sink.emit(&event))
+            .await
+            .expect("storage acknowledgement must be bounded")
+            .unwrap();
+
+        assert_eq!(downstream.events.lock().unwrap().as_slice(), &[event]);
+        let reports = health.reports.lock().unwrap();
+        assert_eq!(
+            reports.last().unwrap().status,
+            StorageHealthStatus::Degraded
         );
     }
 
