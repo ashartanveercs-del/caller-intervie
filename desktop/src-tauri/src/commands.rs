@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tauri::State;
 
-use crate::protocol::{Envelope, EventKind, ProtocolKind, PROTOCOL_VERSION};
+use crate::protocol::{
+    is_supported_session_mode, CommandKind, Envelope, EventKind, ProtocolKind, PROTOCOL_VERSION,
+};
 use crate::sidecar::{SidecarError, SidecarStatus, StorageHealth};
 use crate::state::AppState;
 use crate::storage::{
@@ -13,7 +15,6 @@ use crate::storage::{
     SessionStatus, StoredSession, StoredTimelineEvent, TimelineEventKind,
 };
 
-const MAX_MODE_BYTES: usize = 64;
 const MAX_LANGUAGE_TAG_BYTES: usize = 63;
 const MAX_BRIEF_BYTES: usize = 256 * 1024;
 
@@ -223,7 +224,64 @@ pub async fn send_sidecar_command(
     state: State<'_, AppState>,
     command: Envelope,
 ) -> Result<(), SidecarCommandError> {
+    let repository = state.repository.clone();
+    ensure_query_turn_association(
+        &command,
+        &state.workspace_id,
+        move |workspace_id, session_id, request_id| {
+            repository.resolve_request_turn(&workspace_id, &session_id, &request_id)
+        },
+    )
+    .await?;
     state.sidecar.send(command).await
+}
+
+async fn ensure_query_turn_association<F>(
+    command: &Envelope,
+    workspace_id: &str,
+    resolve: F,
+) -> Result<(), SidecarError>
+where
+    F: FnOnce(String, String, String) -> Result<Option<String>, RepositoryError> + Send + 'static,
+{
+    if !matches!(
+        command.kind,
+        ProtocolKind::Command(CommandKind::QueryTrigger)
+    ) {
+        return Ok(());
+    }
+
+    let session_id = command.session_id.clone().ok_or_else(|| {
+        SidecarError::new("invalid_session_id", "sidecar command validation failed")
+    })?;
+    let workspace_id = workspace_id.to_owned();
+    // The sidecar echoes the query command ID as suggestion correlation_id.
+    let request_id = command.id.clone();
+    let resolved =
+        tauri::async_runtime::spawn_blocking(move || resolve(workspace_id, session_id, request_id))
+            .await
+            .map_err(|_| {
+                SidecarError::new(
+                    "query_association_unavailable",
+                    "The durable request association could not be verified.",
+                )
+            })?;
+
+    match resolved {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(SidecarError::new(
+            "query_association_missing",
+            "A durable request association is required before query dispatch.",
+        )),
+        Err(RepositoryError::RequestTurnAssociationConflict) => Err(SidecarError::new(
+            "query_association_conflict",
+            "The durable request association conflicts with this query.",
+        )),
+        Err(_) => Err(SidecarError::new(
+            "query_association_unavailable",
+            "The durable request association could not be verified.",
+        )),
+    }
 }
 
 #[tauri::command]
@@ -522,12 +580,7 @@ fn validate_uuid(value: &str) -> Result<(), StorageCommandError> {
 }
 
 fn validate_mode(value: &str) -> Result<(), StorageCommandError> {
-    if value.is_empty()
-        || value.len() > MAX_MODE_BYTES
-        || !value.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
-        })
-    {
+    if !is_supported_session_mode(value) {
         return Err(StorageCommandError::invalid("Session mode is invalid."));
     }
     Ok(())
@@ -562,18 +615,112 @@ fn validate_language_tag(value: &str, allow_auto: bool) -> Result<(), StorageCom
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use serde_json::{json, Map, Value};
 
+    use crate::protocol::{
+        validate_command, CommandKind, Envelope, ProtocolKind, PROTOCOL_VERSION,
+    };
     use crate::storage::{
         RepositoryError, SessionStatus, StoredSession, StoredSessionBrief, StoredTimelineEvent,
         TimelineEventKind,
     };
 
     use super::{
-        timeline_envelope, validate_language_tag, validate_mode, validate_uuid,
-        AssociateRequestWithTurnInput, CompletionStatusInput, CreateSessionInput,
+        ensure_query_turn_association, timeline_envelope, validate_language_tag, validate_mode,
+        validate_uuid, AssociateRequestWithTurnInput, CompletionStatusInput, CreateSessionInput,
         SaveSessionBriefInput, SessionRecordDto, StorageCommandError, MAX_BRIEF_BYTES,
     };
+
+    const WORKSPACE_ID: &str = "018f0000-0000-7000-8000-000000000099";
+    const SESSION_ID: &str = "018f0000-0000-7000-8000-000000000001";
+    const REQUEST_ID: &str = "018f0000-0000-7000-8000-000000000002";
+    const TURN_ID: &str = "018f0000-0000-7000-8000-000000000003";
+
+    fn query_command() -> Envelope {
+        Envelope {
+            version: PROTOCOL_VERSION,
+            id: REQUEST_ID.into(),
+            session_id: Some(SESSION_ID.into()),
+            sequence: 1,
+            timestamp_ms: 1,
+            kind: ProtocolKind::Command(CommandKind::QueryTrigger),
+            payload: Map::from_iter([
+                ("text".into(), Value::String("Explain the trade-off".into())),
+                ("answer_format".into(), Value::String("chat".into())),
+            ]),
+            correlation_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn query_dispatch_resolves_command_id_in_the_same_workspace_and_session() {
+        let caller_thread = std::thread::current().id();
+        let observed = Arc::new(Mutex::new(None));
+        let captured = observed.clone();
+
+        ensure_query_turn_association(
+            &query_command(),
+            WORKSPACE_ID,
+            move |workspace_id, session_id, request_id| {
+                *captured.lock().unwrap() = Some((
+                    workspace_id,
+                    session_id,
+                    request_id,
+                    std::thread::current().id(),
+                ));
+                Ok(Some(TURN_ID.into()))
+            },
+        )
+        .await
+        .unwrap();
+
+        let observed = observed.lock().unwrap().take().unwrap();
+        assert_eq!(observed.0, WORKSPACE_ID);
+        assert_eq!(observed.1, SESSION_ID);
+        assert_eq!(observed.2, REQUEST_ID);
+        assert_ne!(observed.3, caller_thread);
+    }
+
+    #[tokio::test]
+    async fn query_dispatch_rejects_missing_and_conflicting_associations_without_ids() {
+        let missing =
+            ensure_query_turn_association(&query_command(), WORKSPACE_ID, |_, _, _| Ok(None))
+                .await
+                .unwrap_err();
+        let conflict = ensure_query_turn_association(&query_command(), WORKSPACE_ID, |_, _, _| {
+            Err(RepositoryError::RequestTurnAssociationConflict)
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(missing.code(), "query_association_missing");
+        assert_eq!(conflict.code(), "query_association_conflict");
+        for error in [missing, conflict] {
+            let serialized = serde_json::to_string(&error).unwrap();
+            for forbidden in [WORKSPACE_ID, SESSION_ID, REQUEST_ID, TURN_ID, "SELECT"] {
+                assert!(!serialized.contains(forbidden));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn non_query_dispatch_does_not_consult_request_turn_storage() {
+        let mut command = query_command();
+        command.kind = ProtocolKind::Command(CommandKind::ListeningSet);
+        command.payload = Map::from_iter([("enabled".into(), Value::Bool(true))]);
+
+        ensure_query_turn_association(
+            &command,
+            WORKSPACE_ID,
+            |_, _, _| -> Result<_, RepositoryError> {
+                panic!("non-query commands must bypass association storage")
+            },
+        )
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn tauri_input_dtos_accept_exact_snake_case_shapes() {
@@ -669,11 +816,55 @@ mod tests {
         }
         assert!(validate_mode("").is_err());
         assert!(validate_mode("Interview").is_err());
+        assert!(validate_mode("custom-mode").is_err());
         let input = SaveSessionBriefInput {
             session_id: "018f0000-0000-7000-8000-000000000001".into(),
             brief: Map::from_iter([("notes".into(), Value::String("x".repeat(MAX_BRIEF_BYTES)))]),
         };
         assert!(input.validate().is_err());
+    }
+
+    #[test]
+    fn create_session_and_session_start_share_the_closed_mode_contract() {
+        let start_fixture = include_str!("../../../protocol/v1/fixtures/session-start.json");
+
+        for mode in ["interview", "sales", "meeting", "presentation", "classroom"] {
+            let input: CreateSessionInput = serde_json::from_value(json!({
+                "mode": mode,
+                "ui_language": "en",
+                "input_language": "auto",
+                "response_language": "en",
+                "review_language": "en"
+            }))
+            .unwrap();
+            let mut command: Envelope = serde_json::from_str(start_fixture).unwrap();
+            command.payload.insert("mode".into(), mode.into());
+
+            assert!(input.validate().is_ok(), "create_session rejected {mode}");
+            assert!(
+                validate_command(&command).is_ok(),
+                "session.start rejected {mode}"
+            );
+        }
+
+        for mode in ["unknown", "custom-mode"] {
+            let input: CreateSessionInput = serde_json::from_value(json!({
+                "mode": mode,
+                "ui_language": "en",
+                "input_language": "auto",
+                "response_language": "en",
+                "review_language": "en"
+            }))
+            .unwrap();
+            let mut command: Envelope = serde_json::from_str(start_fixture).unwrap();
+            command.payload.insert("mode".into(), mode.into());
+
+            assert!(input.validate().is_err(), "create_session accepted {mode}");
+            assert!(
+                validate_command(&command).is_err(),
+                "session.start accepted {mode}"
+            );
+        }
     }
 
     #[test]

@@ -504,8 +504,15 @@ pub fn validate_event(event: &Envelope) -> Result<(), CommandValidationError> {
                 && required_safe_integer(&event.payload, "started_at_ms")
                 && required_safe_integer(&event.payload, "ended_at_ms")
         }
-        EventKind::SuggestionChunk | EventKind::SuggestionCompleted => {
+        EventKind::SuggestionChunk => {
             event.session_id.is_some()
+                && has_exact_keys(&event.payload, &["suggestion_id", "text"])
+                && required_uuid_value(&event.payload, "suggestion_id")
+                && required_bounded_string(&event.payload, "text")
+        }
+        EventKind::SuggestionCompleted => {
+            event.session_id.is_some()
+                && event.correlation_id.is_some()
                 && has_exact_keys(&event.payload, &["suggestion_id", "text"])
                 && required_uuid_value(&event.payload, "suggestion_id")
                 && required_bounded_string(&event.payload, "text")
@@ -578,9 +585,16 @@ fn required_runtime_state(payload: &Map<String, Value>, key: &str) -> bool {
 }
 
 fn required_supported_mode(payload: &Map<String, Value>, key: &str) -> bool {
+    payload
+        .get(key)
+        .and_then(Value::as_str)
+        .is_some_and(is_supported_session_mode)
+}
+
+pub fn is_supported_session_mode(value: &str) -> bool {
     matches!(
-        payload.get(key).and_then(Value::as_str),
-        Some("interview" | "sales" | "meeting" | "presentation")
+        value,
+        "interview" | "sales" | "meeting" | "presentation" | "classroom"
     )
 }
 
@@ -826,7 +840,7 @@ mod tests {
             assert!(validate_command(&command).is_err(), "{invalid_mode:?}");
         }
 
-        for supported_mode in ["interview", "sales", "meeting", "presentation"] {
+        for supported_mode in ["interview", "sales", "meeting", "presentation", "classroom"] {
             let mut active: Envelope = serde_json::from_str(active_fixture).unwrap();
             active.payload.insert("mode".into(), supported_mode.into());
             assert!(validate_event(&active).is_ok(), "{supported_mode}");
@@ -838,6 +852,22 @@ mod tests {
             command.payload.insert("mode".into(), supported_mode.into());
             assert!(validate_command(&command).is_ok(), "{supported_mode}");
         }
+    }
+
+    #[test]
+    fn completed_suggestions_require_a_persistable_request_correlation() {
+        let mut completed: Envelope = serde_json::from_str(include_str!(
+            "../../../protocol/v1/fixtures/suggestion-complete.json"
+        ))
+        .unwrap();
+        assert!(validate_event(&completed).is_ok());
+
+        completed.correlation_id = None;
+
+        assert!(validate_event(&completed).is_err());
+
+        completed.kind = EventKind::SuggestionChunk.into();
+        assert!(validate_event(&completed).is_ok());
     }
 
     #[test]
