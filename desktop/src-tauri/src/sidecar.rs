@@ -1571,7 +1571,7 @@ impl PersistenceAwareEventSink {
             self.persistence_timeout,
             self.retry_delay,
             self.shutdown.subscribe(),
-        ));
+        ))
     }
 }
 
