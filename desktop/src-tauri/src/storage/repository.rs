@@ -1,7 +1,8 @@
 use std::{path::Path, sync::Mutex};
 
 use rusqlite::{
-    ffi, params, types::Type, Connection, OptionalExtension, Transaction, TransactionBehavior,
+    ffi, params, types::Type, Connection, InterruptHandle, OptionalExtension, Transaction,
+    TransactionBehavior,
 };
 use serde_json::Value;
 
@@ -59,6 +60,7 @@ pub enum QueryDispatchAuthorization {
 
 pub struct SessionRepository {
     connection: Mutex<Connection>,
+    interrupt_handle: InterruptHandle,
 }
 
 impl SessionRepository {
@@ -70,9 +72,15 @@ impl SessionRepository {
         apply_cipher_key(&mut connection, key)?;
         connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = DELETE;")?;
         migrate(&mut connection)?;
+        let interrupt_handle = connection.get_interrupt_handle();
         Ok(Self {
             connection: Mutex::new(connection),
+            interrupt_handle,
         })
+    }
+
+    pub fn interrupt(&self) {
+        self.interrupt_handle.interrupt();
     }
 
     pub fn cipher_version(&self) -> Result<String, RepositoryError> {
@@ -678,9 +686,14 @@ mod tests {
         AppendEventResult, ModelError, NewSession, NewSessionBrief, NewTimelineEvent,
         RequestTurnAssociation, SessionStatus, TimelineEventKind,
     };
-    use rusqlite::params;
+    use rusqlite::{params, ErrorCode};
     use serde_json::json;
-    use std::fs;
+    use std::{
+        fs,
+        sync::{mpsc, Arc},
+        thread,
+        time::{Duration, Instant},
+    };
     use tempfile::{tempdir, TempDir};
     const WORKSPACE_A: &str = "workspace-a";
     const WORKSPACE_B: &str = "workspace-b";
@@ -693,6 +706,121 @@ mod tests {
         let path = temp.path().join("sessions.db");
         let repository = SessionRepository::open(&path, &key(0x41)).unwrap();
         (temp, path, repository)
+    }
+
+    impl SessionRepository {
+        fn run_interruptible_test_query(
+            &self,
+            started: mpsc::SyncSender<()>,
+        ) -> Result<(), RepositoryError> {
+            let connection = self
+                .connection
+                .lock()
+                .map_err(|_| RepositoryError::ConnectionUnavailable)?;
+            let mut statement = connection.prepare(
+                "WITH RECURSIVE counter(value) AS (
+                     VALUES(0)
+                     UNION ALL
+                     SELECT value + 1 FROM counter WHERE value < 1000000000
+                 )
+                 SELECT sum(value) FROM counter",
+            )?;
+            started
+                .send(())
+                .expect("interrupt test receiver must remain available");
+            statement.query_row([], |row| row.get::<_, i64>(0))?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn repeated_idle_interrupts_leave_the_repository_usable() {
+        let (_temp, _path, repository) = repository();
+
+        repository.interrupt();
+        repository.interrupt();
+        repository.create_session(&session(WORKSPACE_A)).unwrap();
+        repository.interrupt();
+
+        let stored = repository
+            .get_session(WORKSPACE_A, SESSION)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.workspace_id, WORKSPACE_A);
+        assert_eq!(stored.session_id, SESSION);
+    }
+
+    #[test]
+    fn interrupt_does_not_wait_for_the_connection_mutex() {
+        let (_temp, _path, repository) = repository();
+        let repository = Arc::new(repository);
+        let (locked_tx, locked_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let locker_repository = Arc::clone(&repository);
+        let locker = thread::spawn(move || {
+            let _connection = locker_repository.connection.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        locked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let (interrupted_tx, interrupted_rx) = mpsc::sync_channel(1);
+        let interrupting_repository = Arc::clone(&repository);
+        let interrupter = thread::spawn(move || {
+            interrupting_repository.interrupt();
+            interrupted_tx.send(()).unwrap();
+        });
+        let returned_without_connection = interrupted_rx
+            .recv_timeout(Duration::from_millis(250))
+            .is_ok();
+
+        release_tx.send(()).unwrap();
+        locker.join().unwrap();
+        interrupter.join().unwrap();
+        assert!(
+            returned_without_connection,
+            "interrupt must not acquire the repository connection mutex"
+        );
+    }
+
+    #[test]
+    fn interrupt_cancels_a_concurrent_query_and_repository_recovers() {
+        let (_temp, _path, repository) = repository();
+        repository.create_session(&session(WORKSPACE_A)).unwrap();
+        let repository = Arc::new(repository);
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let querying_repository = Arc::clone(&repository);
+        let query = thread::spawn(move || {
+            result_tx
+                .send(querying_repository.run_interruptible_test_query(started_tx))
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let result = loop {
+            repository.interrupt();
+            match result_rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(result) => break result,
+                Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => {}
+                Err(error) => panic!("interruptible query did not stop: {error}"),
+            }
+        };
+        query.join().unwrap();
+
+        let error = result.unwrap_err();
+        assert_eq!(
+            match error {
+                RepositoryError::Sql(error) => error.sqlite_error_code(),
+                _ => None,
+            },
+            Some(ErrorCode::OperationInterrupted)
+        );
+        assert!(repository
+            .get_session(WORKSPACE_A, SESSION)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
