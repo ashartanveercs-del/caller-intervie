@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, VecDeque};
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -347,6 +348,18 @@ struct PendingRuntimeSession {
 }
 
 fn apply_runtime_session_event(active: &mut ActiveSidecar, event: &Envelope) {
+    if matches!(&event.kind, ProtocolKind::Event(EventKind::RuntimeError)) {
+        let clears_pending_start = active
+            .pending_runtime_session
+            .as_ref()
+            .is_some_and(|pending| {
+                event.correlation_id.as_deref() == Some(pending.command_id.as_str())
+            });
+        if clears_pending_start {
+            active.pending_runtime_session = None;
+        }
+        return;
+    }
     if !matches!(&event.kind, ProtocolKind::Event(EventKind::SessionState)) {
         return;
     }
@@ -387,6 +400,78 @@ fn apply_runtime_session_event(active: &mut ActiveSidecar, event: &Envelope) {
             active.runtime_session_id = None;
         }
         _ => {}
+    }
+}
+
+fn validate_runtime_command(
+    active: &ActiveSidecar,
+    command_kind: &ProtocolKind,
+    command_session_id: Option<&str>,
+) -> Result<(), SidecarError> {
+    let ProtocolKind::Command(command_kind) = command_kind else {
+        return Err(SidecarError::new(
+            "invalid_command_kind",
+            "sidecar command validation failed",
+        ));
+    };
+    if matches!(
+        command_kind,
+        CommandKind::HandshakeRequest | CommandKind::SessionSnapshotRequest
+    ) {
+        return Ok(());
+    }
+    let requested = command_session_id.ok_or_else(|| {
+        SidecarError::new("invalid_session_id", "sidecar command validation failed")
+    })?;
+    let active_session = active.runtime_session_id.as_deref();
+    let pending_session = active
+        .pending_runtime_session
+        .as_ref()
+        .map(|pending| pending.session_id.as_str());
+
+    match command_kind {
+        CommandKind::SessionStart => {
+            if active_session.is_some() || pending_session.is_some() {
+                Err(SidecarError::new(
+                    "runtime_session_conflict",
+                    "A runtime session is already active or starting.",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        CommandKind::QueryTrigger => match active_session {
+            None => Err(SidecarError::new(
+                "query_runtime_session_inactive",
+                "No active runtime session can accept this query.",
+            )),
+            Some(current) if current != requested => Err(SidecarError::new(
+                "query_runtime_session_mismatch",
+                "The query does not target the active runtime session.",
+            )),
+            Some(_) => Ok(()),
+        },
+        CommandKind::SessionStop
+        | CommandKind::ListeningSet
+        | CommandKind::YouSourceSet
+        | CommandKind::AudioSystemSet
+        | CommandKind::AudioDeviceSet
+        | CommandKind::KnowledgeIngest => {
+            if active_session.is_none() && pending_session.is_none() {
+                Err(SidecarError::new(
+                    "runtime_session_inactive",
+                    "No tracked runtime session can accept this command.",
+                ))
+            } else if active_session == Some(requested) || pending_session == Some(requested) {
+                Ok(())
+            } else {
+                Err(SidecarError::new(
+                    "runtime_session_mismatch",
+                    "The command does not target the tracked runtime session.",
+                ))
+            }
+        }
+        CommandKind::HandshakeRequest | CommandKind::SessionSnapshotRequest => Ok(()),
     }
 }
 
@@ -473,6 +558,7 @@ impl SidecarSupervisor {
 
     pub async fn start(&self) -> Result<SidecarStatus, SidecarError> {
         let _lifecycle = self.inner.lifecycle.lock().await;
+        let _commands = self.inner.commands.lock().await;
         let _delivery = self.inner.delivery.lock().await;
         if let Err(error) = self.launch_internal().await {
             self.fail(&error).await;
@@ -501,15 +587,28 @@ impl SidecarSupervisor {
     }
 
     pub async fn send(&self, command: Envelope) -> Result<(), SidecarError> {
+        self.send_with_authorization(command, async { Ok(()) })
+            .await
+    }
+
+    pub async fn send_with_authorization<A>(
+        &self,
+        command: Envelope,
+        authorization: A,
+    ) -> Result<(), SidecarError>
+    where
+        A: Future<Output = Result<(), SidecarError>> + Send,
+    {
         validate_command(&command).map_err(|error| {
             SidecarError::new(error.code(), "sidecar command validation failed")
         })?;
-        let _commands = self.inner.commands.lock().await;
         let bytes = encode_frame(&command)
             .map_err(|error| SidecarError::new(error.code(), error.to_string()))?;
         let command_id = command.id.clone();
         let command_kind = command.kind.clone();
         let command_session_id = command.session_id.clone();
+        let _commands = self.inner.commands.lock().await;
+        let _delivery = self.inner.delivery.lock().await;
         let (port, generation) = {
             let data = self.inner.data.lock().await;
             if !matches!(data.state, SidecarState::Ready) {
@@ -521,72 +620,67 @@ impl SidecarSupervisor {
             let active = data.active.as_ref().ok_or_else(|| {
                 SidecarError::new("sidecar_unavailable", "sidecar port is unavailable")
             })?;
-            if matches!(
-                &command_kind,
-                ProtocolKind::Command(CommandKind::QueryTrigger)
-            ) {
-                match (
-                    active.runtime_session_id.as_deref(),
-                    command_session_id.as_deref(),
-                ) {
-                    (None, _) => {
-                        return Err(SidecarError::new(
-                            "query_runtime_session_inactive",
-                            "No active runtime session can accept this query.",
-                        ))
-                    }
-                    (Some(current), Some(requested)) if current != requested => {
-                        return Err(SidecarError::new(
-                            "query_runtime_session_mismatch",
-                            "The query does not target the active runtime session.",
-                        ))
-                    }
-                    (Some(_), Some(_)) => {}
-                    (Some(_), None) => {
-                        return Err(SidecarError::new(
-                            "invalid_session_id",
-                            "sidecar command validation failed",
-                        ))
-                    }
-                }
-            }
+            validate_runtime_command(active, &command_kind, command_session_id.as_deref())?;
             (active.port.clone(), active.generation)
         };
+
+        authorization.await?;
+
+        {
+            let data = self.inner.data.lock().await;
+            if !matches!(data.state, SidecarState::Ready) || data.generation != generation {
+                return Err(SidecarError::new(
+                    "sidecar_runtime_changed",
+                    "The sidecar runtime changed before command dispatch.",
+                ));
+            }
+            let active = data.active.as_ref().ok_or_else(|| {
+                SidecarError::new(
+                    "sidecar_runtime_changed",
+                    "The sidecar runtime changed before command dispatch.",
+                )
+            })?;
+            if active.generation != generation {
+                return Err(SidecarError::new(
+                    "sidecar_runtime_changed",
+                    "The sidecar runtime changed before command dispatch.",
+                ));
+            }
+            validate_runtime_command(active, &command_kind, command_session_id.as_deref())?;
+        }
+
         match port.write(bytes).await {
             Ok(()) => {
                 let mut data = self.inner.data.lock().await;
-                if data.generation == generation {
-                    if let Some(active) = data
-                        .active
-                        .as_mut()
-                        .filter(|active| active.generation == generation)
-                    {
-                        match command_kind {
-                            ProtocolKind::Command(CommandKind::SessionStart) => {
-                                if active.runtime_session_id != command_session_id {
-                                    active.runtime_session_id = None;
-                                }
-                                active.pending_runtime_session =
-                                    command_session_id.map(|session_id| PendingRuntimeSession {
-                                        session_id,
-                                        command_id,
-                                    });
-                            }
-                            ProtocolKind::Command(CommandKind::SessionStop) => {
-                                if active.runtime_session_id == command_session_id
-                                    || active
-                                        .pending_runtime_session
-                                        .as_ref()
-                                        .map(|pending| &pending.session_id)
-                                        == command_session_id.as_ref()
-                                {
-                                    active.pending_runtime_session = None;
-                                    active.runtime_session_id = None;
-                                }
-                            }
-                            _ => {}
-                        }
+                if data.generation != generation || !matches!(data.state, SidecarState::Ready) {
+                    return Err(SidecarError::new(
+                        "sidecar_runtime_changed",
+                        "The sidecar runtime changed during command dispatch.",
+                    ));
+                }
+                let active = data
+                    .active
+                    .as_mut()
+                    .filter(|active| active.generation == generation)
+                    .ok_or_else(|| {
+                        SidecarError::new(
+                            "sidecar_runtime_changed",
+                            "The sidecar runtime changed during command dispatch.",
+                        )
+                    })?;
+                match command_kind {
+                    ProtocolKind::Command(CommandKind::SessionStart) => {
+                        active.pending_runtime_session =
+                            command_session_id.map(|session_id| PendingRuntimeSession {
+                                session_id,
+                                command_id,
+                            });
                     }
+                    ProtocolKind::Command(CommandKind::SessionStop) => {
+                        active.pending_runtime_session = None;
+                        active.runtime_session_id = None;
+                    }
+                    _ => {}
                 }
                 Ok(())
             }
@@ -600,6 +694,7 @@ impl SidecarSupervisor {
     }
 
     pub async fn accept_stdout(&self, generation: u64, chunk: &[u8]) -> Result<(), SidecarError> {
+        let _commands = self.inner.commands.lock().await;
         let _delivery = self.inner.delivery.lock().await;
         let envelopes = {
             let mut data = self.inner.data.lock().await;
@@ -640,6 +735,7 @@ impl SidecarSupervisor {
     }
 
     pub async fn accept_event(&self, generation: u64, event: Envelope) -> Result<(), SidecarError> {
+        let _commands = self.inner.commands.lock().await;
         let _delivery = self.inner.delivery.lock().await;
         let accepted = {
             let mut data = self.inner.data.lock().await;
@@ -712,6 +808,7 @@ impl SidecarSupervisor {
 
     pub async fn handle_unexpected_exit(&self, generation: u64) {
         let _lifecycle = self.inner.lifecycle.lock().await;
+        let _commands = self.inner.commands.lock().await;
         let _delivery = self.inner.delivery.lock().await;
         let restart = {
             let mut data = self.inner.data.lock().await;
@@ -753,6 +850,7 @@ impl SidecarSupervisor {
     }
 
     async fn handle_poisoned_exit(&self, generation: u64) {
+        let _commands = self.inner.commands.lock().await;
         let _delivery = self.inner.delivery.lock().await;
         let mut data = self.inner.data.lock().await;
         let Some(active) = data.active.as_ref() else {
@@ -795,6 +893,7 @@ impl SidecarSupervisor {
 
     pub async fn restart(&self) -> Result<SidecarStatus, SidecarError> {
         let _lifecycle = self.inner.lifecycle.lock().await;
+        let _commands = self.inner.commands.lock().await;
         let _delivery = self.inner.delivery.lock().await;
         self.stop_current_for_restart_internal().await?;
         {
@@ -812,6 +911,7 @@ impl SidecarSupervisor {
 
     pub async fn shutdown(&self) -> Result<(), SidecarError> {
         let _lifecycle = self.inner.lifecycle.lock().await;
+        let _commands = self.inner.commands.lock().await;
         let _delivery = self.inner.delivery.lock().await;
         let generation = {
             let mut data = self.inner.data.lock().await;
@@ -902,6 +1002,7 @@ impl SidecarSupervisor {
 
     async fn handle_handshake_timeout(&self, generation: u64) {
         let _lifecycle = self.inner.lifecycle.lock().await;
+        let _commands = self.inner.commands.lock().await;
         let _delivery = self.inner.delivery.lock().await;
         let active = {
             let mut data = self.inner.data.lock().await;
@@ -2094,7 +2195,7 @@ mod tests {
 
     use async_trait::async_trait;
     use serde_json::{json, Map, Value};
-    use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex};
+    use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, Notify};
 
     use crate::protocol::{
         encode_frame, CommandKind, Envelope, EventKind, FrameDecoder, ProtocolKind,
@@ -2129,6 +2230,91 @@ mod tests {
 
         async fn kill(&self) -> Result<(), SidecarError> {
             Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct EarlyStartAckPort {
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        observer: Arc<Mutex<Option<(SidecarSupervisor, u64)>>>,
+        delivered: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl SidecarPort for EarlyStartAckPort {
+        async fn write(&self, bytes: Vec<u8>) -> Result<(), SidecarError> {
+            let mut decoder = FrameDecoder::new(MAX_FRAME_BYTES);
+            let command = decoder.push(&bytes).unwrap().pop().unwrap();
+            self.writes.lock().unwrap().push(bytes);
+            if matches!(
+                command.kind,
+                ProtocolKind::Command(CommandKind::SessionStart)
+            ) {
+                let (supervisor, generation) = self.observer.lock().unwrap().clone().unwrap();
+                let session_id = command.session_id.unwrap();
+                let mut event = runtime_session_event(&session_id, "listening");
+                event.correlation_id = Some(command.id);
+                let event = encode_frame(&event).unwrap();
+                let delivered = self.delivered.clone();
+                let mut delivery = tokio::spawn(async move {
+                    supervisor.accept_stdout(generation, &event).await.unwrap();
+                    delivered.notify_waiters();
+                });
+                let _ = tokio::time::timeout(Duration::from_millis(25), &mut delivery).await;
+            }
+            Ok(())
+        }
+
+        async fn kill(&self) -> Result<(), SidecarError> {
+            Ok(())
+        }
+
+        fn observe(&self, supervisor: SidecarSupervisor, generation: u64) {
+            *self.observer.lock().unwrap() = Some((supervisor, generation));
+        }
+    }
+
+    #[derive(Clone)]
+    struct ToggleWriteFailurePort {
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        fail_writes: Arc<AtomicBool>,
+        poisoned: bool,
+    }
+
+    impl ToggleWriteFailurePort {
+        fn new(poisoned: bool) -> Self {
+            Self {
+                writes: Arc::new(Mutex::new(Vec::new())),
+                fail_writes: Arc::new(AtomicBool::new(false)),
+                poisoned,
+            }
+        }
+
+        fn set_fail_writes(&self, fail: bool) {
+            self.fail_writes
+                .store(fail, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl SidecarPort for ToggleWriteFailurePort {
+        async fn write(&self, bytes: Vec<u8>) -> Result<(), SidecarError> {
+            if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(SidecarError::new(
+                    "sidecar_write_failed",
+                    "sidecar command write failed",
+                ));
+            }
+            self.writes.lock().unwrap().push(bytes);
+            Ok(())
+        }
+
+        async fn kill(&self) -> Result<(), SidecarError> {
+            Ok(())
+        }
+
+        fn is_poisoned(&self) -> bool {
+            self.poisoned
         }
     }
 
@@ -2668,6 +2854,28 @@ mod tests {
             "../../../protocol/v1/fixtures/session-state-idle.json"
         ))
         .unwrap()
+    }
+
+    fn runtime_error_event(correlation_id: &str) -> Envelope {
+        Envelope {
+            version: PROTOCOL_VERSION,
+            id: "018f0000-0000-7000-8000-000000000026".into(),
+            session_id: None,
+            sequence: 4,
+            timestamp_ms: 4,
+            kind: ProtocolKind::Event(EventKind::RuntimeError),
+            payload: Map::from_iter([
+                ("code".into(), json!("session_start_failed")),
+                ("message".into(), json!("Runtime command failed.")),
+                ("recoverable".into(), json!(true)),
+                ("source".into(), json!("runtime")),
+            ]),
+            correlation_id: Some(correlation_id.into()),
+        }
+    }
+
+    async fn unreachable_authorization() -> Result<(), SidecarError> {
+        panic!("rejected commands must not invoke the authorizer")
     }
 
     fn session_event(kind: EventKind, payload: Map<String, Value>) -> Envelope {
@@ -3239,7 +3447,11 @@ mod tests {
         let mut malformed = fixture_command();
         malformed.payload = Map::from_iter([(String::from("enabled"), json!("yes"))]);
         assert_eq!(
-            supervisor.send(malformed).await.unwrap_err().code(),
+            supervisor
+                .send_with_authorization(malformed, unreachable_authorization())
+                .await
+                .unwrap_err()
+                .code(),
             "invalid_command_payload"
         );
 
@@ -3250,6 +3462,284 @@ mod tests {
             "invalid_session_id"
         );
         assert!(port.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn correlated_start_snapshot_before_write_return_confirms_the_pending_runtime() {
+        let port = Arc::new(EarlyStartAckPort::default());
+        let launcher = FakeSidecarLauncher {
+            port: port.clone(),
+            launches: Arc::new(Mutex::new(0)),
+        };
+        let supervisor = SidecarSupervisor::with_launcher(Arc::new(launcher), Duration::ZERO);
+
+        supervisor.start().await.unwrap();
+        let handshake_id = {
+            let writes = port.writes.lock().unwrap();
+            let mut decoder = FrameDecoder::new(MAX_FRAME_BYTES);
+            decoder
+                .push(writes.last().unwrap())
+                .unwrap()
+                .pop()
+                .unwrap()
+                .id
+        };
+        supervisor
+            .accept_event(1, ready_for(Some(&handshake_id)))
+            .await
+            .unwrap();
+
+        let delivered = port.delivered.notified();
+        supervisor
+            .send(session_start_command(SESSION_ID))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), delivered)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            supervisor.current_runtime_session().await.as_deref(),
+            Some(SESSION_ID)
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_delivery_waits_for_query_authorization_and_port_write() {
+        let port = FakeSidecarPort::default();
+        let supervisor = SidecarSupervisor::with_port(Arc::new(port.clone()));
+        supervisor
+            .accept_event(0, fixture_envelope())
+            .await
+            .unwrap();
+        supervisor
+            .send(session_start_command(SESSION_ID))
+            .await
+            .unwrap();
+        supervisor
+            .accept_event(0, runtime_session_event(SESSION_ID, "listening"))
+            .await
+            .unwrap();
+
+        let authorization_entered = Arc::new(Notify::new());
+        let authorization_release = Arc::new(Notify::new());
+        let entered = authorization_entered.notified();
+        let send = tokio::spawn({
+            let supervisor = supervisor.clone();
+            let authorization_entered = authorization_entered.clone();
+            let authorization_release = authorization_release.clone();
+            async move {
+                supervisor
+                    .send_with_authorization(query_command(SESSION_ID), async move {
+                        authorization_entered.notify_waiters();
+                        authorization_release.notified().await;
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        entered.await;
+
+        let mut terminal = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move {
+                supervisor
+                    .accept_event(0, runtime_session_event(SESSION_ID, "stopped"))
+                    .await
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut terminal)
+                .await
+                .is_err()
+        );
+
+        authorization_release.notify_waiters();
+        send.await.unwrap().unwrap();
+        terminal.await.unwrap().unwrap();
+        assert_eq!(port.writes.lock().unwrap().len(), 2);
+        assert_eq!(supervisor.current_runtime_session().await, None);
+    }
+
+    #[tokio::test]
+    async fn restart_waits_for_query_authorization_and_port_write() {
+        let first_port = Arc::new(FakeSidecarPort::default());
+        let second_port = Arc::new(FakeSidecarPort::default());
+        let supervisor = SidecarSupervisor::with_launcher(
+            Arc::new(SequencedSidecarLauncher {
+                ports: Arc::new(Mutex::new(VecDeque::from([
+                    first_port.clone() as Arc<dyn SidecarPort>,
+                    second_port.clone() as Arc<dyn SidecarPort>,
+                ]))),
+            }),
+            Duration::ZERO,
+        );
+        supervisor.start().await.unwrap();
+        supervisor
+            .accept_event(1, ready_for(Some(&last_handshake_id(&first_port))))
+            .await
+            .unwrap();
+        supervisor
+            .send(session_start_command(SESSION_ID))
+            .await
+            .unwrap();
+        supervisor
+            .accept_event(1, runtime_session_event(SESSION_ID, "listening"))
+            .await
+            .unwrap();
+
+        let authorization_entered = Arc::new(Notify::new());
+        let authorization_release = Arc::new(Notify::new());
+        let entered = authorization_entered.notified();
+        let send = tokio::spawn({
+            let supervisor = supervisor.clone();
+            let authorization_entered = authorization_entered.clone();
+            let authorization_release = authorization_release.clone();
+            async move {
+                supervisor
+                    .send_with_authorization(query_command(SESSION_ID), async move {
+                        authorization_entered.notify_waiters();
+                        authorization_release.notified().await;
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        entered.await;
+
+        let mut restart = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.restart().await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut restart)
+                .await
+                .is_err()
+        );
+
+        authorization_release.notify_waiters();
+        send.await.unwrap().unwrap();
+        restart.await.unwrap().unwrap();
+        assert_eq!(first_port.writes.lock().unwrap().len(), 3);
+        assert_eq!(second_port.writes.lock().unwrap().len(), 1);
+        assert_eq!(supervisor.current_runtime_session().await, None);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_and_control_commands_are_bound_to_the_tracked_runtime() {
+        let port = FakeSidecarPort::default();
+        let supervisor = SidecarSupervisor::with_port(Arc::new(port.clone()));
+        supervisor
+            .accept_event(0, fixture_envelope())
+            .await
+            .unwrap();
+        let other_session = "018f0000-0000-7000-8000-000000000024";
+
+        let inactive_stop = supervisor
+            .send(session_stop_command(SESSION_ID))
+            .await
+            .unwrap_err();
+        let inactive_control = supervisor.send(fixture_command()).await.unwrap_err();
+        assert_eq!(inactive_stop.code(), "runtime_session_inactive");
+        assert_eq!(inactive_control.code(), "runtime_session_inactive");
+
+        supervisor
+            .send(session_start_command(SESSION_ID))
+            .await
+            .unwrap();
+        let writes_before_rejections = port.writes.lock().unwrap().len();
+        let conflicting_same = supervisor
+            .send(session_start_command(SESSION_ID))
+            .await
+            .unwrap_err();
+        let conflicting_other = supervisor
+            .send(session_start_command(other_session))
+            .await
+            .unwrap_err();
+        let cross_stop = supervisor
+            .send(session_stop_command(other_session))
+            .await
+            .unwrap_err();
+        let mut cross_control = fixture_command();
+        cross_control.session_id = Some(other_session.into());
+        let cross_control = supervisor.send(cross_control).await.unwrap_err();
+        assert_eq!(conflicting_same.code(), "runtime_session_conflict");
+        assert_eq!(conflicting_other.code(), "runtime_session_conflict");
+        assert_eq!(cross_stop.code(), "runtime_session_mismatch");
+        assert_eq!(cross_control.code(), "runtime_session_mismatch");
+        assert_eq!(port.writes.lock().unwrap().len(), writes_before_rejections);
+
+        supervisor.send(fixture_command()).await.unwrap();
+        assert_eq!(
+            supervisor
+                .send_with_authorization(query_command(SESSION_ID), unreachable_authorization(),)
+                .await
+                .unwrap_err()
+                .code(),
+            "query_runtime_session_inactive"
+        );
+        supervisor
+            .accept_event(0, runtime_session_event(SESSION_ID, "listening"))
+            .await
+            .unwrap();
+        let active_conflict = supervisor
+            .send(session_start_command(other_session))
+            .await
+            .unwrap_err();
+        assert_eq!(active_conflict.code(), "runtime_session_conflict");
+
+        for error in [
+            inactive_stop,
+            inactive_control,
+            conflicting_same,
+            conflicting_other,
+            cross_stop,
+            cross_control,
+            active_conflict,
+        ] {
+            let serialized = serde_json::to_string(&error).unwrap();
+            assert!(!serialized.contains(SESSION_ID));
+            assert!(!serialized.contains(other_session));
+        }
+    }
+
+    #[tokio::test]
+    async fn correlated_runtime_error_clears_a_pending_session_start() {
+        let port = FakeSidecarPort::default();
+        let supervisor = SidecarSupervisor::with_port(Arc::new(port));
+        supervisor
+            .accept_event(0, fixture_envelope())
+            .await
+            .unwrap();
+        supervisor
+            .send(session_start_command(SESSION_ID))
+            .await
+            .unwrap();
+
+        supervisor
+            .accept_event(
+                0,
+                runtime_error_event("018f0000-0000-7000-8000-000000000027"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            supervisor
+                .send(session_start_command(SESSION_ID))
+                .await
+                .unwrap_err()
+                .code(),
+            "runtime_session_conflict"
+        );
+
+        supervisor
+            .accept_event(0, runtime_error_event(SESSION_START_COMMAND_ID))
+            .await
+            .unwrap();
+        supervisor
+            .send(session_start_command(SESSION_ID))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -3264,7 +3754,7 @@ mod tests {
         assert_eq!(supervisor.current_runtime_session().await, None);
         assert_eq!(
             supervisor
-                .send(query_command(SESSION_ID))
+                .send_with_authorization(query_command(SESSION_ID), unreachable_authorization(),)
                 .await
                 .unwrap_err()
                 .code(),
@@ -3309,7 +3799,7 @@ mod tests {
         let other_session = "018f0000-0000-7000-8000-000000000024";
         assert_eq!(
             supervisor
-                .send(query_command(other_session))
+                .send_with_authorization(query_command(other_session), unreachable_authorization(),)
                 .await
                 .unwrap_err()
                 .code(),
@@ -3349,6 +3839,157 @@ mod tests {
                 .code(),
             "query_runtime_session_inactive"
         );
+    }
+
+    #[tokio::test]
+    async fn matching_session_stop_is_allowed_while_start_is_pending() {
+        let port = FakeSidecarPort::default();
+        let supervisor = SidecarSupervisor::with_port(Arc::new(port));
+        supervisor
+            .accept_event(0, fixture_envelope())
+            .await
+            .unwrap();
+        supervisor
+            .send(session_start_command(SESSION_ID))
+            .await
+            .unwrap();
+
+        supervisor
+            .send(session_stop_command(SESSION_ID))
+            .await
+            .unwrap();
+        supervisor
+            .send(session_start_command(
+                "018f0000-0000-7000-8000-000000000024",
+            ))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_poisoned_start_write_failure_rolls_back_pending_tracking() {
+        let port = ToggleWriteFailurePort::new(false);
+        let supervisor = SidecarSupervisor::with_port(Arc::new(port.clone()));
+        supervisor
+            .accept_event(0, fixture_envelope())
+            .await
+            .unwrap();
+        port.set_fail_writes(true);
+
+        assert_eq!(
+            supervisor
+                .send(session_start_command(SESSION_ID))
+                .await
+                .unwrap_err()
+                .code(),
+            "sidecar_write_failed"
+        );
+        assert_eq!(supervisor.status().await.state, SidecarState::Ready);
+
+        port.set_fail_writes(false);
+        supervisor
+            .send(session_start_command(SESSION_ID))
+            .await
+            .unwrap();
+        assert_eq!(
+            supervisor
+                .send(session_start_command(SESSION_ID))
+                .await
+                .unwrap_err()
+                .code(),
+            "runtime_session_conflict"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_poisoned_stop_write_failure_retains_runtime_tracking() {
+        let port = ToggleWriteFailurePort::new(false);
+        let supervisor = SidecarSupervisor::with_port(Arc::new(port.clone()));
+        supervisor
+            .accept_event(0, fixture_envelope())
+            .await
+            .unwrap();
+        supervisor
+            .send(session_start_command(SESSION_ID))
+            .await
+            .unwrap();
+        supervisor
+            .accept_event(0, runtime_session_event(SESSION_ID, "listening"))
+            .await
+            .unwrap();
+        port.set_fail_writes(true);
+
+        assert_eq!(
+            supervisor
+                .send(session_stop_command(SESSION_ID))
+                .await
+                .unwrap_err()
+                .code(),
+            "sidecar_write_failed"
+        );
+        assert_eq!(
+            supervisor.current_runtime_session().await.as_deref(),
+            Some(SESSION_ID)
+        );
+
+        port.set_fail_writes(false);
+        supervisor
+            .send(session_stop_command(SESSION_ID))
+            .await
+            .unwrap();
+        assert_eq!(supervisor.current_runtime_session().await, None);
+    }
+
+    #[tokio::test]
+    async fn poisoned_start_write_failure_invalidates_the_runtime_generation() {
+        let port = ToggleWriteFailurePort::new(true);
+        let supervisor = SidecarSupervisor::with_port(Arc::new(port.clone()));
+        supervisor
+            .accept_event(0, fixture_envelope())
+            .await
+            .unwrap();
+        port.set_fail_writes(true);
+
+        assert_eq!(
+            supervisor
+                .send(session_start_command(SESSION_ID))
+                .await
+                .unwrap_err()
+                .code(),
+            "sidecar_write_failed"
+        );
+        assert_eq!(supervisor.status().await.state, SidecarState::Failed);
+        assert_eq!(supervisor.current_runtime_session().await, None);
+    }
+
+    #[tokio::test]
+    async fn poisoned_stop_write_failure_invalidates_the_active_runtime() {
+        let port = ToggleWriteFailurePort::new(true);
+        let supervisor = SidecarSupervisor::with_port(Arc::new(port.clone()));
+        supervisor
+            .accept_event(0, fixture_envelope())
+            .await
+            .unwrap();
+        supervisor
+            .send(session_start_command(SESSION_ID))
+            .await
+            .unwrap();
+        supervisor
+            .accept_event(0, runtime_session_event(SESSION_ID, "listening"))
+            .await
+            .unwrap();
+        port.set_fail_writes(true);
+
+        assert_eq!(
+            supervisor
+                .send(session_stop_command(SESSION_ID))
+                .await
+                .unwrap_err()
+                .code(),
+            "sidecar_write_failed"
+        );
+        assert_eq!(supervisor.status().await.state, SidecarState::Failed);
+        assert_eq!(supervisor.current_runtime_session().await, None);
     }
 
     #[tokio::test]
@@ -3461,7 +4102,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_does_not_wait_for_a_blocked_port_write() {
+    async fn shutdown_waits_for_a_serialized_port_write_before_cleanup() {
         #[derive(Clone)]
         struct BlockingPort {
             started: Arc<tokio::sync::Notify>,
@@ -3491,17 +4132,23 @@ mod tests {
         let started = port.started.notified();
         let send = tokio::spawn({
             let supervisor = supervisor.clone();
-            async move { supervisor.send(fixture_command()).await }
+            async move { supervisor.send(session_start_command(SESSION_ID)).await }
         });
         started.await;
 
+        let mut shutdown = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.shutdown().await }
+        });
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), supervisor.shutdown())
+            tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
                 .await
-                .is_ok()
+                .is_err()
         );
         port.release.notify_waiters();
-        let _ = send.await;
+        send.await.unwrap().unwrap();
+        shutdown.await.unwrap().unwrap();
+        assert_eq!(supervisor.status().await.state, SidecarState::Stopped);
     }
 
     #[test]

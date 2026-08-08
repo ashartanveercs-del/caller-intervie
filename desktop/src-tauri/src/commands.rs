@@ -226,24 +226,26 @@ pub async fn send_sidecar_command(
     state: State<'_, AppState>,
     command: Envelope,
 ) -> Result<(), SidecarCommandError> {
-    let runtime_session = state.sidecar.current_runtime_session().await;
+    let _session_operation = state.session_operation_gate.lock().await;
     let repository = state.repository.clone();
-    ensure_sidecar_command_authorized(
-        &command,
-        &state.workspace_id,
-        runtime_session.as_deref(),
+    let authorization_command = command.clone();
+    let workspace_id = state.workspace_id.clone();
+    let authorization = ensure_sidecar_command_authorized(
+        &authorization_command,
+        &workspace_id,
         move |workspace_id, session_id, request_id| {
             repository.authorize_query_dispatch(&workspace_id, &session_id, &request_id)
         },
-    )
-    .await?;
-    state.sidecar.send(command).await
+    );
+    state
+        .sidecar
+        .send_with_authorization(command, authorization)
+        .await
 }
 
 async fn ensure_sidecar_command_authorized<F>(
     command: &Envelope,
     workspace_id: &str,
-    runtime_session_id: Option<&str>,
     authorize: F,
 ) -> Result<(), SidecarError>
 where
@@ -263,21 +265,6 @@ where
     let session_id = command.session_id.clone().ok_or_else(|| {
         SidecarError::new("invalid_session_id", "sidecar command validation failed")
     })?;
-    match runtime_session_id {
-        None => {
-            return Err(SidecarError::new(
-                "query_runtime_session_inactive",
-                "No active runtime session can accept this query.",
-            ))
-        }
-        Some(current) if current != session_id.as_str() => {
-            return Err(SidecarError::new(
-                "query_runtime_session_mismatch",
-                "The query does not target the active runtime session.",
-            ))
-        }
-        Some(_) => {}
-    }
     let workspace_id = workspace_id.to_owned();
     // The sidecar echoes the query command ID as suggestion correlation_id.
     let request_id = command.id.clone();
@@ -387,6 +374,7 @@ pub async fn complete_session(
     status: CompletionStatusInput,
 ) -> Result<(), StorageCommandError> {
     validate_uuid(&session_id)?;
+    let _session_operation = state.session_operation_gate.lock().await;
     let workspace_id = state.workspace_id.clone();
     let completed_at_ms = now_ms()?;
     run_repository(state.repository.clone(), move |repository| {
@@ -483,6 +471,7 @@ pub async fn delete_session(
     session_id: String,
 ) -> Result<(), StorageCommandError> {
     validate_uuid(&session_id)?;
+    let _session_operation = state.session_operation_gate.lock().await;
     let workspace_id = state.workspace_id.clone();
     run_repository(state.repository.clone(), move |repository| {
         if repository.delete_session(&workspace_id, &session_id)? {
@@ -685,7 +674,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn valid_query_proves_the_request_turn_and_runtime_session_before_dispatch() {
+    async fn valid_query_proves_the_request_turn_before_dispatch() {
         let caller_thread = std::thread::current().id();
         let observed = Arc::new(Mutex::new(None));
         let captured = observed.clone();
@@ -693,7 +682,6 @@ mod tests {
         ensure_sidecar_command_authorized(
             &query_command(),
             WORKSPACE_ID,
-            Some(SESSION_ID),
             move |workspace_id, session_id, request_id| {
                 *captured.lock().unwrap() = Some((
                     workspace_id,
@@ -722,7 +710,6 @@ mod tests {
         let error = ensure_sidecar_command_authorized(
             &command,
             WORKSPACE_ID,
-            Some(SESSION_ID),
             |_, _, _| -> Result<_, RepositoryError> {
                 panic!("invalid commands must not reach durable storage")
             },
@@ -731,39 +718,6 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.code(), "invalid_command_payload");
-    }
-
-    #[tokio::test]
-    async fn query_requires_a_current_matching_runtime_session_before_repository_lookup() {
-        let inactive = ensure_sidecar_command_authorized(
-            &query_command(),
-            WORKSPACE_ID,
-            None,
-            |_, _, _| -> Result<_, RepositoryError> {
-                panic!("inactive runtime sessions must not reach durable storage")
-            },
-        )
-        .await
-        .unwrap_err();
-        let mismatch = ensure_sidecar_command_authorized(
-            &query_command(),
-            WORKSPACE_ID,
-            Some("018f0000-0000-7000-8000-000000000004"),
-            |_, _, _| -> Result<_, RepositoryError> {
-                panic!("cross-runtime queries must not reach durable storage")
-            },
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(inactive.code(), "query_runtime_session_inactive");
-        assert_eq!(mismatch.code(), "query_runtime_session_mismatch");
-        for error in [inactive, mismatch] {
-            let serialized = serde_json::to_string(&error).unwrap();
-            for forbidden in [WORKSPACE_ID, SESSION_ID, REQUEST_ID, TURN_ID, "SELECT"] {
-                assert!(!serialized.contains(forbidden));
-            }
-        }
     }
 
     #[tokio::test]
@@ -791,7 +745,6 @@ mod tests {
             let error = ensure_sidecar_command_authorized(
                 &query_command(),
                 WORKSPACE_ID,
-                Some(SESSION_ID),
                 move |_, _, _| Ok(authorization),
             )
             .await
@@ -814,7 +767,6 @@ mod tests {
         ensure_sidecar_command_authorized(
             &command,
             WORKSPACE_ID,
-            None,
             |_, _, _| -> Result<_, RepositoryError> {
                 panic!("non-query commands must bypass association storage")
             },

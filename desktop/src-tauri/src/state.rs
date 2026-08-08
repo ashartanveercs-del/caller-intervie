@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tauri::{AppHandle, Manager};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::sidecar::{
     PersistenceAwareEventSink, SidecarSupervisor, StorageHealth, StorageHealthTracker,
@@ -28,6 +29,7 @@ pub struct AppState {
     pub repository: Arc<SessionRepository>,
     pub storage_health: StorageHealthTracker,
     pub sidecar: SidecarSupervisor,
+    pub session_operation_gate: Arc<AsyncMutex<()>>,
 }
 
 impl AppState {
@@ -73,12 +75,18 @@ impl AppState {
             repository,
             storage_health,
             sidecar,
+            session_operation_gate: Arc::new(AsyncMutex::new(())),
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify};
+
     use super::{KEYRING_ACCOUNT, KEYRING_SERVICE, LOCAL_WORKSPACE_ID};
 
     #[test]
@@ -87,5 +95,42 @@ mod tests {
         assert_eq!(KEYRING_SERVICE, "com.callerinterview.desktop");
         assert_eq!(KEYRING_ACCOUNT, "sqlcipher-unlock");
         assert!(!KEYRING_ACCOUNT.contains("key"));
+    }
+
+    #[tokio::test]
+    async fn complete_and_delete_session_operations_are_serialized() {
+        let gate = Arc::new(AsyncMutex::new(()));
+        let release_complete = Arc::new(Notify::new());
+        let (entered_sender, mut entered_receiver) = mpsc::unbounded_channel();
+
+        let complete = tokio::spawn({
+            let gate = gate.clone();
+            let release_complete = release_complete.clone();
+            let entered_sender = entered_sender.clone();
+            async move {
+                let _session_operation = gate.lock().await;
+                entered_sender.send("complete").unwrap();
+                release_complete.notified().await;
+            }
+        });
+        assert_eq!(entered_receiver.recv().await, Some("complete"));
+
+        let delete = tokio::spawn({
+            let gate = gate.clone();
+            async move {
+                let _session_operation = gate.lock().await;
+                entered_sender.send("delete").unwrap();
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), entered_receiver.recv())
+                .await
+                .is_err()
+        );
+
+        release_complete.notify_waiters();
+        complete.await.unwrap();
+        delete.await.unwrap();
+        assert_eq!(entered_receiver.recv().await, Some("delete"));
     }
 }
