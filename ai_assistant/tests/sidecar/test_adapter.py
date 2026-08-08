@@ -164,6 +164,19 @@ class FakeRuntimeService:
             raise self.error
 
 
+class FailedStartRuntime(FakeRuntimeService):
+    async def start_session(self, config) -> None:
+        self.started_with = config
+        self._snapshot = replace(
+            self._snapshot,
+            state="error",
+            session_id=config.session_id,
+            mode=config.mode,
+            listening=False,
+        )
+        raise RuntimeError("secret startup detail")
+
+
 @_async_test
 async def test_start_command_maps_all_language_fields_and_correlates_state() -> None:
     runtime = FakeRuntimeService()
@@ -183,6 +196,33 @@ async def test_start_command_maps_all_language_fields_and_correlates_state() -> 
     assert output.last.kind == EventKind.SESSION_STATE
     assert output.last.correlation_id == start.id
     assert output.last.payload["state"] == "listening"
+
+
+@_async_test
+async def test_start_failure_emits_error_state_before_sanitized_runtime_error() -> None:
+    runtime = FailedStartRuntime()
+    output = CollectingOutput()
+    adapter = RuntimeProtocolAdapter(runtime, output.write)
+    start = load_fixture("session-start.json")
+
+    await adapter.handle(start)
+
+    assert [event.kind for event in output.events] == [
+        EventKind.SESSION_STATE,
+        EventKind.RUNTIME_ERROR,
+    ]
+    state, error = output.events
+    assert state.session_id == SESSION_ID
+    assert state.correlation_id == start.id
+    assert state.payload["state"] == "error"
+    assert state.payload["listening"] is False
+    assert error.correlation_id == start.id
+    assert error.payload == {
+        "code": "runtime_error",
+        "message": "Runtime command failed",
+        "recoverable": True,
+        "source": "runtime",
+    }
 
 
 @pytest.mark.parametrize(
