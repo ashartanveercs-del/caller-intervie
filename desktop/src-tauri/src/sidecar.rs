@@ -17,7 +17,7 @@ use crate::protocol::{
     ProtocolKind, MAX_FRAME_BYTES,
 };
 use crate::storage::{
-    AppendEventResult, AssociateRequestResult, NewTimelineEvent, RequestTurnAssociation,
+    AppendEventResult, NewTimelineEvent, RepositoryError, RequestTurnAssociation,
     SessionRepository, SessionStatus, TimelineEventKind,
 };
 
@@ -27,9 +27,13 @@ pub const STORAGE_HEALTH_EVENT: &str = "storage://health";
 pub const PRODUCTION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_DIAGNOSTICS: usize = 20;
 const MAX_PENDING_DURABLE_EVENTS: usize = 1_024;
+const MAX_QUARANTINED_DURABLE_EVENTS: usize = 64;
+const MAX_PERMANENT_ATTEMPTS: u8 = 3;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const STORAGE_PERSIST_TIMEOUT: Duration = Duration::from_secs(5);
 const STORAGE_RETRY_DELAY: Duration = Duration::from_millis(250);
+const EVENT_SINK_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
+const PERSISTENCE_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn packaged_sidecar_path(host_executable: &std::path::Path) -> std::path::PathBuf {
@@ -106,6 +110,10 @@ pub trait SidecarLauncher: Send + Sync {
 #[async_trait]
 pub trait SidecarEventSink: Send + Sync {
     async fn emit(&self, event: &Envelope) -> Result<(), SidecarError>;
+
+    async fn shutdown(&self) -> Result<(), SidecarError> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -187,29 +195,88 @@ pub trait StorageHealthReporter: Send + Sync {
     fn report(&self, health: &StorageHealth) -> Result<(), SidecarError>;
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DurableStoreError {
+    Transient,
+    DependencyMissing,
+    EventCollision,
+    InvalidSession,
+    TerminalConflict,
+    InvalidEvent,
+}
+
+impl DurableStoreError {
+    fn code(self, event: &Envelope) -> &'static str {
+        match self {
+            Self::Transient => PersistenceAwareEventSink::storage_failure_code(event),
+            Self::DependencyMissing => "storage_dependency_missing",
+            Self::EventCollision => "storage_event_collision",
+            Self::InvalidSession => "storage_invalid_session",
+            Self::TerminalConflict => "storage_terminal_conflict",
+            Self::InvalidEvent => "storage_invalid_event",
+        }
+    }
+
+    fn is_permanent(self) -> bool {
+        matches!(
+            self,
+            Self::EventCollision
+                | Self::InvalidSession
+                | Self::TerminalConflict
+                | Self::InvalidEvent
+        )
+    }
+}
+
+fn classify_repository_error(error: RepositoryError) -> DurableStoreError {
+    match error {
+        RepositoryError::EventContentCollision { .. }
+        | RepositoryError::RequestTurnAssociationConflict => DurableStoreError::EventCollision,
+        RepositoryError::NotFound => DurableStoreError::InvalidSession,
+        RepositoryError::SessionCompletionConflict => DurableStoreError::TerminalConflict,
+        RepositoryError::NonDurableEvent(_)
+        | RepositoryError::InvalidSessionLimit { .. }
+        | RepositoryError::InvalidCompletionStatus
+        | RepositoryError::InvalidTerminalEventKind
+        | RepositoryError::BriefSerialization
+        | RepositoryError::Model(_) => DurableStoreError::InvalidEvent,
+        RepositoryError::CipherUnavailable
+        | RepositoryError::ConnectionUnavailable
+        | RepositoryError::Migration(_)
+        | RepositoryError::Sql(_) => DurableStoreError::Transient,
+    }
+}
+
 pub trait DurableEventStore: Send + Sync {
-    fn append_event(&self, event: &NewTimelineEvent) -> Result<AppendEventResult, ()>;
+    fn append_event(
+        &self,
+        event: &NewTimelineEvent,
+    ) -> Result<AppendEventResult, DurableStoreError>;
     fn append_terminal_event(
         &self,
         event: &NewTimelineEvent,
         status: SessionStatus,
         completed_at_ms: i64,
-    ) -> Result<AppendEventResult, ()>;
-    fn associate_request_with_turn(
+    ) -> Result<AppendEventResult, DurableStoreError>;
+    fn append_transcript_event_with_association(
         &self,
+        event: &NewTimelineEvent,
         association: &RequestTurnAssociation,
-    ) -> Result<AssociateRequestResult, ()>;
+    ) -> Result<AppendEventResult, DurableStoreError>;
     fn resolve_request_turn(
         &self,
         workspace_id: &str,
         session_id: &str,
         request_id: &str,
-    ) -> Result<Option<String>, ()>;
+    ) -> Result<Option<String>, DurableStoreError>;
 }
 
 impl DurableEventStore for SessionRepository {
-    fn append_event(&self, event: &NewTimelineEvent) -> Result<AppendEventResult, ()> {
-        SessionRepository::append_event(self, event).map_err(|_| ())
+    fn append_event(
+        &self,
+        event: &NewTimelineEvent,
+    ) -> Result<AppendEventResult, DurableStoreError> {
+        SessionRepository::append_event(self, event).map_err(classify_repository_error)
     }
 
     fn append_terminal_event(
@@ -217,16 +284,18 @@ impl DurableEventStore for SessionRepository {
         event: &NewTimelineEvent,
         status: SessionStatus,
         completed_at_ms: i64,
-    ) -> Result<AppendEventResult, ()> {
+    ) -> Result<AppendEventResult, DurableStoreError> {
         SessionRepository::append_terminal_event(self, event, status, completed_at_ms)
-            .map_err(|_| ())
+            .map_err(classify_repository_error)
     }
 
-    fn associate_request_with_turn(
+    fn append_transcript_event_with_association(
         &self,
+        event: &NewTimelineEvent,
         association: &RequestTurnAssociation,
-    ) -> Result<AssociateRequestResult, ()> {
-        SessionRepository::associate_request_with_turn(self, association).map_err(|_| ())
+    ) -> Result<AppendEventResult, DurableStoreError> {
+        SessionRepository::append_transcript_event_with_association(self, event, association)
+            .map_err(classify_repository_error)
     }
 
     fn resolve_request_turn(
@@ -234,9 +303,9 @@ impl DurableEventStore for SessionRepository {
         workspace_id: &str,
         session_id: &str,
         request_id: &str,
-    ) -> Result<Option<String>, ()> {
+    ) -> Result<Option<String>, DurableStoreError> {
         SessionRepository::resolve_request_turn(self, workspace_id, session_id, request_id)
-            .map_err(|_| ())
+            .map_err(classify_repository_error)
     }
 }
 
@@ -748,10 +817,22 @@ impl SidecarSupervisor {
             data.state = SidecarState::Stopped;
             data.active.as_ref().map(|active| active.generation)
         };
-        if let Some(generation) = generation {
-            self.cleanup_generation(generation).await?;
-        }
-        Ok(())
+        let sink_result =
+            match tokio::time::timeout(EVENT_SINK_SHUTDOWN_TIMEOUT, self.inner.sink.shutdown())
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(SidecarError::new(
+                    "sidecar_sink_shutdown_timeout",
+                    "sidecar event delivery did not stop in time",
+                )),
+            };
+        let cleanup_result = match generation {
+            Some(generation) => self.cleanup_generation(generation).await,
+            None => Ok(()),
+        };
+        sink_result?;
+        cleanup_result
     }
 
     async fn launch_internal(&self) -> Result<(), SidecarError> {
@@ -1357,6 +1438,7 @@ pub struct PersistenceAwareEventSink {
     health: Arc<dyn StorageHealthReporter>,
     source_generation: AtomicU64,
     queue: Arc<AsyncMutex<DurableEventQueue>>,
+    shutdown: watch::Sender<bool>,
     persistence_timeout: Duration,
     retry_delay: Duration,
 }
@@ -1368,6 +1450,12 @@ struct PendingDurableEvent {
     acknowledgement: watch::Sender<PersistenceAcknowledgement>,
 }
 
+#[derive(Clone)]
+struct QuarantinedDurableEvent {
+    event: Envelope,
+    code: &'static str,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PersistenceAcknowledgement {
     Pending,
@@ -1377,10 +1465,20 @@ enum PersistenceAcknowledgement {
 
 #[derive(Default)]
 struct DurableEventQueue {
-    events: VecDeque<PendingDurableEvent>,
+    pending: VecDeque<PendingDurableEvent>,
+    deferred: VecDeque<PendingDurableEvent>,
+    quarantined: VecDeque<QuarantinedDurableEvent>,
     worker_running: bool,
+    worker: Option<tokio::task::JoinHandle<()>>,
+    shutting_down: bool,
     degraded_code: Option<&'static str>,
     sticky_degraded: bool,
+}
+
+enum PersistenceEnqueue {
+    Await(watch::Receiver<PersistenceAcknowledgement>),
+    LiveOnly,
+    Collision,
 }
 
 impl PersistenceAwareEventSink {
@@ -1424,6 +1522,7 @@ impl PersistenceAwareEventSink {
         persistence_timeout: Duration,
         retry_delay: Duration,
     ) -> Self {
+        let (shutdown, _) = watch::channel(false);
         Self {
             workspace_id: workspace_id.into(),
             store,
@@ -1431,6 +1530,7 @@ impl PersistenceAwareEventSink {
             health,
             source_generation: AtomicU64::new(0),
             queue: Arc::new(AsyncMutex::new(DurableEventQueue::default())),
+            shutdown,
             persistence_timeout,
             retry_delay,
         }
@@ -1460,7 +1560,7 @@ impl PersistenceAwareEventSink {
         }
     }
 
-    fn spawn_persistence_worker(&self) {
+    fn spawn_persistence_worker(&self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(run_persistence_worker(
             self.workspace_id.clone(),
             self.store.clone(),
@@ -1468,6 +1568,7 @@ impl PersistenceAwareEventSink {
             self.queue.clone(),
             self.persistence_timeout,
             self.retry_delay,
+            self.shutdown.subscribe(),
         ));
     }
 }
@@ -1478,68 +1579,112 @@ impl SidecarEventSink for PersistenceAwareEventSink {
         if matches!(&event.kind, ProtocolKind::Event(EventKind::SidecarReady)) {
             self.source_generation.fetch_add(1, Ordering::SeqCst);
         } else if Self::is_persistence_candidate(event) {
-            let mut acknowledgement = None;
-            let mut wait_for_acknowledgement = false;
-            let mut start_worker = false;
             let mut report_code = None;
-            {
+            let enqueue = {
                 let mut queue = self.queue.lock().await;
-                if let Some(existing) = queue.events.iter().find(|item| item.event.id == event.id) {
-                    if existing.event == *event {
-                        acknowledgement = Some(existing.acknowledgement.subscribe());
-                        wait_for_acknowledgement = queue.degraded_code.is_none();
+                let queued = queue
+                    .pending
+                    .iter()
+                    .chain(queue.deferred.iter())
+                    .find(|item| item.event.id == event.id)
+                    .map(|item| (item.event == *event, item.acknowledgement.subscribe()));
+                let quarantined = queue
+                    .quarantined
+                    .iter()
+                    .find(|item| item.event.id == event.id)
+                    .map(|item| (item.event == *event, item.code));
+                if let Some((is_exact, receiver)) = queued {
+                    if is_exact {
+                        PersistenceEnqueue::Await(receiver)
                     } else {
                         let code = "storage_event_collision";
-                        let should_report = queue.degraded_code != Some(code);
-                        queue.degraded_code = Some(code);
-                        queue.sticky_degraded = true;
+                        let should_report = mark_degraded_locked(&mut queue, code, true);
                         report_code = should_report.then_some(code);
+                        PersistenceEnqueue::Collision
                     }
-                } else if queue.events.len() >= MAX_PENDING_DURABLE_EVENTS {
-                    let code = "storage_backlog_full";
-                    let should_report = queue.degraded_code != Some(code);
-                    queue.degraded_code = Some(code);
-                    queue.sticky_degraded = true;
+                } else if let Some((is_exact, quarantine_code)) = quarantined {
+                    if is_exact {
+                        let should_report = mark_degraded_locked(&mut queue, quarantine_code, true);
+                        report_code = should_report.then_some(quarantine_code);
+                        PersistenceEnqueue::LiveOnly
+                    } else {
+                        let code = "storage_event_collision";
+                        let should_report = mark_degraded_locked(&mut queue, code, true);
+                        report_code = should_report.then_some(code);
+                        PersistenceEnqueue::Collision
+                    }
+                } else if queue.shutting_down {
+                    let code = "storage_shutdown";
+                    let should_report = mark_degraded_locked(&mut queue, code, true);
                     report_code = should_report.then_some(code);
+                    PersistenceEnqueue::LiveOnly
+                } else if queue.pending.len() + queue.deferred.len() >= MAX_PENDING_DURABLE_EVENTS {
+                    let code = "storage_backlog_full";
+                    let should_report = mark_degraded_locked(&mut queue, code, true);
+                    report_code = should_report.then_some(code);
+                    PersistenceEnqueue::LiveOnly
                 } else {
-                    wait_for_acknowledgement = queue.degraded_code.is_none();
                     let (sender, receiver) = watch::channel(PersistenceAcknowledgement::Pending);
-                    queue.events.push_back(PendingDurableEvent {
+                    queue.pending.push_back(PendingDurableEvent {
                         source_generation: self.source_generation.load(Ordering::SeqCst),
                         event: event.clone(),
                         acknowledgement: sender,
                     });
-                    acknowledgement = Some(receiver);
                     if !queue.worker_running {
                         queue.worker_running = true;
-                        start_worker = true;
+                        queue.worker = Some(self.spawn_persistence_worker());
                     }
+                    PersistenceEnqueue::Await(receiver)
                 }
-            }
+            };
 
             if let Some(code) = report_code {
                 let _ = self.health.report(&StorageHealth::degraded(code));
             }
-            if start_worker {
-                self.spawn_persistence_worker();
-            }
-            if wait_for_acknowledgement {
-                let receiver = acknowledgement
-                    .expect("a queued durable event must have an acknowledgement channel");
-                if await_initial_persistence(receiver, self.persistence_timeout)
-                    .await
-                    .is_none()
-                {
-                    report_storage_degraded(
-                        &self.queue,
-                        self.health.as_ref(),
-                        Self::storage_failure_code(event),
-                    )
-                    .await;
+            match enqueue {
+                PersistenceEnqueue::Await(receiver) => {
+                    if await_initial_persistence(receiver, self.persistence_timeout)
+                        .await
+                        .is_none()
+                    {
+                        report_timeout_if_event_pending(
+                            &self.queue,
+                            self.health.as_ref(),
+                            event,
+                            Self::storage_failure_code(event),
+                        )
+                        .await;
+                    }
                 }
+                PersistenceEnqueue::Collision => {
+                    return Err(SidecarError::new(
+                        "storage_event_collision",
+                        "durable event id conflicts with pending content",
+                    ));
+                }
+                PersistenceEnqueue::LiveOnly => {}
             }
         }
         self.downstream.emit(event).await
+    }
+
+    async fn shutdown(&self) -> Result<(), SidecarError> {
+        let mut worker = {
+            let mut queue = self.queue.lock().await;
+            queue.shutting_down = true;
+            self.shutdown.send_replace(true);
+            queue.worker.take()
+        };
+        if let Some(worker) = worker.as_mut() {
+            if tokio::time::timeout(PERSISTENCE_WORKER_SHUTDOWN_TIMEOUT, &mut *worker)
+                .await
+                .is_err()
+            {
+                worker.abort();
+            }
+        }
+        self.queue.lock().await.worker_running = false;
+        self.downstream.shutdown().await
     }
 }
 
@@ -1558,30 +1703,55 @@ async fn await_initial_persistence(
             }
         }
     };
-    tokio::time::timeout(
-        timeout.saturating_add(Duration::from_millis(10)),
-        acknowledgement,
-    )
-    .await
-    .ok()
+    tokio::time::timeout(timeout, acknowledgement).await.ok()
+}
+
+fn mark_degraded_locked(queue: &mut DurableEventQueue, code: &'static str, sticky: bool) -> bool {
+    if queue.sticky_degraded && !sticky {
+        return false;
+    }
+    let newly_sticky = sticky && !queue.sticky_degraded;
+    let should_report = queue.degraded_code != Some(code) || newly_sticky;
+    queue.degraded_code = Some(code);
+    queue.sticky_degraded |= sticky;
+    should_report
 }
 
 async fn report_storage_degraded(
     queue: &Arc<AsyncMutex<DurableEventQueue>>,
     health: &dyn StorageHealthReporter,
     code: &'static str,
+    sticky: bool,
 ) {
     let should_report = {
         let mut queue = queue.lock().await;
-        if queue.sticky_degraded {
-            return;
-        }
-        let should_report = queue.degraded_code != Some(code);
-        queue.degraded_code = Some(code);
-        should_report
+        mark_degraded_locked(&mut queue, code, sticky)
     };
     if should_report {
         let _ = health.report(&StorageHealth::degraded(code));
+    }
+}
+
+async fn report_timeout_if_event_pending(
+    queue: &Arc<AsyncMutex<DurableEventQueue>>,
+    health: &dyn StorageHealthReporter,
+    event: &Envelope,
+    code: &'static str,
+) {
+    let mut queue = queue.lock().await;
+    let acknowledgement = queue
+        .pending
+        .iter()
+        .chain(queue.deferred.iter())
+        .find(|item| item.event == *event)
+        .filter(|item| *item.acknowledgement.borrow() == PersistenceAcknowledgement::Pending)
+        .map(|item| item.acknowledgement.clone());
+    if let Some(acknowledgement) = acknowledgement {
+        let should_report = mark_degraded_locked(&mut queue, code, false);
+        acknowledgement.send_replace(PersistenceAcknowledgement::Degraded(code));
+        if should_report {
+            let _ = health.report(&StorageHealth::degraded(code));
+        }
     }
 }
 
@@ -1589,7 +1759,7 @@ fn spawn_persistence_attempt(
     store: Arc<dyn DurableEventStore>,
     workspace_id: String,
     item: PendingDurableEvent,
-) -> tokio::task::JoinHandle<Result<(), ()>> {
+) -> tokio::task::JoinHandle<Result<(), DurableStoreError>> {
     tokio::task::spawn_blocking(move || {
         persist_durable_event(
             store.as_ref(),
@@ -1607,64 +1777,216 @@ async fn run_persistence_worker(
     queue: Arc<AsyncMutex<DurableEventQueue>>,
     persistence_timeout: Duration,
     retry_delay: Duration,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
         let item = {
             let mut queue_state = queue.lock().await;
-            let Some(item) = queue_state.events.front().cloned() else {
+            if queue_state.shutting_down {
+                queue_state.worker_running = false;
+                return;
+            }
+            let Some(item) = queue_state.pending.front().cloned() else {
                 queue_state.worker_running = false;
                 return;
             };
             item
         };
-        let failure_code = PersistenceAwareEventSink::storage_failure_code(&item.event);
-        let mut attempt =
-            spawn_persistence_attempt(store.clone(), workspace_id.clone(), item.clone());
+        let Some(mut attempt) = spawn_persistence_attempt_if_active(
+            &queue,
+            store.clone(),
+            workspace_id.clone(),
+            item.clone(),
+        )
+        .await
+        else {
+            return;
+        };
+        let mut permanent_attempts = 0_u8;
 
         loop {
-            match tokio::time::timeout(persistence_timeout, &mut attempt).await {
+            let result = tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        mark_worker_stopped(&queue).await;
+                        return;
+                    }
+                    continue;
+                }
+                result = tokio::time::timeout(persistence_timeout, &mut attempt) => result,
+            };
+            match result {
                 Ok(Ok(Ok(()))) => {
                     let report_ready = {
                         let mut queue_state = queue.lock().await;
                         let persisted = queue_state
-                            .events
+                            .pending
                             .pop_front()
                             .expect("persistence worker must own the FIFO head");
                         debug_assert_eq!(persisted.event, item.event);
-                        if queue_state.events.is_empty() && !queue_state.sticky_degraded {
+                        let deferred = std::mem::take(&mut queue_state.deferred);
+                        queue_state.pending.extend(deferred);
+                        if queue_state.pending.is_empty() && !queue_state.sticky_degraded {
                             queue_state.degraded_code = None;
                             true
                         } else {
                             false
                         }
                     };
+                    item.acknowledgement
+                        .send_replace(PersistenceAcknowledgement::Persisted);
                     if report_ready {
                         let _ = health.report(&StorageHealth::ready());
                     }
-                    item.acknowledgement
-                        .send_replace(PersistenceAcknowledgement::Persisted);
                     break;
                 }
-                Ok(_) => {
-                    report_storage_degraded(&queue, health.as_ref(), failure_code).await;
+                Ok(Ok(Err(DurableStoreError::DependencyMissing))) => {
+                    let code = DurableStoreError::DependencyMissing.code(&item.event);
+                    report_storage_degraded(&queue, health.as_ref(), code, false).await;
                     item.acknowledgement
-                        .send_replace(PersistenceAcknowledgement::Degraded(failure_code));
-                    tokio::time::sleep(retry_delay).await;
-                    attempt = spawn_persistence_attempt(
+                        .send_replace(PersistenceAcknowledgement::Degraded(code));
+                    defer_fifo_head(&queue, &item).await;
+                    break;
+                }
+                Ok(Ok(Err(error))) if error.is_permanent() => {
+                    let code = error.code(&item.event);
+                    permanent_attempts += 1;
+                    report_storage_degraded(&queue, health.as_ref(), code, false).await;
+                    item.acknowledgement
+                        .send_replace(PersistenceAcknowledgement::Degraded(code));
+                    if permanent_attempts >= MAX_PERMANENT_ATTEMPTS {
+                        quarantine_fifo_head(&queue, &item, code).await;
+                        report_storage_degraded(&queue, health.as_ref(), code, true).await;
+                        break;
+                    }
+                    if sleep_or_shutdown(&mut shutdown, retry_delay).await {
+                        mark_worker_stopped(&queue).await;
+                        return;
+                    }
+                    let Some(retry) = spawn_persistence_attempt_if_active(
+                        &queue,
                         store.clone(),
                         workspace_id.clone(),
                         item.clone(),
-                    );
+                    )
+                    .await
+                    else {
+                        return;
+                    };
+                    attempt = retry;
+                }
+                Ok(Ok(Err(error))) => {
+                    let code = error.code(&item.event);
+                    report_storage_degraded(&queue, health.as_ref(), code, false).await;
+                    item.acknowledgement
+                        .send_replace(PersistenceAcknowledgement::Degraded(code));
+                    if sleep_or_shutdown(&mut shutdown, retry_delay).await {
+                        mark_worker_stopped(&queue).await;
+                        return;
+                    }
+                    let Some(retry) = spawn_persistence_attempt_if_active(
+                        &queue,
+                        store.clone(),
+                        workspace_id.clone(),
+                        item.clone(),
+                    )
+                    .await
+                    else {
+                        return;
+                    };
+                    attempt = retry;
                 }
                 Err(_) => {
-                    report_storage_degraded(&queue, health.as_ref(), failure_code).await;
+                    let code = PersistenceAwareEventSink::storage_failure_code(&item.event);
+                    report_storage_degraded(&queue, health.as_ref(), code, false).await;
                     item.acknowledgement
-                        .send_replace(PersistenceAcknowledgement::Degraded(failure_code));
-                    tokio::time::sleep(retry_delay).await;
+                        .send_replace(PersistenceAcknowledgement::Degraded(code));
+                    if sleep_or_shutdown(&mut shutdown, retry_delay).await {
+                        mark_worker_stopped(&queue).await;
+                        return;
+                    }
+                }
+                Ok(Err(_)) => {
+                    let code = PersistenceAwareEventSink::storage_failure_code(&item.event);
+                    report_storage_degraded(&queue, health.as_ref(), code, false).await;
+                    item.acknowledgement
+                        .send_replace(PersistenceAcknowledgement::Degraded(code));
+                    if sleep_or_shutdown(&mut shutdown, retry_delay).await {
+                        mark_worker_stopped(&queue).await;
+                        return;
+                    }
+                    let Some(retry) = spawn_persistence_attempt_if_active(
+                        &queue,
+                        store.clone(),
+                        workspace_id.clone(),
+                        item.clone(),
+                    )
+                    .await
+                    else {
+                        return;
+                    };
+                    attempt = retry;
                 }
             }
         }
     }
+}
+
+async fn spawn_persistence_attempt_if_active(
+    queue: &Arc<AsyncMutex<DurableEventQueue>>,
+    store: Arc<dyn DurableEventStore>,
+    workspace_id: String,
+    item: PendingDurableEvent,
+) -> Option<tokio::task::JoinHandle<Result<(), DurableStoreError>>> {
+    let queue = queue.lock().await;
+    if queue.shutting_down {
+        return None;
+    }
+    Some(spawn_persistence_attempt(store, workspace_id, item))
+}
+
+async fn sleep_or_shutdown(shutdown: &mut watch::Receiver<bool>, delay: Duration) -> bool {
+    tokio::select! {
+        changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
+        _ = tokio::time::sleep(delay) => *shutdown.borrow(),
+    }
+}
+
+async fn mark_worker_stopped(queue: &Arc<AsyncMutex<DurableEventQueue>>) {
+    queue.lock().await.worker_running = false;
+}
+
+async fn defer_fifo_head(
+    queue: &Arc<AsyncMutex<DurableEventQueue>>,
+    expected: &PendingDurableEvent,
+) {
+    let mut queue = queue.lock().await;
+    let item = queue
+        .pending
+        .pop_front()
+        .expect("persistence worker must own the FIFO head");
+    debug_assert_eq!(item.event, expected.event);
+    queue.deferred.push_back(item);
+}
+
+async fn quarantine_fifo_head(
+    queue: &Arc<AsyncMutex<DurableEventQueue>>,
+    expected: &PendingDurableEvent,
+    code: &'static str,
+) {
+    let mut queue = queue.lock().await;
+    let item = queue
+        .pending
+        .pop_front()
+        .expect("persistence worker must own the FIFO head");
+    debug_assert_eq!(item.event, expected.event);
+    if queue.quarantined.len() >= MAX_QUARANTINED_DURABLE_EVENTS {
+        queue.quarantined.pop_front();
+    }
+    queue.quarantined.push_back(QuarantinedDurableEvent {
+        event: item.event,
+        code,
+    });
 }
 
 fn persist_durable_event(
@@ -1672,11 +1994,14 @@ fn persist_durable_event(
     workspace_id: &str,
     source_generation: u64,
     event: &Envelope,
-) -> Result<(), ()> {
+) -> Result<(), DurableStoreError> {
     let ProtocolKind::Event(kind) = &event.kind else {
-        return Err(());
+        return Err(DurableStoreError::InvalidEvent);
     };
-    let session_id = event.session_id.as_deref().ok_or(())?;
+    let session_id = event
+        .session_id
+        .as_deref()
+        .ok_or(DurableStoreError::InvalidEvent)?;
     let timeline_kind = match kind {
         EventKind::SessionState => TimelineEventKind::SessionState,
         EventKind::TranscriptUpdated
@@ -1685,9 +2010,10 @@ fn persist_durable_event(
             TimelineEventKind::TranscriptFinal
         }
         EventKind::SuggestionCompleted => TimelineEventKind::SuggestionCompleted,
-        _ => return Err(()),
+        _ => return Err(DurableStoreError::InvalidEvent),
     };
-    let timestamp_ms = i64::try_from(event.timestamp_ms).map_err(|_| ())?;
+    let timestamp_ms =
+        i64::try_from(event.timestamp_ms).map_err(|_| DurableStoreError::InvalidEvent)?;
     let request_id = matches!(kind, EventKind::SuggestionCompleted)
         .then(|| event.correlation_id.clone())
         .flatten();
@@ -1698,30 +2024,25 @@ fn persist_durable_event(
             .and_then(Value::as_str)
             .map(str::to_owned),
         EventKind::SuggestionCompleted => {
-            let request_id = request_id.as_deref().ok_or(())?;
+            let request_id = request_id
+                .as_deref()
+                .ok_or(DurableStoreError::InvalidEvent)?;
             Some(
                 store
                     .resolve_request_turn(workspace_id, session_id, request_id)?
-                    .ok_or(())?,
+                    .ok_or(DurableStoreError::DependencyMissing)?,
             )
         }
         _ => None,
     };
-    if matches!(kind, EventKind::TranscriptUpdated) {
-        store.associate_request_with_turn(&RequestTurnAssociation {
-            workspace_id: workspace_id.to_owned(),
-            session_id: session_id.to_owned(),
-            request_id: event.id.clone(),
-            turn_id: turn_id.clone().ok_or(())?,
-            created_at_ms: timestamp_ms,
-        })?;
-    }
     let durable_event = NewTimelineEvent {
         workspace_id: workspace_id.to_owned(),
         session_id: session_id.to_owned(),
         event_id: event.id.clone(),
-        source_generation: i64::try_from(source_generation).map_err(|_| ())?,
-        source_sequence: i64::try_from(event.sequence).map_err(|_| ())?,
+        source_generation: i64::try_from(source_generation)
+            .map_err(|_| DurableStoreError::InvalidEvent)?,
+        source_sequence: i64::try_from(event.sequence)
+            .map_err(|_| DurableStoreError::InvalidEvent)?,
         timestamp_ms,
         kind: timeline_kind,
         correlation_id: event.correlation_id.clone(),
@@ -1729,6 +2050,21 @@ fn persist_durable_event(
         turn_id,
         payload: Value::Object(event.payload.clone()),
     };
+    if matches!(kind, EventKind::TranscriptUpdated) {
+        let association = RequestTurnAssociation {
+            workspace_id: workspace_id.to_owned(),
+            session_id: session_id.to_owned(),
+            request_id: event.id.clone(),
+            turn_id: durable_event
+                .turn_id
+                .clone()
+                .ok_or(DurableStoreError::InvalidEvent)?,
+            created_at_ms: timestamp_ms,
+        };
+        return store
+            .append_transcript_event_with_association(&durable_event, &association)
+            .map(|_| ());
+    }
     let terminal_status = matches!(kind, EventKind::SessionState)
         .then(|| event.payload.get("state").and_then(Value::as_str))
         .flatten()
@@ -1747,7 +2083,7 @@ fn persist_durable_event(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::{HashMap, HashSet, VecDeque};
     use std::future::Future;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Condvar, Mutex};
@@ -1763,15 +2099,14 @@ mod tests {
         MAX_FRAME_BYTES, PROTOCOL_VERSION,
     };
     use crate::storage::{
-        AppendEventResult, AssociateRequestResult, NewTimelineEvent, RequestTurnAssociation,
-        SessionStatus,
+        AppendEventResult, NewTimelineEvent, RequestTurnAssociation, SessionStatus,
     };
 
     use super::{
         packaged_sidecar_path, persist_durable_event, redact_diagnostic, DurableEventStore,
-        PersistenceAwareEventSink, ProcessExit, ProcessRequest, SidecarError, SidecarEventSink,
-        SidecarLauncher, SidecarPort, SidecarState, SidecarSupervisor, StorageHealth,
-        StorageHealthReporter, StorageHealthStatus, TokioCommand, TokioSidecarPort,
+        DurableStoreError, PersistenceAwareEventSink, ProcessExit, ProcessRequest, SidecarError,
+        SidecarEventSink, SidecarLauncher, SidecarPort, SidecarState, SidecarSupervisor,
+        StorageHealth, StorageHealthReporter, StorageHealthStatus, TokioCommand, TokioSidecarPort,
         MAX_PENDING_DURABLE_EVENTS, SIDECAR_PROGRAM,
     };
 
@@ -1842,6 +2177,7 @@ mod tests {
         events: Mutex<Vec<NewTimelineEvent>>,
         terminal_transitions: Mutex<Vec<(SessionStatus, i64)>>,
         associations: Mutex<HashMap<String, String>>,
+        permanent_event_ids: Mutex<HashSet<String>>,
         fail_writes: AtomicBool,
         order: Arc<Mutex<Vec<String>>>,
         writer_threads: Mutex<Vec<std::thread::ThreadId>>,
@@ -1849,14 +2185,25 @@ mod tests {
     }
 
     impl DurableEventStore for FakeDurableEventStore {
-        fn append_event(&self, event: &NewTimelineEvent) -> Result<AppendEventResult, ()> {
+        fn append_event(
+            &self,
+            event: &NewTimelineEvent,
+        ) -> Result<AppendEventResult, DurableStoreError> {
             self.writer_threads
                 .lock()
                 .unwrap()
                 .push(std::thread::current().id());
             self.order.lock().unwrap().push("persist".into());
+            if self
+                .permanent_event_ids
+                .lock()
+                .unwrap()
+                .contains(&event.event_id)
+            {
+                return Err(DurableStoreError::EventCollision);
+            }
             if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(());
+                return Err(DurableStoreError::Transient);
             }
             self.events.lock().unwrap().push(event.clone());
             self.persisted.notify_one();
@@ -1868,7 +2215,7 @@ mod tests {
             event: &NewTimelineEvent,
             status: SessionStatus,
             completed_at_ms: i64,
-        ) -> Result<AppendEventResult, ()> {
+        ) -> Result<AppendEventResult, DurableStoreError> {
             let result = self.append_event(event)?;
             self.terminal_transitions
                 .lock()
@@ -1877,23 +2224,23 @@ mod tests {
             Ok(result)
         }
 
-        fn associate_request_with_turn(
+        fn append_transcript_event_with_association(
             &self,
+            event: &NewTimelineEvent,
             association: &RequestTurnAssociation,
-        ) -> Result<AssociateRequestResult, ()> {
+        ) -> Result<AppendEventResult, DurableStoreError> {
             self.order.lock().unwrap().push("associate".into());
             let mut associations = self.associations.lock().unwrap();
             match associations.get(&association.request_id) {
-                Some(turn_id) if turn_id == &association.turn_id => {
-                    Ok(AssociateRequestResult::Duplicate)
-                }
-                Some(_) => Err(()),
+                Some(turn_id) if turn_id == &association.turn_id => {}
+                Some(_) => return Err(DurableStoreError::EventCollision),
                 None => {
                     associations
                         .insert(association.request_id.clone(), association.turn_id.clone());
-                    Ok(AssociateRequestResult::Inserted)
                 }
             }
+            drop(associations);
+            self.append_event(event)
         }
 
         fn resolve_request_turn(
@@ -1901,7 +2248,7 @@ mod tests {
             _workspace_id: &str,
             _session_id: &str,
             request_id: &str,
-        ) -> Result<Option<String>, ()> {
+        ) -> Result<Option<String>, DurableStoreError> {
             Ok(self.associations.lock().unwrap().get(request_id).cloned())
         }
     }
@@ -1911,7 +2258,10 @@ mod tests {
     }
 
     impl DurableEventStore for SlowDurableEventStore {
-        fn append_event(&self, _event: &NewTimelineEvent) -> Result<AppendEventResult, ()> {
+        fn append_event(
+            &self,
+            _event: &NewTimelineEvent,
+        ) -> Result<AppendEventResult, DurableStoreError> {
             std::thread::sleep(self.delay);
             Ok(AppendEventResult::Inserted { host_sequence: 1 })
         }
@@ -1921,15 +2271,16 @@ mod tests {
             event: &NewTimelineEvent,
             _status: SessionStatus,
             _completed_at_ms: i64,
-        ) -> Result<AppendEventResult, ()> {
+        ) -> Result<AppendEventResult, DurableStoreError> {
             self.append_event(event)
         }
 
-        fn associate_request_with_turn(
+        fn append_transcript_event_with_association(
             &self,
+            event: &NewTimelineEvent,
             _association: &RequestTurnAssociation,
-        ) -> Result<AssociateRequestResult, ()> {
-            Ok(AssociateRequestResult::Inserted)
+        ) -> Result<AppendEventResult, DurableStoreError> {
+            self.append_event(event)
         }
 
         fn resolve_request_turn(
@@ -1937,7 +2288,7 @@ mod tests {
             _workspace_id: &str,
             _session_id: &str,
             _request_id: &str,
-        ) -> Result<Option<String>, ()> {
+        ) -> Result<Option<String>, DurableStoreError> {
             Ok(None)
         }
     }
@@ -1963,7 +2314,10 @@ mod tests {
     }
 
     impl DurableEventStore for BlockingDurableEventStore {
-        fn append_event(&self, event: &NewTimelineEvent) -> Result<AppendEventResult, ()> {
+        fn append_event(
+            &self,
+            event: &NewTimelineEvent,
+        ) -> Result<AppendEventResult, DurableStoreError> {
             self.attempts.fetch_add(1, AtomicOrdering::SeqCst);
             let active = self.active_writes.fetch_add(1, AtomicOrdering::SeqCst) + 1;
             self.max_active_writes
@@ -1987,26 +2341,26 @@ mod tests {
             event: &NewTimelineEvent,
             _status: SessionStatus,
             _completed_at_ms: i64,
-        ) -> Result<AppendEventResult, ()> {
+        ) -> Result<AppendEventResult, DurableStoreError> {
             self.append_event(event)
         }
 
-        fn associate_request_with_turn(
+        fn append_transcript_event_with_association(
             &self,
+            event: &NewTimelineEvent,
             association: &RequestTurnAssociation,
-        ) -> Result<AssociateRequestResult, ()> {
+        ) -> Result<AppendEventResult, DurableStoreError> {
             let mut associations = self.associations.lock().unwrap();
             match associations.get(&association.request_id) {
-                Some(turn_id) if turn_id == &association.turn_id => {
-                    Ok(AssociateRequestResult::Duplicate)
-                }
-                Some(_) => Err(()),
+                Some(turn_id) if turn_id == &association.turn_id => {}
+                Some(_) => return Err(DurableStoreError::EventCollision),
                 None => {
                     associations
                         .insert(association.request_id.clone(), association.turn_id.clone());
-                    Ok(AssociateRequestResult::Inserted)
                 }
             }
+            drop(associations);
+            self.append_event(event)
         }
 
         fn resolve_request_turn(
@@ -2014,7 +2368,7 @@ mod tests {
             _workspace_id: &str,
             _session_id: &str,
             request_id: &str,
-        ) -> Result<Option<String>, ()> {
+        ) -> Result<Option<String>, DurableStoreError> {
             Ok(self.associations.lock().unwrap().get(request_id).cloned())
         }
     }
@@ -2028,9 +2382,12 @@ mod tests {
     }
 
     impl DurableEventStore for FailOnceDurableEventStore {
-        fn append_event(&self, event: &NewTimelineEvent) -> Result<AppendEventResult, ()> {
+        fn append_event(
+            &self,
+            event: &NewTimelineEvent,
+        ) -> Result<AppendEventResult, DurableStoreError> {
             if self.attempts.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
-                return Err(());
+                return Err(DurableStoreError::Transient);
             }
             self.events.lock().unwrap().push(event.clone());
             self.persisted.notify_one();
@@ -2042,26 +2399,26 @@ mod tests {
             event: &NewTimelineEvent,
             _status: SessionStatus,
             _completed_at_ms: i64,
-        ) -> Result<AppendEventResult, ()> {
+        ) -> Result<AppendEventResult, DurableStoreError> {
             self.append_event(event)
         }
 
-        fn associate_request_with_turn(
+        fn append_transcript_event_with_association(
             &self,
+            event: &NewTimelineEvent,
             association: &RequestTurnAssociation,
-        ) -> Result<AssociateRequestResult, ()> {
+        ) -> Result<AppendEventResult, DurableStoreError> {
             let mut associations = self.associations.lock().unwrap();
             match associations.get(&association.request_id) {
-                Some(turn_id) if turn_id == &association.turn_id => {
-                    Ok(AssociateRequestResult::Duplicate)
-                }
-                Some(_) => Err(()),
+                Some(turn_id) if turn_id == &association.turn_id => {}
+                Some(_) => return Err(DurableStoreError::EventCollision),
                 None => {
                     associations
                         .insert(association.request_id.clone(), association.turn_id.clone());
-                    Ok(AssociateRequestResult::Inserted)
                 }
             }
+            drop(associations);
+            self.append_event(event)
         }
 
         fn resolve_request_turn(
@@ -2069,7 +2426,7 @@ mod tests {
             _workspace_id: &str,
             _session_id: &str,
             request_id: &str,
-        ) -> Result<Option<String>, ()> {
+        ) -> Result<Option<String>, DurableStoreError> {
             Ok(self.associations.lock().unwrap().get(request_id).cloned())
         }
     }
@@ -2099,6 +2456,35 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("health:{:?}", health.status).to_lowercase());
+            self.reports.lock().unwrap().push(health.clone());
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct BlockingReadyStorageHealthReporter {
+        gate: (Mutex<bool>, Condvar),
+        ready_started: tokio::sync::Notify,
+        reports: Mutex<Vec<StorageHealth>>,
+    }
+
+    impl BlockingReadyStorageHealthReporter {
+        fn release_ready(&self) {
+            let mut released = self.gate.0.lock().unwrap();
+            *released = true;
+            self.gate.1.notify_all();
+        }
+    }
+
+    impl StorageHealthReporter for BlockingReadyStorageHealthReporter {
+        fn report(&self, health: &StorageHealth) -> Result<(), SidecarError> {
+            if health.status == StorageHealthStatus::Ready {
+                self.ready_started.notify_one();
+                let mut released = self.gate.0.lock().unwrap();
+                while !*released {
+                    released = self.gate.1.wait(released).unwrap();
+                }
+            }
             self.reports.lock().unwrap().push(health.clone());
             Ok(())
         }
@@ -3231,10 +3617,19 @@ mod tests {
 
         sink.emit(&event).await.unwrap();
 
-        assert_eq!(
-            &*order.lock().unwrap(),
-            &["associate", "persist", "health:ready", "emit"]
-        );
+        let observed_order = order.lock().unwrap();
+        assert_eq!(&observed_order[..2], &["associate", "persist"]);
+        assert!(observed_order.iter().any(|entry| entry == "health:ready"));
+        let persisted_at = observed_order
+            .iter()
+            .position(|entry| entry == "persist")
+            .unwrap();
+        let emitted_at = observed_order
+            .iter()
+            .position(|entry| entry == "emit")
+            .unwrap();
+        assert!(persisted_at < emitted_at);
+        drop(observed_order);
         let stored = store.events.lock().unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(
@@ -3440,18 +3835,24 @@ mod tests {
         assert_eq!(stored.len(), 2);
         assert_eq!(stored[0].event_id, "018f0000-0000-7000-8000-000000000008");
         assert_eq!(stored[1].event_id, "018f0000-0000-7000-8000-000000000009");
+        let observed_order = order.lock().unwrap();
         assert_eq!(
-            &*order.lock().unwrap(),
-            &[
-                "persist",
-                "health:degraded",
-                "emit",
-                "emit",
-                "persist",
-                "persist",
-                "health:ready",
-            ]
+            &observed_order[..3],
+            &["persist", "health:degraded", "emit"]
         );
+        let persist_positions = observed_order
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| (entry == "persist").then_some(index))
+            .collect::<Vec<_>>();
+        let emit_positions = observed_order
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| (entry == "emit").then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(persist_positions.len(), 3);
+        assert_eq!(emit_positions.len(), 2);
+        assert!(emit_positions[1] > persist_positions[2]);
     }
 
     #[tokio::test]
@@ -3556,17 +3957,28 @@ mod tests {
         assert_eq!(stored.len(), 2);
         assert_eq!(stored[1].request_id.as_deref(), Some(TRANSCRIPT_EVENT_ID));
         assert_eq!(stored[1].turn_id.as_deref(), Some(TURN_ID));
+        let observed_order = order.lock().unwrap();
+        assert_eq!(&observed_order[..2], &["associate", "persist"]);
         assert_eq!(
-            &*order.lock().unwrap(),
-            &[
-                "associate",
-                "persist",
-                "health:ready",
-                "emit",
-                "persist",
-                "health:ready",
-                "emit",
-            ]
+            observed_order
+                .iter()
+                .filter(|entry| entry.as_str() == "persist")
+                .count(),
+            2
+        );
+        assert_eq!(
+            observed_order
+                .iter()
+                .filter(|entry| entry.as_str() == "emit")
+                .count(),
+            2
+        );
+        assert_eq!(
+            observed_order
+                .iter()
+                .filter(|entry| entry.as_str() == "health:ready")
+                .count(),
+            2
         );
     }
 
@@ -3729,7 +4141,7 @@ mod tests {
             .iter()
             .any(|report| report.code == Some("storage_backlog_full")));
         assert_eq!(
-            sink.queue.lock().await.events.len(),
+            sink.queue.lock().await.pending.len(),
             MAX_PENDING_DURABLE_EVENTS
         );
         assert_eq!(store.attempts.load(AtomicOrdering::SeqCst), 1);
@@ -3737,7 +4149,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_same_id_with_changed_envelope_is_a_live_only_collision() {
+    async fn pending_same_id_with_changed_envelope_is_rejected_before_live_delivery() {
         let store = Arc::new(BlockingDurableEventStore::default());
         let downstream = Arc::new(CollectingEventSink::default());
         let health = Arc::new(RecordingStorageHealthReporter {
@@ -3760,16 +4172,20 @@ mod tests {
             .insert("state".into(), Value::String("changed".into()));
 
         sink.emit(&original).await.unwrap();
-        sink.emit(&collision).await.unwrap();
+        let error = sink.emit(&collision).await.unwrap_err();
 
-        assert_eq!(downstream.events.lock().unwrap().len(), 2);
+        assert_eq!(error.code(), "storage_event_collision");
+        assert_eq!(
+            downstream.events.lock().unwrap().as_slice(),
+            &[original.clone()]
+        );
         assert!(health
             .reports
             .lock()
             .unwrap()
             .iter()
             .any(|report| report.code == Some("storage_event_collision")));
-        assert_eq!(sink.queue.lock().await.events.len(), 1);
+        assert_eq!(sink.queue.lock().await.pending.len(), 1);
         assert_eq!(store.attempts.load(AtomicOrdering::SeqCst), 1);
 
         store.release();
@@ -3782,6 +4198,8 @@ mod tests {
             stored[0].source_sequence,
             i64::try_from(original.sequence).unwrap()
         );
+        drop(stored);
+        sink.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -3803,7 +4221,7 @@ mod tests {
 
         sink.emit(&event).await.unwrap();
         sink.emit(&event).await.unwrap();
-        assert_eq!(sink.queue.lock().await.events.len(), 1);
+        assert_eq!(sink.queue.lock().await.pending.len(), 1);
         store.release();
         tokio::time::timeout(Duration::from_millis(250), store.persisted.notified())
             .await
@@ -3812,6 +4230,266 @@ mod tests {
         assert_eq!(downstream.events.lock().unwrap().len(), 2);
         assert_eq!(store.attempts.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(store.events.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_suggestion_dependency_is_deferred_while_transcript_and_terminal_progress() {
+        const TRANSCRIPT_ID: &str = "018f0000-0000-7000-8000-000000000401";
+        const SUGGESTION_ID: &str = "018f0000-0000-7000-8000-000000000402";
+        const TERMINAL_ID: &str = "018f0000-0000-7000-8000-000000000403";
+        const TURN_ID: &str = "018f0000-0000-7000-8000-000000000404";
+        let store = Arc::new(FakeDurableEventStore::default());
+        let sink = PersistenceAwareEventSink::with_persistence_options(
+            "workspace",
+            store.clone(),
+            Arc::new(CollectingEventSink::default()),
+            Arc::new(RecordingStorageHealthReporter {
+                order: Arc::new(Mutex::new(Vec::new())),
+                reports: Mutex::new(Vec::new()),
+            }),
+            Duration::from_millis(10),
+            Duration::from_millis(5),
+        );
+        let mut suggestion = session_event(
+            EventKind::SuggestionCompleted,
+            Map::from_iter([
+                (
+                    "suggestion_id".into(),
+                    Value::String("018f0000-0000-7000-8000-000000000405".into()),
+                ),
+                ("text".into(), Value::String("answer".into())),
+            ]),
+        );
+        suggestion.id = SUGGESTION_ID.into();
+        suggestion.correlation_id = Some(TRANSCRIPT_ID.into());
+        let mut transcript = session_event(
+            EventKind::TranscriptUpdated,
+            Map::from_iter([
+                ("turn_id".into(), Value::String(TURN_ID.into())),
+                ("text".into(), Value::String("question".into())),
+                ("is_final".into(), Value::Bool(true)),
+            ]),
+        );
+        transcript.id = TRANSCRIPT_ID.into();
+        let mut terminal = session_event(
+            EventKind::SessionState,
+            Map::from_iter([("state".into(), Value::String("stopped".into()))]),
+        );
+        terminal.id = TERMINAL_ID.into();
+
+        sink.emit(&suggestion).await.unwrap();
+        sink.emit(&transcript).await.unwrap();
+        sink.emit(&terminal).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while store.events.lock().unwrap().len() < 3 {
+                store.persisted.notified().await;
+            }
+        })
+        .await
+        .expect("the deferred suggestion must retry after its transcript association exists");
+
+        let stored = store.events.lock().unwrap();
+        assert_eq!(
+            stored
+                .iter()
+                .map(|event| event.event_id.as_str())
+                .collect::<Vec<_>>(),
+            [TRANSCRIPT_ID, SUGGESTION_ID, TERMINAL_ID]
+        );
+        assert_eq!(
+            store.terminal_transitions.lock().unwrap().as_slice(),
+            &[(SessionStatus::Completed, 4)]
+        );
+    }
+
+    #[tokio::test]
+    async fn permanent_store_error_is_quarantined_before_later_event_persists() {
+        const QUARANTINED_ID: &str = "018f0000-0000-7000-8000-000000000411";
+        const LATER_ID: &str = "018f0000-0000-7000-8000-000000000412";
+        let store = Arc::new(FakeDurableEventStore {
+            permanent_event_ids: Mutex::new(HashSet::from([QUARANTINED_ID.into()])),
+            ..Default::default()
+        });
+        let health = Arc::new(RecordingStorageHealthReporter {
+            order: Arc::new(Mutex::new(Vec::new())),
+            reports: Mutex::new(Vec::new()),
+        });
+        let sink = PersistenceAwareEventSink::with_persistence_options(
+            "workspace",
+            store.clone(),
+            Arc::new(CollectingEventSink::default()),
+            health.clone(),
+            Duration::from_millis(10),
+            Duration::from_millis(5),
+        );
+        let mut quarantined = session_event(EventKind::SessionState, Map::new());
+        quarantined.id = QUARANTINED_ID.into();
+        let mut later = session_event(EventKind::SessionState, Map::new());
+        later.id = LATER_ID.into();
+
+        sink.emit(&quarantined).await.unwrap();
+        sink.emit(&later).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while store.events.lock().unwrap().is_empty() {
+                store.persisted.notified().await;
+            }
+        })
+        .await
+        .expect("a permanent head failure must not block the next durable event");
+
+        assert_eq!(store.events.lock().unwrap()[0].event_id, LATER_ID);
+        let queue = sink.queue.lock().await;
+        assert_eq!(queue.quarantined.len(), 1);
+        assert_eq!(queue.quarantined[0].event.id, QUARANTINED_ID);
+        assert!(queue.sticky_degraded);
+        assert!(health
+            .reports
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|report| report.code == Some("storage_event_collision")));
+    }
+
+    #[tokio::test]
+    async fn normally_queued_event_waits_for_persistence_after_sticky_degradation() {
+        let store = Arc::new(BlockingDurableEventStore::default());
+        let downstream = Arc::new(CollectingEventSink::default());
+        let sink = Arc::new(PersistenceAwareEventSink::with_persistence_options(
+            "workspace",
+            store.clone(),
+            downstream.clone(),
+            Arc::new(RecordingStorageHealthReporter {
+                order: Arc::new(Mutex::new(Vec::new())),
+                reports: Mutex::new(Vec::new()),
+            }),
+            Duration::from_millis(100),
+            Duration::from_millis(5),
+        ));
+        {
+            let mut queue = sink.queue.lock().await;
+            queue.sticky_degraded = true;
+            queue.degraded_code = Some("storage_backlog_full");
+        }
+        let event = session_event(EventKind::SessionState, Map::new());
+        let emit = tokio::spawn({
+            let sink = sink.clone();
+            let event = event.clone();
+            async move { sink.emit(&event).await }
+        });
+        tokio::time::timeout(Duration::from_millis(50), store.started.notified())
+            .await
+            .expect("the durable write must start");
+        tokio::task::yield_now().await;
+
+        assert!(downstream.events.lock().unwrap().is_empty());
+        assert!(!emit.is_finished());
+
+        store.release();
+        emit.await.unwrap().unwrap();
+        assert_eq!(downstream.events.lock().unwrap().as_slice(), &[event]);
+        sink.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocked_persistence_worker_shutdown_is_bounded_and_starts_no_retry() {
+        let store = Arc::new(BlockingDurableEventStore::default());
+        let sink = Arc::new(PersistenceAwareEventSink::with_persistence_options(
+            "workspace",
+            store.clone(),
+            Arc::new(CollectingEventSink::default()),
+            Arc::new(RecordingStorageHealthReporter {
+                order: Arc::new(Mutex::new(Vec::new())),
+                reports: Mutex::new(Vec::new()),
+            }),
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+        ));
+        sink.emit(&session_event(EventKind::SessionState, Map::new()))
+            .await
+            .unwrap();
+        let supervisor = SidecarSupervisor::with_launcher_and_sink(
+            Arc::new(FakeSidecarLauncher {
+                port: Arc::new(FakeSidecarPort::default()),
+                launches: Arc::new(Mutex::new(0)),
+            }),
+            sink,
+            Duration::ZERO,
+            None,
+        );
+
+        tokio::time::timeout(Duration::from_millis(50), supervisor.shutdown())
+            .await
+            .expect("supervisor shutdown must cancel persistence retries")
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(store.attempts.load(AtomicOrdering::SeqCst), 1);
+
+        store.release();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(store.attempts.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delayed_ready_reporting_cannot_create_false_timeout_degradation() {
+        let store = Arc::new(FakeDurableEventStore::default());
+        let downstream = Arc::new(CollectingEventSink::default());
+        let health = Arc::new(BlockingReadyStorageHealthReporter::default());
+        let sink = PersistenceAwareEventSink::with_persistence_options(
+            "workspace",
+            store,
+            downstream.clone(),
+            health.clone(),
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+        );
+        let event = session_event(EventKind::SessionState, Map::new());
+
+        tokio::time::timeout(Duration::from_millis(50), sink.emit(&event))
+            .await
+            .expect("the persistence acknowledgement must precede ready reporting")
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(50), health.ready_started.notified())
+            .await
+            .expect("ready reporting must begin");
+
+        assert_eq!(downstream.events.lock().unwrap().as_slice(), &[event]);
+        assert!(!health
+            .reports
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|report| report.status == StorageHealthStatus::Degraded));
+        health.release_ready();
+        sink.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_emits_start_exactly_one_persistence_worker() {
+        let store = Arc::new(BlockingDurableEventStore::default());
+        let sink = Arc::new(PersistenceAwareEventSink::with_persistence_options(
+            "workspace",
+            store.clone(),
+            Arc::new(CollectingEventSink::default()),
+            Arc::new(RecordingStorageHealthReporter {
+                order: Arc::new(Mutex::new(Vec::new())),
+                reports: Mutex::new(Vec::new()),
+            }),
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+        ));
+        let first = session_event(EventKind::SessionState, Map::new());
+        let mut second = first.clone();
+        second.id = "018f0000-0000-7000-8000-000000000421".into();
+        second.sequence += 1;
+
+        let (first_result, second_result) = tokio::join!(sink.emit(&first), sink.emit(&second));
+        first_result.unwrap();
+        second_result.unwrap();
+        assert_eq!(store.attempts.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(sink.queue.lock().await.pending.len(), 2);
+
+        sink.shutdown().await.unwrap();
+        store.release();
     }
 
     #[tokio::test]
