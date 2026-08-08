@@ -238,6 +238,8 @@ fn classify_repository_error(error: RepositoryError) -> DurableStoreError {
         | RepositoryError::InvalidSessionLimit { .. }
         | RepositoryError::InvalidCompletionStatus
         | RepositoryError::InvalidTerminalEventKind
+        | RepositoryError::InvalidTranscriptAssociationEventKind
+        | RepositoryError::TranscriptAssociationMismatch
         | RepositoryError::BriefSerialization
         | RepositoryError::Model(_) => DurableStoreError::InvalidEvent,
         RepositoryError::CipherUnavailable
