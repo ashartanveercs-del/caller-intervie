@@ -6,13 +6,15 @@ use serde_json::{Map, Value};
 use tauri::State;
 
 use crate::protocol::{
-    is_supported_session_mode, CommandKind, Envelope, EventKind, ProtocolKind, PROTOCOL_VERSION,
+    is_supported_session_mode, validate_command, CommandKind, Envelope, EventKind, ProtocolKind,
+    PROTOCOL_VERSION,
 };
 use crate::sidecar::{SidecarError, SidecarStatus, StorageHealth};
 use crate::state::AppState;
 use crate::storage::{
-    NewSession, NewSessionBrief, RepositoryError, RequestTurnAssociation, SessionRepository,
-    SessionStatus, StoredSession, StoredTimelineEvent, TimelineEventKind,
+    NewSession, NewSessionBrief, QueryDispatchAuthorization, RepositoryError,
+    RequestTurnAssociation, SessionRepository, SessionStatus, StoredSession, StoredTimelineEvent,
+    TimelineEventKind,
 };
 
 const MAX_LANGUAGE_TAG_BYTES: usize = 63;
@@ -224,26 +226,33 @@ pub async fn send_sidecar_command(
     state: State<'_, AppState>,
     command: Envelope,
 ) -> Result<(), SidecarCommandError> {
+    let runtime_session = state.sidecar.current_runtime_session().await;
     let repository = state.repository.clone();
-    ensure_query_turn_association(
+    ensure_sidecar_command_authorized(
         &command,
         &state.workspace_id,
+        runtime_session.as_deref(),
         move |workspace_id, session_id, request_id| {
-            repository.resolve_request_turn(&workspace_id, &session_id, &request_id)
+            repository.authorize_query_dispatch(&workspace_id, &session_id, &request_id)
         },
     )
     .await?;
     state.sidecar.send(command).await
 }
 
-async fn ensure_query_turn_association<F>(
+async fn ensure_sidecar_command_authorized<F>(
     command: &Envelope,
     workspace_id: &str,
-    resolve: F,
+    runtime_session_id: Option<&str>,
+    authorize: F,
 ) -> Result<(), SidecarError>
 where
-    F: FnOnce(String, String, String) -> Result<Option<String>, RepositoryError> + Send + 'static,
+    F: FnOnce(String, String, String) -> Result<QueryDispatchAuthorization, RepositoryError>
+        + Send
+        + 'static,
 {
+    validate_command(command)
+        .map_err(|error| SidecarError::new(error.code(), "sidecar command validation failed"))?;
     if !matches!(
         command.kind,
         ProtocolKind::Command(CommandKind::QueryTrigger)
@@ -254,32 +263,53 @@ where
     let session_id = command.session_id.clone().ok_or_else(|| {
         SidecarError::new("invalid_session_id", "sidecar command validation failed")
     })?;
+    match runtime_session_id {
+        None => {
+            return Err(SidecarError::new(
+                "query_runtime_session_inactive",
+                "No active runtime session can accept this query.",
+            ))
+        }
+        Some(current) if current != session_id.as_str() => {
+            return Err(SidecarError::new(
+                "query_runtime_session_mismatch",
+                "The query does not target the active runtime session.",
+            ))
+        }
+        Some(_) => {}
+    }
     let workspace_id = workspace_id.to_owned();
     // The sidecar echoes the query command ID as suggestion correlation_id.
     let request_id = command.id.clone();
-    let resolved =
-        tauri::async_runtime::spawn_blocking(move || resolve(workspace_id, session_id, request_id))
-            .await
-            .map_err(|_| {
-                SidecarError::new(
-                    "query_association_unavailable",
-                    "The durable request association could not be verified.",
-                )
-            })?;
+    let authorization = tauri::async_runtime::spawn_blocking(move || {
+        authorize(workspace_id, session_id, request_id)
+    })
+    .await
+    .map_err(|_| {
+        SidecarError::new(
+            "query_association_unavailable",
+            "The durable query context could not be verified.",
+        )
+    })?;
 
-    match resolved {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => Err(SidecarError::new(
+    match authorization {
+        Ok(QueryDispatchAuthorization::Authorized) => Ok(()),
+        Ok(QueryDispatchAuthorization::SessionMissing)
+        | Ok(QueryDispatchAuthorization::SessionInactive) => Err(SidecarError::new(
+            "query_session_stale",
+            "The durable session is no longer active.",
+        )),
+        Ok(QueryDispatchAuthorization::AssociationMissing) => Err(SidecarError::new(
             "query_association_missing",
             "A durable request association is required before query dispatch.",
         )),
-        Err(RepositoryError::RequestTurnAssociationConflict) => Err(SidecarError::new(
-            "query_association_conflict",
-            "The durable request association conflicts with this query.",
+        Ok(QueryDispatchAuthorization::TranscriptMissing) => Err(SidecarError::new(
+            "query_turn_not_durable",
+            "The associated transcript turn is not durably available.",
         )),
         Err(_) => Err(SidecarError::new(
             "query_association_unavailable",
-            "The durable request association could not be verified.",
+            "The durable query context could not be verified.",
         )),
     }
 }
@@ -623,12 +653,12 @@ mod tests {
         validate_command, CommandKind, Envelope, ProtocolKind, PROTOCOL_VERSION,
     };
     use crate::storage::{
-        RepositoryError, SessionStatus, StoredSession, StoredSessionBrief, StoredTimelineEvent,
-        TimelineEventKind,
+        QueryDispatchAuthorization, RepositoryError, SessionStatus, StoredSession,
+        StoredSessionBrief, StoredTimelineEvent, TimelineEventKind,
     };
 
     use super::{
-        ensure_query_turn_association, timeline_envelope, validate_language_tag, validate_mode,
+        ensure_sidecar_command_authorized, timeline_envelope, validate_language_tag, validate_mode,
         validate_uuid, AssociateRequestWithTurnInput, CompletionStatusInput, CreateSessionInput,
         SaveSessionBriefInput, SessionRecordDto, StorageCommandError, MAX_BRIEF_BYTES,
     };
@@ -655,14 +685,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_dispatch_resolves_command_id_in_the_same_workspace_and_session() {
+    async fn valid_query_proves_the_request_turn_and_runtime_session_before_dispatch() {
         let caller_thread = std::thread::current().id();
         let observed = Arc::new(Mutex::new(None));
         let captured = observed.clone();
 
-        ensure_query_turn_association(
+        ensure_sidecar_command_authorized(
             &query_command(),
             WORKSPACE_ID,
+            Some(SESSION_ID),
             move |workspace_id, session_id, request_id| {
                 *captured.lock().unwrap() = Some((
                     workspace_id,
@@ -670,7 +701,7 @@ mod tests {
                     request_id,
                     std::thread::current().id(),
                 ));
-                Ok(Some(TURN_ID.into()))
+                Ok(QueryDispatchAuthorization::Authorized)
             },
         )
         .await
@@ -684,20 +715,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_dispatch_rejects_missing_and_conflicting_associations_without_ids() {
-        let missing =
-            ensure_query_turn_association(&query_command(), WORKSPACE_ID, |_, _, _| Ok(None))
-                .await
-                .unwrap_err();
-        let conflict = ensure_query_turn_association(&query_command(), WORKSPACE_ID, |_, _, _| {
-            Err(RepositoryError::RequestTurnAssociationConflict)
-        })
+    async fn malformed_query_is_rejected_before_repository_lookup() {
+        let mut command = query_command();
+        command.payload.remove("answer_format");
+
+        let error = ensure_sidecar_command_authorized(
+            &command,
+            WORKSPACE_ID,
+            Some(SESSION_ID),
+            |_, _, _| -> Result<_, RepositoryError> {
+                panic!("invalid commands must not reach durable storage")
+            },
+        )
         .await
         .unwrap_err();
 
-        assert_eq!(missing.code(), "query_association_missing");
-        assert_eq!(conflict.code(), "query_association_conflict");
-        for error in [missing, conflict] {
+        assert_eq!(error.code(), "invalid_command_payload");
+    }
+
+    #[tokio::test]
+    async fn query_requires_a_current_matching_runtime_session_before_repository_lookup() {
+        let inactive = ensure_sidecar_command_authorized(
+            &query_command(),
+            WORKSPACE_ID,
+            None,
+            |_, _, _| -> Result<_, RepositoryError> {
+                panic!("inactive runtime sessions must not reach durable storage")
+            },
+        )
+        .await
+        .unwrap_err();
+        let mismatch = ensure_sidecar_command_authorized(
+            &query_command(),
+            WORKSPACE_ID,
+            Some("018f0000-0000-7000-8000-000000000004"),
+            |_, _, _| -> Result<_, RepositoryError> {
+                panic!("cross-runtime queries must not reach durable storage")
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(inactive.code(), "query_runtime_session_inactive");
+        assert_eq!(mismatch.code(), "query_runtime_session_mismatch");
+        for error in [inactive, mismatch] {
+            let serialized = serde_json::to_string(&error).unwrap();
+            for forbidden in [WORKSPACE_ID, SESSION_ID, REQUEST_ID, TURN_ID, "SELECT"] {
+                assert!(!serialized.contains(forbidden));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn query_maps_stale_and_incomplete_durable_proofs_to_stable_redacted_errors() {
+        let cases = [
+            (
+                QueryDispatchAuthorization::SessionMissing,
+                "query_session_stale",
+            ),
+            (
+                QueryDispatchAuthorization::SessionInactive,
+                "query_session_stale",
+            ),
+            (
+                QueryDispatchAuthorization::AssociationMissing,
+                "query_association_missing",
+            ),
+            (
+                QueryDispatchAuthorization::TranscriptMissing,
+                "query_turn_not_durable",
+            ),
+        ];
+
+        for (authorization, expected_code) in cases {
+            let error = ensure_sidecar_command_authorized(
+                &query_command(),
+                WORKSPACE_ID,
+                Some(SESSION_ID),
+                move |_, _, _| Ok(authorization),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(error.code(), expected_code);
             let serialized = serde_json::to_string(&error).unwrap();
             for forbidden in [WORKSPACE_ID, SESSION_ID, REQUEST_ID, TURN_ID, "SELECT"] {
                 assert!(!serialized.contains(forbidden));
@@ -711,9 +811,10 @@ mod tests {
         command.kind = ProtocolKind::Command(CommandKind::ListeningSet);
         command.payload = Map::from_iter([("enabled".into(), Value::Bool(true))]);
 
-        ensure_query_turn_association(
+        ensure_sidecar_command_authorized(
             &command,
             WORKSPACE_ID,
+            None,
             |_, _, _| -> Result<_, RepositoryError> {
                 panic!("non-query commands must bypass association storage")
             },

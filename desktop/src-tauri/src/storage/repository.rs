@@ -44,6 +44,15 @@ pub enum RepositoryError {
     Sql(#[from] rusqlite::Error),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueryDispatchAuthorization {
+    Authorized,
+    SessionMissing,
+    SessionInactive,
+    AssociationMissing,
+    TranscriptMissing,
+}
+
 pub struct SessionRepository {
     connection: Mutex<Connection>,
 }
@@ -321,6 +330,65 @@ impl SessionRepository {
             .map_err(Into::into)
     }
 
+    pub fn authorize_query_dispatch(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+        request_id: &str,
+    ) -> Result<QueryDispatchAuthorization, RepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| RepositoryError::ConnectionUnavailable)?;
+        let proof = connection
+            .query_row(
+                "SELECT sessions.status,
+                        associations.turn_id,
+                        CASE WHEN associations.turn_id IS NULL THEN 0 ELSE EXISTS(
+                            SELECT 1
+                            FROM timeline_events AS transcripts
+                            WHERE transcripts.workspace_id = sessions.workspace_id
+                              AND transcripts.session_id = sessions.session_id
+                              AND transcripts.kind = ?4
+                              AND transcripts.turn_id = associations.turn_id
+                        ) END
+                 FROM sessions
+                 LEFT JOIN request_turn_associations AS associations
+                   ON associations.workspace_id = sessions.workspace_id
+                  AND associations.session_id = sessions.session_id
+                  AND associations.request_id = ?3
+                 WHERE sessions.workspace_id = ?1 AND sessions.session_id = ?2",
+                params![
+                    workspace_id,
+                    session_id,
+                    request_id,
+                    TimelineEventKind::TranscriptFinal.as_db()
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)? != 0,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((status, turn_id, has_transcript)) = proof else {
+            return Ok(QueryDispatchAuthorization::SessionMissing);
+        };
+        if SessionStatus::from_db(&status)? != SessionStatus::Active {
+            return Ok(QueryDispatchAuthorization::SessionInactive);
+        }
+        if turn_id.is_none() {
+            return Ok(QueryDispatchAuthorization::AssociationMissing);
+        }
+        if !has_transcript {
+            return Ok(QueryDispatchAuthorization::TranscriptMissing);
+        }
+        Ok(QueryDispatchAuthorization::Authorized)
+    }
+
     pub fn get_request_turn_associations(
         &self,
         workspace_id: &str,
@@ -557,7 +625,9 @@ fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTimelineEve
 
 #[cfg(test)]
 mod tests {
-    use super::{AssociateRequestResult, RepositoryError, SessionRepository};
+    use super::{
+        AssociateRequestResult, QueryDispatchAuthorization, RepositoryError, SessionRepository,
+    };
     use crate::storage::{
         AppendEventResult, ModelError, NewSession, NewSessionBrief, NewTimelineEvent,
         RequestTurnAssociation, SessionStatus, TimelineEventKind,
@@ -1267,6 +1337,90 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("turn-a")
+        );
+    }
+
+    #[test]
+    fn query_authorization_requires_the_mapped_final_transcript_in_the_same_owned_session() {
+        let (_temp, _path, repository) = repository();
+        repository.create_session(&session(WORKSPACE_A)).unwrap();
+        repository
+            .associate_request_with_turn(&RequestTurnAssociation {
+                workspace_id: WORKSPACE_A.into(),
+                session_id: SESSION.into(),
+                request_id: "request-a".into(),
+                turn_id: "turn-a".into(),
+                created_at_ms: 1_700_000_000_040,
+            })
+            .unwrap();
+
+        let mut other = session(WORKSPACE_A);
+        other.session_id = "session-b".into();
+        repository.create_session(&other).unwrap();
+        let mut other_transcript = event("event-other", TimelineEventKind::TranscriptFinal);
+        other_transcript.session_id = "session-b".into();
+        other_transcript.turn_id = Some("turn-a".into());
+        repository.append_event(&other_transcript).unwrap();
+
+        assert_eq!(
+            repository
+                .authorize_query_dispatch(WORKSPACE_A, SESSION, "request-a")
+                .unwrap(),
+            QueryDispatchAuthorization::TranscriptMissing
+        );
+
+        let mut wrong_turn = event("event-wrong-turn", TimelineEventKind::TranscriptFinal);
+        wrong_turn.turn_id = Some("turn-b".into());
+        repository.append_event(&wrong_turn).unwrap();
+        assert_eq!(
+            repository
+                .authorize_query_dispatch(WORKSPACE_A, SESSION, "request-a")
+                .unwrap(),
+            QueryDispatchAuthorization::TranscriptMissing
+        );
+
+        let mut transcript = event("event-a", TimelineEventKind::TranscriptFinal);
+        transcript.turn_id = Some("turn-a".into());
+        repository.append_event(&transcript).unwrap();
+        assert_eq!(
+            repository
+                .authorize_query_dispatch(WORKSPACE_A, SESSION, "request-a")
+                .unwrap(),
+            QueryDispatchAuthorization::Authorized
+        );
+    }
+
+    #[test]
+    fn query_authorization_rejects_missing_cross_workspace_and_inactive_sessions() {
+        let (_temp, _path, repository) = repository();
+        repository.create_session(&session(WORKSPACE_A)).unwrap();
+
+        assert_eq!(
+            repository
+                .authorize_query_dispatch(WORKSPACE_A, SESSION, "request-a")
+                .unwrap(),
+            QueryDispatchAuthorization::AssociationMissing
+        );
+        assert_eq!(
+            repository
+                .authorize_query_dispatch(WORKSPACE_B, SESSION, "request-a")
+                .unwrap(),
+            QueryDispatchAuthorization::SessionMissing
+        );
+
+        repository
+            .complete_session(
+                WORKSPACE_A,
+                SESSION,
+                SessionStatus::Completed,
+                1_700_000_000_050,
+            )
+            .unwrap();
+        assert_eq!(
+            repository
+                .authorize_query_dispatch(WORKSPACE_A, SESSION, "request-a")
+                .unwrap(),
+            QueryDispatchAuthorization::SessionInactive
         );
     }
 
