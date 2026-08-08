@@ -151,7 +151,11 @@ class RuntimeProtocolAdapter:
             await self._emit_snapshot(correlation_id)
             return
         if kind is CommandKind.SESSION_STOP:
-            await self._runtime.stop_session()
+            try:
+                await self._runtime.stop_session()
+            except Exception:
+                await self._emit_snapshot(correlation_id)
+                raise
             await self._emit_snapshot(correlation_id)
             return
         if kind is CommandKind.LISTENING_SET:

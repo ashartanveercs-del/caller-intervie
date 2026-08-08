@@ -7,7 +7,7 @@ import functools
 from io import BytesIO
 import json
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from uuid import UUID
 
@@ -120,8 +120,11 @@ class FakeRuntimeService:
         self.started_with = config
 
     async def stop_session(self) -> None:
-        self._raise_if_needed()
+        if self.error is not None:
+            self._snapshot = replace(self._snapshot, state="error", listening=False)
+            raise self.error
         self.stopped = True
+        self._snapshot = replace(self._snapshot, state="stopped", listening=False)
 
     def set_listening(self, enabled: bool) -> None:
         self._raise_if_needed()
@@ -226,6 +229,36 @@ async def test_handshake_stop_snapshot_and_knowledge_commands_emit_protocol_stat
     assert output.events[2].kind == EventKind.SESSION_STATE
     assert runtime.stopped is True
     assert output.events[3].kind == EventKind.SESSION_STATE
+    assert output.events[3].payload["state"] == "stopped"
+    assert output.events[3].correlation_id == COMMAND_ID
+
+
+@_async_test
+async def test_stop_failure_emits_error_state_before_sanitized_runtime_error() -> None:
+    runtime = FakeRuntimeService()
+    runtime.error = RuntimeError("secret shutdown detail")
+    output = CollectingOutput()
+    adapter = RuntimeProtocolAdapter(runtime, output.write)
+    failure = command(CommandKind.SESSION_STOP, {})
+
+    await adapter.handle(failure)
+
+    assert [event.kind for event in output.events] == [
+        EventKind.SESSION_STATE,
+        EventKind.RUNTIME_ERROR,
+    ]
+    state, error = output.events
+    assert state.session_id == SESSION_ID
+    assert state.correlation_id == failure.id
+    assert state.payload["state"] == "error"
+    assert state.payload["listening"] is False
+    assert error.correlation_id == failure.id
+    assert error.payload == {
+        "code": "runtime_error",
+        "message": "Runtime command failed",
+        "recoverable": True,
+        "source": "runtime",
+    }
 
 
 @_async_test
@@ -311,12 +344,14 @@ async def test_invalid_command_and_runtime_exception_emit_sanitized_errors() -> 
         "source": "adapter",
     }
     assert output.events[0].correlation_id == invalid.id
-    assert output.events[1].kind == EventKind.RUNTIME_ERROR
-    assert output.events[1].payload["code"] == "runtime_error"
-    assert output.events[1].payload["recoverable"] is True
-    assert output.events[1].payload["source"] == "runtime"
-    assert "secret prompt" not in output.events[1].payload["message"]
-    assert output.events[1].correlation_id == failure.id
+    assert output.events[1].kind == EventKind.SESSION_STATE
+    assert output.events[1].payload["state"] == "error"
+    assert output.events[2].kind == EventKind.RUNTIME_ERROR
+    assert output.events[2].payload["code"] == "runtime_error"
+    assert output.events[2].payload["recoverable"] is True
+    assert output.events[2].payload["source"] == "runtime"
+    assert "secret prompt" not in output.events[2].payload["message"]
+    assert output.events[2].correlation_id == failure.id
 
 
 @_async_test

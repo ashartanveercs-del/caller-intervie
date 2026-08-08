@@ -196,6 +196,45 @@ describe("session store", () => {
   });
 
   it.each([
+    ["stopped", "completed"],
+    ["error", "interrupted"],
+  ] as const)("maps live runtime state %s to persisted status %s and cancels restore", (runtimeState, status) => {
+    const store = createSessionStore();
+    activate(store);
+    store.getState().restoreSession(store.getState().session!);
+    expect(store.getState().isRestoringSession).toBe(true);
+
+    store.getState().applyEnvelope(event(EventKind.SESSION_STATE, {
+      state: runtimeState,
+      input_language: "en",
+      response_language: "ur",
+      review_language: "en",
+    }));
+
+    expect(store.getState().session?.status).toBe(status);
+    expect(store.getState().isRestoringSession).toBe(false);
+  });
+
+  it.each(["listening", "paused"])(
+    "keeps persisted status active and restore open for nonterminal runtime state %s",
+    (runtimeState) => {
+      const store = createSessionStore();
+      activate(store);
+      store.getState().restoreSession(store.getState().session!);
+
+      store.getState().applyEnvelope(event(EventKind.SESSION_STATE, {
+        state: runtimeState,
+        input_language: "en",
+        response_language: "ur",
+        review_language: "en",
+      }));
+
+      expect(store.getState().session?.status).toBe("active");
+      expect(store.getState().isRestoringSession).toBe(true);
+    },
+  );
+
+  it.each([
     { status: "ready", recoverable: false },
     {
       status: "degraded",

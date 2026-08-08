@@ -587,7 +587,14 @@ function healthStatus(value: string | undefined): RuntimeHealthStatus {
 }
 
 function sessionStatus(value: string | undefined): SessionStatus | undefined {
-  return value === "active" || value === "completed" || value === "interrupted" ? value : undefined;
+  switch (value) {
+    case "active":
+    case "completed":
+    case "interrupted": return value;
+    case "stopped": return "completed";
+    case "error": return "interrupted";
+    default: return undefined;
+  }
 }
 
 function sidecarHealth(state: SidecarStatus["state"]): RuntimeHealthStatus {
