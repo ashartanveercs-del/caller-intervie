@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -19,6 +19,7 @@ use crate::storage::{
 
 const MAX_LANGUAGE_TAG_BYTES: usize = 63;
 const MAX_BRIEF_BYTES: usize = 256 * 1024;
+const REPOSITORY_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub type SidecarCommandError = SidecarError;
 
@@ -68,6 +69,13 @@ impl StorageCommandError {
         Self {
             code: "storage_task_failed",
             message: "Encrypted session storage could not complete the request.",
+        }
+    }
+
+    fn timed_out() -> Self {
+        Self {
+            code: "storage_timeout",
+            message: "Encrypted session storage timed out.",
         }
     }
 }
@@ -207,6 +215,23 @@ pub struct RequestTurnAssociationDto {
     turn_id: String,
 }
 
+enum DurableAuthorizationRequest {
+    Query {
+        workspace_id: String,
+        session_id: String,
+        request_id: String,
+    },
+    SessionStart {
+        workspace_id: String,
+        session_id: String,
+    },
+}
+
+enum DurableAuthorization {
+    Query(QueryDispatchAuthorization),
+    SessionStart(Option<SessionStatus>),
+}
+
 #[tauri::command]
 pub async fn sidecar_status(
     state: State<'_, AppState>,
@@ -226,78 +251,122 @@ pub async fn send_sidecar_command(
     state: State<'_, AppState>,
     command: Envelope,
 ) -> Result<(), SidecarCommandError> {
-    let _session_operation = state.session_operation_gate.lock().await;
     let repository = state.repository.clone();
     let authorization_command = command.clone();
     let workspace_id = state.workspace_id.clone();
-    let authorization = ensure_sidecar_command_authorized(
-        &authorization_command,
-        &workspace_id,
-        move |workspace_id, session_id, request_id| {
-            repository.authorize_query_dispatch(&workspace_id, &session_id, &request_id)
-        },
-    );
+    let authorization =
+        ensure_sidecar_command_authorized(authorization_command, workspace_id, move |request| {
+            match request {
+                DurableAuthorizationRequest::Query {
+                    workspace_id,
+                    session_id,
+                    request_id,
+                } => repository
+                    .authorize_query_dispatch(&workspace_id, &session_id, &request_id)
+                    .map(DurableAuthorization::Query),
+                DurableAuthorizationRequest::SessionStart {
+                    workspace_id,
+                    session_id,
+                } => repository
+                    .get_session(&workspace_id, &session_id)
+                    .map(|session| {
+                        DurableAuthorization::SessionStart(session.map(|session| session.status))
+                    }),
+            }
+        });
     state
         .sidecar
-        .send_with_authorization(command, authorization)
+        .send_with_authorization_and_gate(
+            command,
+            state.session_operation_gate.clone(),
+            authorization,
+        )
         .await
 }
 
 async fn ensure_sidecar_command_authorized<F>(
-    command: &Envelope,
-    workspace_id: &str,
+    command: Envelope,
+    workspace_id: String,
     authorize: F,
 ) -> Result<(), SidecarError>
 where
-    F: FnOnce(String, String, String) -> Result<QueryDispatchAuthorization, RepositoryError>
+    F: FnOnce(DurableAuthorizationRequest) -> Result<DurableAuthorization, RepositoryError>
         + Send
         + 'static,
 {
-    validate_command(command)
+    validate_command(&command)
         .map_err(|error| SidecarError::new(error.code(), "sidecar command validation failed"))?;
-    if !matches!(
-        command.kind,
-        ProtocolKind::Command(CommandKind::QueryTrigger)
-    ) {
-        return Ok(());
-    }
-
-    let session_id = command.session_id.clone().ok_or_else(|| {
-        SidecarError::new("invalid_session_id", "sidecar command validation failed")
-    })?;
-    let workspace_id = workspace_id.to_owned();
-    // The sidecar echoes the query command ID as suggestion correlation_id.
-    let request_id = command.id.clone();
-    let authorization = tauri::async_runtime::spawn_blocking(move || {
-        authorize(workspace_id, session_id, request_id)
-    })
-    .await
-    .map_err(|_| {
-        SidecarError::new(
-            "query_association_unavailable",
-            "The durable query context could not be verified.",
-        )
-    })?;
+    let (request, query_authorization) = match &command.kind {
+        ProtocolKind::Command(CommandKind::QueryTrigger) => (
+            DurableAuthorizationRequest::Query {
+                workspace_id,
+                session_id: command.session_id.clone().ok_or_else(|| {
+                    SidecarError::new("invalid_session_id", "sidecar command validation failed")
+                })?,
+                // The sidecar echoes the query command ID as suggestion correlation_id.
+                request_id: command.id.clone(),
+            },
+            true,
+        ),
+        ProtocolKind::Command(CommandKind::SessionStart) => (
+            DurableAuthorizationRequest::SessionStart {
+                workspace_id,
+                session_id: command.session_id.clone().ok_or_else(|| {
+                    SidecarError::new("invalid_session_id", "sidecar command validation failed")
+                })?,
+            },
+            false,
+        ),
+        _ => return Ok(()),
+    };
+    let unavailable = || {
+        if query_authorization {
+            SidecarError::new(
+                "query_association_unavailable",
+                "The durable query context could not be verified.",
+            )
+        } else {
+            SidecarError::new(
+                "session_start_authorization_unavailable",
+                "The durable session could not be verified.",
+            )
+        }
+    };
+    let authorization = tauri::async_runtime::spawn_blocking(move || authorize(request))
+        .await
+        .map_err(|_| unavailable())?
+        .map_err(|_| unavailable())?;
 
     match authorization {
-        Ok(QueryDispatchAuthorization::Authorized) => Ok(()),
-        Ok(QueryDispatchAuthorization::SessionMissing)
-        | Ok(QueryDispatchAuthorization::SessionInactive) => Err(SidecarError::new(
-            "query_session_stale",
-            "The durable session is no longer active.",
+        DurableAuthorization::Query(QueryDispatchAuthorization::Authorized) => Ok(()),
+        DurableAuthorization::Query(QueryDispatchAuthorization::SessionMissing)
+        | DurableAuthorization::Query(QueryDispatchAuthorization::SessionInactive) => {
+            Err(SidecarError::new(
+                "query_session_stale",
+                "The durable session is no longer active.",
+            ))
+        }
+        DurableAuthorization::Query(QueryDispatchAuthorization::AssociationMissing) => {
+            Err(SidecarError::new(
+                "query_association_missing",
+                "A durable request association is required before query dispatch.",
+            ))
+        }
+        DurableAuthorization::Query(QueryDispatchAuthorization::TranscriptMissing) => {
+            Err(SidecarError::new(
+                "query_turn_not_durable",
+                "The associated transcript turn is not durably available.",
+            ))
+        }
+        DurableAuthorization::SessionStart(Some(SessionStatus::Active)) => Ok(()),
+        DurableAuthorization::SessionStart(None)
+        | DurableAuthorization::SessionStart(Some(
+            SessionStatus::Completed | SessionStatus::Interrupted,
+        )) => Err(SidecarError::new(
+            "session_start_not_active",
+            "The durable session is missing or no longer active.",
         )),
-        Ok(QueryDispatchAuthorization::AssociationMissing) => Err(SidecarError::new(
-            "query_association_missing",
-            "A durable request association is required before query dispatch.",
-        )),
-        Ok(QueryDispatchAuthorization::TranscriptMissing) => Err(SidecarError::new(
-            "query_turn_not_durable",
-            "The associated transcript turn is not durably available.",
-        )),
-        Err(_) => Err(SidecarError::new(
-            "query_association_unavailable",
-            "The durable query context could not be verified.",
-        )),
+        _ => Err(unavailable()),
     }
 }
 
@@ -540,8 +609,22 @@ where
     T: Send + 'static,
     F: FnOnce(&SessionRepository) -> Result<T, RepositoryError> + Send + 'static,
 {
-    tauri::async_runtime::spawn_blocking(move || operation(&repository))
+    run_repository_with_timeout(repository, operation, REPOSITORY_COMMAND_TIMEOUT).await
+}
+
+async fn run_repository_with_timeout<T, F>(
+    repository: Arc<SessionRepository>,
+    operation: F,
+    timeout: Duration,
+) -> Result<T, StorageCommandError>
+where
+    T: Send + 'static,
+    F: FnOnce(&SessionRepository) -> Result<T, RepositoryError> + Send + 'static,
+{
+    let task = tauri::async_runtime::spawn_blocking(move || operation(&repository));
+    tokio::time::timeout(timeout, task)
         .await
+        .map_err(|_| StorageCommandError::timed_out())?
         .map_err(|_| StorageCommandError::task_failed())?
         .map_err(StorageCommandError::from_repository)
 }
@@ -635,21 +718,25 @@ fn validate_language_tag(value: &str, allow_auto: bool) -> Result<(), StorageCom
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use serde_json::{json, Map, Value};
+    use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
     use crate::protocol::{
         validate_command, CommandKind, Envelope, ProtocolKind, PROTOCOL_VERSION,
     };
     use crate::storage::{
-        QueryDispatchAuthorization, RepositoryError, SessionStatus, StoredSession,
-        StoredSessionBrief, StoredTimelineEvent, TimelineEventKind,
+        QueryDispatchAuthorization, RepositoryError, SessionRepository, SessionStatus,
+        StoredSession, StoredSessionBrief, StoredTimelineEvent, TimelineEventKind,
     };
 
     use super::{
-        ensure_sidecar_command_authorized, timeline_envelope, validate_language_tag, validate_mode,
-        validate_uuid, AssociateRequestWithTurnInput, CompletionStatusInput, CreateSessionInput,
-        SaveSessionBriefInput, SessionRecordDto, StorageCommandError, MAX_BRIEF_BYTES,
+        ensure_sidecar_command_authorized, run_repository_with_timeout, timeline_envelope,
+        validate_language_tag, validate_mode, validate_uuid, AssociateRequestWithTurnInput,
+        CompletionStatusInput, CreateSessionInput, DurableAuthorization,
+        DurableAuthorizationRequest, SaveSessionBriefInput, SessionRecordDto, StorageCommandError,
+        MAX_BRIEF_BYTES,
     };
 
     const WORKSPACE_ID: &str = "018f0000-0000-7000-8000-000000000099";
@@ -679,19 +766,25 @@ mod tests {
         let observed = Arc::new(Mutex::new(None));
         let captured = observed.clone();
 
-        ensure_sidecar_command_authorized(
-            &query_command(),
-            WORKSPACE_ID,
-            move |workspace_id, session_id, request_id| {
-                *captured.lock().unwrap() = Some((
-                    workspace_id,
-                    session_id,
-                    request_id,
-                    std::thread::current().id(),
-                ));
-                Ok(QueryDispatchAuthorization::Authorized)
-            },
-        )
+        ensure_sidecar_command_authorized(query_command(), WORKSPACE_ID.into(), move |request| {
+            let DurableAuthorizationRequest::Query {
+                workspace_id,
+                session_id,
+                request_id,
+            } = request
+            else {
+                panic!("query command produced the wrong authorization request")
+            };
+            *captured.lock().unwrap() = Some((
+                workspace_id,
+                session_id,
+                request_id,
+                std::thread::current().id(),
+            ));
+            Ok(DurableAuthorization::Query(
+                QueryDispatchAuthorization::Authorized,
+            ))
+        })
         .await
         .unwrap();
 
@@ -708,9 +801,9 @@ mod tests {
         command.payload.remove("answer_format");
 
         let error = ensure_sidecar_command_authorized(
-            &command,
-            WORKSPACE_ID,
-            |_, _, _| -> Result<_, RepositoryError> {
+            command,
+            WORKSPACE_ID.into(),
+            |_| -> Result<_, RepositoryError> {
                 panic!("invalid commands must not reach durable storage")
             },
         )
@@ -743,9 +836,9 @@ mod tests {
 
         for (authorization, expected_code) in cases {
             let error = ensure_sidecar_command_authorized(
-                &query_command(),
-                WORKSPACE_ID,
-                move |_, _, _| Ok(authorization),
+                query_command(),
+                WORKSPACE_ID.into(),
+                move |_| Ok(DurableAuthorization::Query(authorization)),
             )
             .await
             .unwrap_err();
@@ -758,6 +851,26 @@ mod tests {
         }
     }
 
+    fn session_start_command() -> Envelope {
+        Envelope {
+            version: PROTOCOL_VERSION,
+            id: "018f0000-0000-7000-8000-000000000020".into(),
+            session_id: Some(SESSION_ID.into()),
+            sequence: 1,
+            timestamp_ms: 1,
+            kind: ProtocolKind::Command(CommandKind::SessionStart),
+            payload: Map::from_iter([
+                ("mode".into(), json!("interview")),
+                ("input_language".into(), json!("auto")),
+                ("response_language".into(), json!("en")),
+                ("review_language".into(), json!("en")),
+                ("you_source".into(), json!("mic")),
+                ("brief_id".into(), json!(TURN_ID)),
+            ]),
+            correlation_id: None,
+        }
+    }
+
     #[tokio::test]
     async fn non_query_dispatch_does_not_consult_request_turn_storage() {
         let mut command = query_command();
@@ -765,14 +878,99 @@ mod tests {
         command.payload = Map::from_iter([("enabled".into(), Value::Bool(true))]);
 
         ensure_sidecar_command_authorized(
-            &command,
-            WORKSPACE_ID,
-            |_, _, _| -> Result<_, RepositoryError> {
+            command,
+            WORKSPACE_ID.into(),
+            |_| -> Result<_, RepositoryError> {
                 panic!("non-query commands must bypass association storage")
             },
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_start_requires_an_active_session_in_the_same_workspace() {
+        let observed = Arc::new(Mutex::new(None));
+        let captured = observed.clone();
+
+        ensure_sidecar_command_authorized(
+            session_start_command(),
+            WORKSPACE_ID.into(),
+            move |request| {
+                let DurableAuthorizationRequest::SessionStart {
+                    workspace_id,
+                    session_id,
+                } = request
+                else {
+                    panic!("session.start produced the wrong authorization request")
+                };
+                *captured.lock().unwrap() = Some((workspace_id, session_id));
+                Ok(DurableAuthorization::SessionStart(Some(
+                    SessionStatus::Active,
+                )))
+            },
+        )
+        .await
+        .unwrap();
+
+        let observed = observed.lock().unwrap().take().unwrap();
+        assert_eq!(observed.0, WORKSPACE_ID);
+        assert_eq!(observed.1, SESSION_ID);
+    }
+
+    #[tokio::test]
+    async fn session_start_rejects_missing_completed_and_deleted_sessions_with_redacted_error() {
+        for status in [
+            None,
+            Some(SessionStatus::Completed),
+            Some(SessionStatus::Interrupted),
+        ] {
+            let error = ensure_sidecar_command_authorized(
+                session_start_command(),
+                WORKSPACE_ID.into(),
+                move |_| Ok(DurableAuthorization::SessionStart(status)),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(error.code(), "session_start_not_active");
+            let serialized = serde_json::to_string(&error).unwrap();
+            for forbidden in [WORKSPACE_ID, SESSION_ID, REQUEST_ID, TURN_ID, "SELECT"] {
+                assert!(!serialized.contains(forbidden));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn repository_timeout_releases_the_session_operation_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository =
+            Arc::new(SessionRepository::open(temp.path().join("timeout.db"), &[0x41; 32]).unwrap());
+        let gate = Arc::new(AsyncMutex::new(()));
+        let (started_sender, started_receiver) = oneshot::channel();
+        let operation = tokio::spawn({
+            let gate = gate.clone();
+            async move {
+                let _session_operation = gate.lock_owned().await;
+                run_repository_with_timeout(
+                    repository,
+                    move |_| {
+                        let _ = started_sender.send(());
+                        std::thread::sleep(Duration::from_millis(100));
+                        Ok(())
+                    },
+                    Duration::from_millis(5),
+                )
+                .await
+            }
+        });
+        started_receiver.await.unwrap();
+
+        let error = operation.await.unwrap().unwrap_err();
+        assert_eq!(error.code, "storage_timeout");
+        let _released = tokio::time::timeout(Duration::from_millis(25), gate.lock())
+            .await
+            .expect("storage timeout must release the session operation gate");
     }
 
     #[test]

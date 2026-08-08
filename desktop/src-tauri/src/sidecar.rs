@@ -36,6 +36,7 @@ const STORAGE_RETRY_DELAY: Duration = Duration::from_millis(250);
 const EVENT_SINK_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const PERSISTENCE_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn packaged_sidecar_path(host_executable: &std::path::Path) -> std::path::PathBuf {
     let mut path = host_executable
@@ -499,11 +500,17 @@ struct SupervisorInner {
     data: AsyncMutex<SupervisorData>,
     lifecycle: AsyncMutex<()>,
     commands: AsyncMutex<()>,
-    delivery: AsyncMutex<()>,
+    delivery: AsyncMutex<DeliveryState>,
     launcher: Option<Arc<dyn SidecarLauncher>>,
     sink: Arc<dyn SidecarEventSink>,
     restart_delay: Duration,
     handshake_timeout: Option<Duration>,
+    authorization_timeout: Duration,
+}
+
+#[derive(Default)]
+struct DeliveryState {
+    tail: Option<oneshot::Receiver<()>>,
 }
 
 #[derive(Clone)]
@@ -529,11 +536,12 @@ impl SidecarSupervisor {
                 }),
                 lifecycle: AsyncMutex::new(()),
                 commands: AsyncMutex::new(()),
-                delivery: AsyncMutex::new(()),
+                delivery: AsyncMutex::new(DeliveryState::default()),
                 launcher: None,
                 sink: Arc::new(NoopEventSink),
                 restart_delay: Duration::ZERO,
                 handshake_timeout: None,
+                authorization_timeout: AUTHORIZATION_TIMEOUT,
             }),
         }
     }
@@ -548,16 +556,33 @@ impl SidecarSupervisor {
         restart_delay: Duration,
         handshake_timeout: Option<Duration>,
     ) -> Self {
+        Self::with_launcher_and_sink_and_authorization_timeout(
+            launcher,
+            sink,
+            restart_delay,
+            handshake_timeout,
+            AUTHORIZATION_TIMEOUT,
+        )
+    }
+
+    fn with_launcher_and_sink_and_authorization_timeout(
+        launcher: Arc<dyn SidecarLauncher>,
+        sink: Arc<dyn SidecarEventSink>,
+        restart_delay: Duration,
+        handshake_timeout: Option<Duration>,
+        authorization_timeout: Duration,
+    ) -> Self {
         Self {
             inner: Arc::new(SupervisorInner {
                 data: AsyncMutex::new(SupervisorData::default()),
                 lifecycle: AsyncMutex::new(()),
                 commands: AsyncMutex::new(()),
-                delivery: AsyncMutex::new(()),
+                delivery: AsyncMutex::new(DeliveryState::default()),
                 launcher: Some(launcher),
                 sink,
                 restart_delay,
                 handshake_timeout,
+                authorization_timeout,
             }),
         }
     }
@@ -603,8 +628,63 @@ impl SidecarSupervisor {
         authorization: A,
     ) -> Result<(), SidecarError>
     where
+        A: Future<Output = Result<(), SidecarError>> + Send + 'static,
+    {
+        self.spawn_owned_dispatch(command, None, authorization)
+            .await
+    }
+
+    pub async fn send_with_authorization_and_gate<A>(
+        &self,
+        command: Envelope,
+        session_operation_gate: Arc<AsyncMutex<()>>,
+        authorization: A,
+    ) -> Result<(), SidecarError>
+    where
+        A: Future<Output = Result<(), SidecarError>> + Send + 'static,
+    {
+        self.spawn_owned_dispatch(command, Some(session_operation_gate), authorization)
+            .await
+    }
+
+    async fn spawn_owned_dispatch<A>(
+        &self,
+        command: Envelope,
+        session_operation_gate: Option<Arc<AsyncMutex<()>>>,
+        authorization: A,
+    ) -> Result<(), SidecarError>
+    where
+        A: Future<Output = Result<(), SidecarError>> + Send + 'static,
+    {
+        let supervisor = self.clone();
+        let (result_sender, result_receiver) = oneshot::channel();
+        tauri::async_runtime::spawn(async move {
+            let result = supervisor
+                .dispatch_owned(command, session_operation_gate, authorization)
+                .await;
+            let _ = result_sender.send(result);
+        });
+        result_receiver.await.map_err(|_| {
+            SidecarError::new(
+                "sidecar_dispatch_failed",
+                "The sidecar command dispatch task failed.",
+            )
+        })?
+    }
+
+    async fn dispatch_owned<A>(
+        &self,
+        command: Envelope,
+        session_operation_gate: Option<Arc<AsyncMutex<()>>>,
+        authorization: A,
+    ) -> Result<(), SidecarError>
+    where
         A: Future<Output = Result<(), SidecarError>> + Send,
     {
+        let _session_operation = match session_operation_gate {
+            Some(gate) => Some(gate.lock_owned().await),
+            None => None,
+        };
         validate_command(&command).map_err(|error| {
             SidecarError::new(error.code(), "sidecar command validation failed")
         })?;
@@ -613,9 +693,7 @@ impl SidecarSupervisor {
         let command_id = command.id.clone();
         let command_kind = command.kind.clone();
         let command_session_id = command.session_id.clone();
-        let _commands = self.inner.commands.lock().await;
-        let _delivery = self.inner.delivery.lock().await;
-        let (port, generation) = {
+        let initial_generation = {
             let data = self.inner.data.lock().await;
             if !matches!(data.state, SidecarState::Ready) {
                 return Err(SidecarError::new(
@@ -627,14 +705,22 @@ impl SidecarSupervisor {
                 SidecarError::new("sidecar_unavailable", "sidecar port is unavailable")
             })?;
             validate_runtime_command(active, &command_kind, command_session_id.as_deref())?;
-            (active.port.clone(), active.generation)
+            active.generation
         };
 
-        authorization.await?;
+        tokio::time::timeout(self.inner.authorization_timeout, authorization)
+            .await
+            .map_err(|_| {
+                SidecarError::new(
+                    "sidecar_authorization_timeout",
+                    "Sidecar command authorization timed out.",
+                )
+            })??;
 
-        {
+        let _commands = self.inner.commands.lock().await;
+        let (port, generation) = {
             let data = self.inner.data.lock().await;
-            if !matches!(data.state, SidecarState::Ready) || data.generation != generation {
+            if !matches!(data.state, SidecarState::Ready) || data.generation != initial_generation {
                 return Err(SidecarError::new(
                     "sidecar_runtime_changed",
                     "The sidecar runtime changed before command dispatch.",
@@ -646,14 +732,15 @@ impl SidecarSupervisor {
                     "The sidecar runtime changed before command dispatch.",
                 )
             })?;
-            if active.generation != generation {
+            if active.generation != initial_generation {
                 return Err(SidecarError::new(
                     "sidecar_runtime_changed",
                     "The sidecar runtime changed before command dispatch.",
                 ));
             }
             validate_runtime_command(active, &command_kind, command_session_id.as_deref())?;
-        }
+            (active.port.clone(), active.generation)
+        };
 
         match port.write(bytes).await {
             Ok(()) => {
@@ -700,57 +787,106 @@ impl SidecarSupervisor {
     }
 
     pub async fn accept_stdout(&self, generation: u64, chunk: &[u8]) -> Result<(), SidecarError> {
-        let _commands = self.inner.commands.lock().await;
-        let _delivery = self.inner.delivery.lock().await;
-        let envelopes = {
-            let mut data = self.inner.data.lock().await;
-            if data.generation != generation {
-                return Ok(());
-            }
-            let Some(active) = data.active.as_mut() else {
-                return Ok(());
-            };
-            if active.generation != generation {
-                return Ok(());
-            }
-            let envelopes = active
-                .decoder
-                .push(chunk)
-                .map_err(|error| SidecarError::new(error.code(), error.to_string()))?;
-            envelopes
-        };
-        let mut first_error = None;
-        for event in envelopes {
-            let accepted = match {
+        let (delivery_result, mut first_error) = {
+            let _commands = self.inner.commands.lock().await;
+            let mut delivery = self.inner.delivery.lock().await;
+            let envelopes = {
                 let mut data = self.inner.data.lock().await;
-                self.accept_event_locked(&mut data, generation, event)
-            } {
-                Ok(accepted) => accepted,
-                Err(error) => {
-                    first_error.get_or_insert(error);
-                    continue;
+                if data.generation != generation {
+                    return Ok(());
                 }
+                let Some(active) = data.active.as_mut() else {
+                    return Ok(());
+                };
+                if active.generation != generation {
+                    return Ok(());
+                }
+                active
+                    .decoder
+                    .push(chunk)
+                    .map_err(|error| SidecarError::new(error.code(), error.to_string()))?
             };
-            if let Some(event) = accepted {
-                if let Err(error) = self.inner.sink.emit(&event).await {
-                    first_error.get_or_insert(error);
+            let mut first_error = None;
+            let mut accepted_events = Vec::new();
+            for event in envelopes {
+                let accepted = match {
+                    let mut data = self.inner.data.lock().await;
+                    self.accept_event_locked(&mut data, generation, event)
+                } {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                        continue;
+                    }
+                };
+                if let Some(event) = accepted {
+                    accepted_events.push(event);
                 }
+            }
+            let delivery_result = (!accepted_events.is_empty())
+                .then(|| self.queue_delivery_locked(&mut delivery, accepted_events));
+            (delivery_result, first_error)
+        };
+        if let Some(delivery_result) = delivery_result {
+            let result = delivery_result.await.unwrap_or_else(|_| {
+                Err(SidecarError::new(
+                    "sidecar_delivery_failed",
+                    "Sidecar event delivery task failed.",
+                ))
+            });
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
             }
         }
         first_error.map_or(Ok(()), Err)
     }
 
     pub async fn accept_event(&self, generation: u64, event: Envelope) -> Result<(), SidecarError> {
-        let _commands = self.inner.commands.lock().await;
-        let _delivery = self.inner.delivery.lock().await;
-        let accepted = {
-            let mut data = self.inner.data.lock().await;
-            self.accept_event_locked(&mut data, generation, event)?
+        let delivery_result = {
+            let _commands = self.inner.commands.lock().await;
+            let mut delivery = self.inner.delivery.lock().await;
+            let accepted = {
+                let mut data = self.inner.data.lock().await;
+                self.accept_event_locked(&mut data, generation, event)?
+            };
+            accepted.map(|event| self.queue_delivery_locked(&mut delivery, vec![event]))
         };
-        if let Some(event) = accepted {
-            self.inner.sink.emit(&event).await?;
+        if let Some(delivery_result) = delivery_result {
+            return delivery_result.await.map_err(|_| {
+                SidecarError::new(
+                    "sidecar_delivery_failed",
+                    "Sidecar event delivery task failed.",
+                )
+            })?;
         }
         Ok(())
+    }
+
+    fn queue_delivery_locked(
+        &self,
+        delivery: &mut DeliveryState,
+        events: Vec<Envelope>,
+    ) -> oneshot::Receiver<Result<(), SidecarError>> {
+        let previous = delivery.tail.take();
+        let (completion_sender, completion_receiver) = oneshot::channel();
+        let (result_sender, result_receiver) = oneshot::channel();
+        delivery.tail = Some(completion_receiver);
+        let sink = self.inner.sink.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            let mut first_error = None;
+            for event in events {
+                if let Err(error) = sink.emit(&event).await {
+                    first_error.get_or_insert(error);
+                }
+            }
+            let result = first_error.map_or(Ok(()), Err);
+            let _ = result_sender.send(result);
+            let _ = completion_sender.send(());
+        });
+        result_receiver
     }
 
     fn accept_event_locked(
@@ -2505,6 +2641,59 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct BlockingCommandPort {
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+        fail_writes: Arc<AtomicBool>,
+    }
+
+    impl BlockingCommandPort {
+        fn new(fail_writes: bool) -> Self {
+            Self {
+                writes: Arc::new(Mutex::new(Vec::new())),
+                started: Arc::new(Notify::new()),
+                release: Arc::new(Notify::new()),
+                fail_writes: Arc::new(AtomicBool::new(fail_writes)),
+            }
+        }
+
+        fn set_fail_writes(&self, fail: bool) {
+            self.fail_writes
+                .store(fail, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl SidecarPort for BlockingCommandPort {
+        async fn write(&self, bytes: Vec<u8>) -> Result<(), SidecarError> {
+            let mut decoder = FrameDecoder::new(MAX_FRAME_BYTES);
+            let command = decoder.push(&bytes).unwrap().pop().unwrap();
+            self.writes.lock().unwrap().push(bytes);
+            if matches!(
+                command.kind,
+                ProtocolKind::Command(CommandKind::HandshakeRequest)
+            ) {
+                return Ok(());
+            }
+            self.started.notify_waiters();
+            self.release.notified().await;
+            if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(SidecarError::new(
+                    "sidecar_write_failed",
+                    "sidecar command write failed",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn kill(&self) -> Result<(), SidecarError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
     struct FakeSidecarLauncher {
         port: Arc<dyn SidecarPort>,
         launches: Arc<Mutex<usize>>,
@@ -2542,6 +2731,29 @@ mod tests {
                 ));
             }
             self.events.lock().unwrap().push(event.clone());
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct BlockingEventSink {
+        block_next: AtomicBool,
+        started: Notify,
+        release: Notify,
+        event_ids: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl SidecarEventSink for BlockingEventSink {
+        async fn emit(&self, event: &Envelope) -> Result<(), SidecarError> {
+            if self
+                .block_next
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.started.notify_waiters();
+                self.release.notified().await;
+            }
+            self.event_ids.lock().unwrap().push(event.id.clone());
             Ok(())
         }
     }
@@ -3724,7 +3936,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_delivery_waits_for_query_authorization_and_port_write() {
+    async fn terminal_delivery_wins_while_query_authorization_is_pending() {
         let port = FakeSidecarPort::default();
         let supervisor = SidecarSupervisor::with_port(Arc::new(port.clone()));
         supervisor
@@ -3759,7 +3971,7 @@ mod tests {
         });
         entered.await;
 
-        let mut terminal = tokio::spawn({
+        let terminal = tokio::spawn({
             let supervisor = supervisor.clone();
             async move {
                 supervisor
@@ -3767,21 +3979,21 @@ mod tests {
                     .await
             }
         });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut terminal)
-                .await
-                .is_err()
-        );
+        tokio::time::timeout(Duration::from_millis(50), terminal)
+            .await
+            .expect("terminal event must not wait for durable authorization")
+            .unwrap()
+            .unwrap();
+        assert_eq!(supervisor.current_runtime_session().await, None);
 
         authorization_release.notify_waiters();
-        send.await.unwrap().unwrap();
-        terminal.await.unwrap().unwrap();
-        assert_eq!(port.writes.lock().unwrap().len(), 2);
-        assert_eq!(supervisor.current_runtime_session().await, None);
+        let error = send.await.unwrap().unwrap_err();
+        assert_eq!(error.code(), "query_runtime_session_inactive");
+        assert_eq!(port.writes.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
-    async fn restart_waits_for_query_authorization_and_port_write() {
+    async fn restart_wins_while_query_authorization_is_pending() {
         let first_port = Arc::new(FakeSidecarPort::default());
         let second_port = Arc::new(FakeSidecarPort::default());
         let supervisor = SidecarSupervisor::with_launcher(
@@ -3826,22 +4038,311 @@ mod tests {
         });
         entered.await;
 
+        let restart = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.restart().await }
+        });
+        tokio::time::timeout(Duration::from_millis(50), restart)
+            .await
+            .expect("restart must not wait for durable authorization")
+            .unwrap()
+            .unwrap();
+
+        authorization_release.notify_waiters();
+        let error = send.await.unwrap().unwrap_err();
+        assert_eq!(error.code(), "sidecar_runtime_changed");
+        assert_eq!(first_port.writes.lock().unwrap().len(), 2);
+        assert_eq!(second_port.writes.lock().unwrap().len(), 1);
+        assert_eq!(supervisor.current_runtime_session().await, None);
+    }
+
+    #[tokio::test]
+    async fn restart_waits_once_an_authorized_port_write_has_begun() {
+        let first_port = Arc::new(BlockingCommandPort::new(false));
+        let second_port = Arc::new(FakeSidecarPort::default());
+        let supervisor = SidecarSupervisor::with_launcher(
+            Arc::new(SequencedSidecarLauncher {
+                ports: Arc::new(Mutex::new(VecDeque::from([
+                    first_port.clone() as Arc<dyn SidecarPort>,
+                    second_port.clone() as Arc<dyn SidecarPort>,
+                ]))),
+            }),
+            Duration::ZERO,
+        );
+        supervisor.start().await.unwrap();
+        let handshake_id = {
+            let writes = first_port.writes.lock().unwrap();
+            let mut decoder = FrameDecoder::new(MAX_FRAME_BYTES);
+            decoder
+                .push(writes.last().unwrap())
+                .unwrap()
+                .pop()
+                .unwrap()
+                .id
+        };
+        supervisor
+            .accept_event(1, ready_for(Some(&handshake_id)))
+            .await
+            .unwrap();
+
+        let write_started = first_port.started.notified();
+        let send = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.send(session_start_command(SESSION_ID)).await }
+        });
+        write_started.await;
         let mut restart = tokio::spawn({
             let supervisor = supervisor.clone();
             async move { supervisor.restart().await }
         });
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut restart)
+            tokio::time::timeout(Duration::from_millis(25), &mut restart)
                 .await
                 .is_err()
         );
 
-        authorization_release.notify_waiters();
+        first_port.release.notify_waiters();
         send.await.unwrap().unwrap();
         restart.await.unwrap().unwrap();
-        assert_eq!(first_port.writes.lock().unwrap().len(), 3);
+        assert_eq!(first_port.writes.lock().unwrap().len(), 2);
         assert_eq!(second_port.writes.lock().unwrap().len(), 1);
-        assert_eq!(supervisor.current_runtime_session().await, None);
+    }
+
+    #[tokio::test]
+    async fn authorization_timeout_does_not_block_restart_and_releases_the_session_gate() {
+        let first_port = Arc::new(FakeSidecarPort::default());
+        let second_port = Arc::new(FakeSidecarPort::default());
+        let supervisor = SidecarSupervisor::with_launcher_and_sink_and_authorization_timeout(
+            Arc::new(SequencedSidecarLauncher {
+                ports: Arc::new(Mutex::new(VecDeque::from([
+                    first_port.clone() as Arc<dyn SidecarPort>,
+                    second_port.clone() as Arc<dyn SidecarPort>,
+                ]))),
+            }),
+            Arc::new(CollectingEventSink::default()),
+            Duration::ZERO,
+            None,
+            Duration::from_millis(100),
+        );
+        supervisor.start().await.unwrap();
+        supervisor
+            .accept_event(1, ready_for(Some(&last_handshake_id(&first_port))))
+            .await
+            .unwrap();
+        supervisor
+            .send(session_start_command(SESSION_ID))
+            .await
+            .unwrap();
+        supervisor
+            .accept_event(1, runtime_session_event(SESSION_ID, "listening"))
+            .await
+            .unwrap();
+
+        let gate = Arc::new(AsyncMutex::new(()));
+        let authorization_entered = Arc::new(Notify::new());
+        let entered = authorization_entered.notified();
+        let send = tokio::spawn({
+            let supervisor = supervisor.clone();
+            let gate = gate.clone();
+            let authorization_entered = authorization_entered.clone();
+            async move {
+                supervisor
+                    .send_with_authorization_and_gate(query_command(SESSION_ID), gate, async move {
+                        authorization_entered.notify_waiters();
+                        std::future::pending::<()>().await;
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        entered.await;
+
+        tokio::time::timeout(Duration::from_millis(50), supervisor.restart())
+            .await
+            .expect("restart must remain available while authorization is pending")
+            .unwrap();
+        let error = send.await.unwrap().unwrap_err();
+        assert_eq!(error.code(), "sidecar_authorization_timeout");
+        let _released = tokio::time::timeout(Duration::from_millis(50), gate.lock())
+            .await
+            .expect("authorization timeout must release the session operation gate");
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_after_write_enqueue_preserves_start_tracking_and_gate() {
+        let port = BlockingCommandPort::new(false);
+        let supervisor = SidecarSupervisor::with_port(Arc::new(port.clone()));
+        supervisor
+            .accept_event(0, fixture_envelope())
+            .await
+            .unwrap();
+        let gate = Arc::new(AsyncMutex::new(()));
+        let write_started = port.started.notified();
+        let caller = tokio::spawn({
+            let supervisor = supervisor.clone();
+            let gate = gate.clone();
+            async move {
+                supervisor
+                    .send_with_authorization_and_gate(
+                        session_start_command(SESSION_ID),
+                        gate,
+                        async { Ok(()) },
+                    )
+                    .await
+            }
+        });
+        write_started.await;
+
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        let mut acknowledgement = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move {
+                supervisor
+                    .accept_event(0, runtime_session_event(SESSION_ID, "listening"))
+                    .await
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut acknowledgement)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), gate.clone().lock_owned())
+                .await
+                .is_err()
+        );
+
+        port.release.notify_waiters();
+        acknowledgement.await.unwrap().unwrap();
+        assert_eq!(
+            supervisor.current_runtime_session().await.as_deref(),
+            Some(SESSION_ID)
+        );
+        let _released = tokio::time::timeout(Duration::from_millis(50), gate.lock())
+            .await
+            .expect("owned dispatch must release the gate after tracking the write");
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_after_failed_write_rolls_back_start_tracking() {
+        let port = BlockingCommandPort::new(true);
+        let supervisor = SidecarSupervisor::with_port(Arc::new(port.clone()));
+        supervisor
+            .accept_event(0, fixture_envelope())
+            .await
+            .unwrap();
+        let gate = Arc::new(AsyncMutex::new(()));
+        let write_started = port.started.notified();
+        let caller = tokio::spawn({
+            let supervisor = supervisor.clone();
+            let gate = gate.clone();
+            async move {
+                supervisor
+                    .send_with_authorization_and_gate(
+                        session_start_command(SESSION_ID),
+                        gate,
+                        async { Ok(()) },
+                    )
+                    .await
+            }
+        });
+        write_started.await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), gate.clone().lock_owned())
+                .await
+                .is_err()
+        );
+
+        port.release.notify_waiters();
+        let released = tokio::time::timeout(Duration::from_millis(50), gate.lock())
+            .await
+            .expect("failed owned dispatch must release the gate");
+        drop(released);
+
+        port.set_fail_writes(false);
+        let retry_started = port.started.notified();
+        let retry = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.send(session_start_command(SESSION_ID)).await }
+        });
+        retry_started.await;
+        port.release.notify_waiters();
+        retry.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn sink_io_runs_outside_supervisor_locks_and_keeps_event_order() {
+        let first_port = Arc::new(FakeSidecarPort::default());
+        let second_port = Arc::new(FakeSidecarPort::default());
+        let sink = Arc::new(BlockingEventSink::default());
+        let supervisor = SidecarSupervisor::with_launcher_and_sink(
+            Arc::new(SequencedSidecarLauncher {
+                ports: Arc::new(Mutex::new(VecDeque::from([
+                    first_port.clone() as Arc<dyn SidecarPort>,
+                    second_port.clone() as Arc<dyn SidecarPort>,
+                ]))),
+            }),
+            sink.clone(),
+            Duration::ZERO,
+            None,
+        );
+        supervisor.start().await.unwrap();
+        supervisor
+            .accept_event(1, ready_for(Some(&last_handshake_id(&first_port))))
+            .await
+            .unwrap();
+        supervisor
+            .send(session_start_command(SESSION_ID))
+            .await
+            .unwrap();
+        supervisor
+            .accept_event(1, runtime_session_event(SESSION_ID, "listening"))
+            .await
+            .unwrap();
+        sink.event_ids.lock().unwrap().clear();
+        sink.block_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let first_event = audio_health_event("018f0000-0000-7000-8000-000000000041", 5);
+        let first_id = first_event.id.clone();
+        let sink_started = sink.started.notified();
+        let first_delivery = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.accept_event(1, first_event).await }
+        });
+        sink_started.await;
+
+        let terminal_event = runtime_session_event(SESSION_ID, "stopped");
+        let terminal_id = terminal_event.id.clone();
+        let second_delivery = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.accept_event(1, terminal_event).await }
+        });
+        tokio::time::timeout(Duration::from_millis(50), async {
+            while supervisor.current_runtime_session().await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal acceptance must not wait for earlier sink I/O");
+
+        tokio::time::timeout(Duration::from_millis(50), supervisor.restart())
+            .await
+            .expect("restart must not wait for sink persistence or downstream I/O")
+            .unwrap();
+        assert!(sink.event_ids.lock().unwrap().is_empty());
+
+        sink.release.notify_waiters();
+        first_delivery.await.unwrap().unwrap();
+        second_delivery.await.unwrap().unwrap();
+        assert_eq!(
+            sink.event_ids.lock().unwrap().as_slice(),
+            &[first_id, terminal_id]
+        );
     }
 
     #[tokio::test]
