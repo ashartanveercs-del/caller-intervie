@@ -30,6 +30,10 @@ pub enum RepositoryError {
     InvalidCompletionStatus,
     #[error("only session state events can atomically complete a session")]
     InvalidTerminalEventKind,
+    #[error("only final transcript events can be atomically associated with a turn")]
+    InvalidTranscriptAssociationEventKind,
+    #[error("transcript event and request-turn association do not describe the same turn")]
+    TranscriptAssociationMismatch,
     #[error("session brief could not be encoded as JSON")]
     BriefSerialization,
     #[error("request id is already associated with a different turn")]
@@ -164,6 +168,40 @@ impl SessionRepository {
         Ok(result)
     }
 
+    /// Persists a final transcript and its event-to-turn association as one commit.
+    pub fn append_transcript_event_with_association(
+        &self,
+        event: &NewTimelineEvent,
+        association: &RequestTurnAssociation,
+    ) -> Result<AppendEventResult, RepositoryError> {
+        event.validate()?;
+        if !event.kind.is_durable() {
+            return Err(RepositoryError::NonDurableEvent(event.kind.clone()));
+        }
+        if event.kind != TimelineEventKind::TranscriptFinal {
+            return Err(RepositoryError::InvalidTranscriptAssociationEventKind);
+        }
+        association.validate()?;
+        if association.workspace_id != event.workspace_id
+            || association.session_id != event.session_id
+            || association.request_id != event.event_id
+            || event.turn_id.as_deref() != Some(association.turn_id.as_str())
+        {
+            return Err(RepositoryError::TranscriptAssociationMismatch);
+        }
+
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| RepositoryError::ConnectionUnavailable)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_session(&transaction, &event.workspace_id, &event.session_id)?;
+        associate_request_with_turn_in_transaction(&transaction, association)?;
+        let result = append_event_in_transaction(&transaction, event)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
     pub fn complete_session(
         &self,
         workspace_id: &str,
@@ -289,25 +327,9 @@ impl SessionRepository {
             &association.workspace_id,
             &association.session_id,
         )?;
-        let existing_turn_id: Option<String> = transaction
-            .query_row(
-                "SELECT turn_id FROM request_turn_associations WHERE workspace_id = ?1 AND session_id = ?2 AND request_id = ?3",
-                params![association.workspace_id, association.session_id, association.request_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(existing_turn_id) = existing_turn_id {
-            if existing_turn_id == association.turn_id {
-                return Ok(AssociateRequestResult::Duplicate);
-            }
-            return Err(RepositoryError::RequestTurnAssociationConflict);
-        }
-        transaction.execute(
-            "INSERT INTO request_turn_associations (workspace_id, session_id, request_id, turn_id, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![association.workspace_id, association.session_id, association.request_id, association.turn_id, association.created_at_ms],
-        )?;
+        let result = associate_request_with_turn_in_transaction(&transaction, association)?;
         transaction.commit()?;
-        Ok(AssociateRequestResult::Inserted)
+        Ok(result)
     }
 
     pub fn resolve_request_turn(
@@ -469,6 +491,30 @@ fn append_event_in_transaction(
     let host_sequence: i64 = transaction.query_row("SELECT COALESCE(MAX(host_sequence), 0) + 1 FROM timeline_events WHERE workspace_id = ?1 AND session_id = ?2", params![event.workspace_id, event.session_id], |row| row.get(0))?;
     transaction.execute("INSERT INTO timeline_events (event_id, workspace_id, session_id, host_sequence, source_generation, source_sequence, timestamp_ms, kind, correlation_id, request_id, turn_id, payload_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)", params![event.event_id, event.workspace_id, event.session_id, host_sequence, event.source_generation, event.source_sequence, event.timestamp_ms, event.kind.as_db(), event.correlation_id, event.request_id, event.turn_id, payload_json])?;
     Ok(AppendEventResult::Inserted { host_sequence })
+}
+
+fn associate_request_with_turn_in_transaction(
+    transaction: &Transaction<'_>,
+    association: &RequestTurnAssociation,
+) -> Result<AssociateRequestResult, RepositoryError> {
+    let existing_turn_id: Option<String> = transaction
+        .query_row(
+            "SELECT turn_id FROM request_turn_associations WHERE workspace_id = ?1 AND session_id = ?2 AND request_id = ?3",
+            params![association.workspace_id, association.session_id, association.request_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(existing_turn_id) = existing_turn_id {
+        if existing_turn_id == association.turn_id {
+            return Ok(AssociateRequestResult::Duplicate);
+        }
+        return Err(RepositoryError::RequestTurnAssociationConflict);
+    }
+    transaction.execute(
+        "INSERT INTO request_turn_associations (workspace_id, session_id, request_id, turn_id, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![association.workspace_id, association.session_id, association.request_id, association.turn_id, association.created_at_ms],
+    )?;
+    Ok(AssociateRequestResult::Inserted)
 }
 
 fn transition_session_in_transaction(
@@ -703,6 +749,23 @@ mod tests {
             payload: json!({"text": "CONFIDENTIAL_MARKER_47"}),
         }
     }
+
+    fn transcript_with_association(
+        event_id: &str,
+        turn_id: &str,
+    ) -> (NewTimelineEvent, RequestTurnAssociation) {
+        let mut transcript = event(event_id, TimelineEventKind::TranscriptFinal);
+        transcript.turn_id = Some(turn_id.into());
+        let association = RequestTurnAssociation {
+            workspace_id: transcript.workspace_id.clone(),
+            session_id: transcript.session_id.clone(),
+            request_id: transcript.event_id.clone(),
+            turn_id: turn_id.into(),
+            created_at_ms: transcript.timestamp_ms,
+        };
+        (transcript, association)
+    }
+
     #[test]
     fn sqlcipher_is_active_and_wrong_key_cannot_open_database() {
         let (_temp, path, repository) = repository();
@@ -1296,6 +1359,261 @@ mod tests {
             repository.list_sessions(WORKSPACE_A, 101),
             Err(RepositoryError::InvalidSessionLimit { limit: 101 })
         ));
+    }
+
+    #[test]
+    fn transcript_event_and_association_commit_and_retry_as_one_unit() {
+        let (_temp, path, repository) = repository();
+        repository.create_session(&session(WORKSPACE_A)).unwrap();
+        let (transcript, association) = transcript_with_association("event-atomic", "turn-a");
+
+        assert_eq!(
+            repository
+                .append_transcript_event_with_association(&transcript, &association)
+                .unwrap(),
+            AppendEventResult::Inserted { host_sequence: 1 }
+        );
+        assert_eq!(
+            repository
+                .append_transcript_event_with_association(&transcript, &association)
+                .unwrap(),
+            AppendEventResult::Duplicate { host_sequence: 1 }
+        );
+        drop(repository);
+
+        let reopened = SessionRepository::open(&path, &key(0x41)).unwrap();
+        let timeline = reopened.get_timeline(WORKSPACE_A, SESSION).unwrap();
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].event_id, transcript.event_id);
+        assert_eq!(
+            reopened
+                .get_request_turn_associations(WORKSPACE_A, SESSION)
+                .unwrap(),
+            vec![association]
+        );
+    }
+
+    #[test]
+    fn transcript_association_rejects_non_transcript_and_transient_events() {
+        let (_temp, _path, repository) = repository();
+        repository.create_session(&session(WORKSPACE_A)).unwrap();
+        let (_, association) = transcript_with_association("event-atomic", "turn-a");
+        let note = event("event-atomic", TimelineEventKind::Note);
+
+        assert!(matches!(
+            repository.append_transcript_event_with_association(&note, &association),
+            Err(RepositoryError::InvalidTranscriptAssociationEventKind)
+        ));
+
+        let chunk = event("event-atomic", TimelineEventKind::SuggestionChunk);
+        assert!(matches!(
+            repository.append_transcript_event_with_association(&chunk, &association),
+            Err(RepositoryError::NonDurableEvent(
+                TimelineEventKind::SuggestionChunk
+            ))
+        ));
+        assert!(repository
+            .get_timeline(WORKSPACE_A, SESSION)
+            .unwrap()
+            .is_empty());
+        assert!(repository
+            .get_request_turn_associations(WORKSPACE_A, SESSION)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn transcript_association_rejects_mismatched_ownership_request_and_turn() {
+        let (_temp, _path, repository) = repository();
+        repository.create_session(&session(WORKSPACE_A)).unwrap();
+        let (transcript, association) = transcript_with_association("event-atomic", "turn-a");
+
+        let mismatches = [
+            RequestTurnAssociation {
+                workspace_id: WORKSPACE_B.into(),
+                ..association.clone()
+            },
+            RequestTurnAssociation {
+                session_id: "session-b".into(),
+                ..association.clone()
+            },
+            RequestTurnAssociation {
+                request_id: "event-other".into(),
+                ..association.clone()
+            },
+            RequestTurnAssociation {
+                turn_id: "turn-b".into(),
+                ..association.clone()
+            },
+        ];
+
+        for mismatch in mismatches {
+            assert!(matches!(
+                repository.append_transcript_event_with_association(&transcript, &mismatch),
+                Err(RepositoryError::TranscriptAssociationMismatch)
+            ));
+        }
+        assert!(repository
+            .get_timeline(WORKSPACE_A, SESSION)
+            .unwrap()
+            .is_empty());
+        assert!(repository
+            .get_request_turn_associations(WORKSPACE_A, SESSION)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn transcript_association_applies_existing_model_validation_before_writing() {
+        let (_temp, _path, repository) = repository();
+        repository.create_session(&session(WORKSPACE_A)).unwrap();
+        let (transcript, association) = transcript_with_association("event-atomic", "turn-a");
+
+        let mut missing_event_id = transcript.clone();
+        missing_event_id.event_id.clear();
+        assert!(matches!(
+            repository.append_transcript_event_with_association(&missing_event_id, &association),
+            Err(RepositoryError::Model(ModelError::MissingEventId))
+        ));
+
+        let mut missing_turn = transcript.clone();
+        missing_turn.turn_id = None;
+        assert!(matches!(
+            repository.append_transcript_event_with_association(&missing_turn, &association),
+            Err(RepositoryError::Model(ModelError::MissingTurnId))
+        ));
+
+        let mut missing_request_id = association.clone();
+        missing_request_id.request_id.clear();
+        assert!(matches!(
+            repository.append_transcript_event_with_association(&transcript, &missing_request_id),
+            Err(RepositoryError::Model(ModelError::MissingRequestId))
+        ));
+        assert!(repository
+            .get_timeline(WORKSPACE_A, SESSION)
+            .unwrap()
+            .is_empty());
+        assert!(repository
+            .get_request_turn_associations(WORKSPACE_A, SESSION)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn missing_session_leaves_no_transcript_or_association_after_reopen() {
+        let (_temp, path, repository) = repository();
+        let (transcript, association) = transcript_with_association("event-atomic", "turn-a");
+
+        assert!(matches!(
+            repository.append_transcript_event_with_association(&transcript, &association),
+            Err(RepositoryError::NotFound)
+        ));
+        drop(repository);
+
+        let reopened = SessionRepository::open(&path, &key(0x41)).unwrap();
+        assert!(reopened
+            .get_timeline(WORKSPACE_A, SESSION)
+            .unwrap()
+            .is_empty());
+        assert!(reopened
+            .get_request_turn_associations(WORKSPACE_A, SESSION)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn association_conflict_rolls_back_the_transcript_append() {
+        let (_temp, _path, repository) = repository();
+        repository.create_session(&session(WORKSPACE_A)).unwrap();
+        let (transcript, association) = transcript_with_association("event-atomic", "turn-a");
+        repository
+            .associate_request_with_turn(&RequestTurnAssociation {
+                turn_id: "turn-b".into(),
+                ..association.clone()
+            })
+            .unwrap();
+
+        assert!(matches!(
+            repository.append_transcript_event_with_association(&transcript, &association),
+            Err(RepositoryError::RequestTurnAssociationConflict)
+        ));
+        assert!(repository
+            .get_timeline(WORKSPACE_A, SESSION)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            repository
+                .resolve_request_turn(WORKSPACE_A, SESSION, "event-atomic")
+                .unwrap()
+                .as_deref(),
+            Some("turn-b")
+        );
+    }
+
+    #[test]
+    fn event_collision_rolls_back_the_proposed_association_after_reopen() {
+        let (_temp, path, repository) = repository();
+        repository.create_session(&session(WORKSPACE_A)).unwrap();
+        let (original, association) = transcript_with_association("event-atomic", "turn-a");
+        repository.append_event(&original).unwrap();
+        let mut collision = original.clone();
+        collision.payload = json!({"text": "changed"});
+
+        assert!(matches!(
+            repository.append_transcript_event_with_association(&collision, &association),
+            Err(RepositoryError::EventContentCollision { .. })
+        ));
+        drop(repository);
+
+        let reopened = SessionRepository::open(&path, &key(0x41)).unwrap();
+        assert!(reopened
+            .resolve_request_turn(WORKSPACE_A, SESSION, "event-atomic")
+            .unwrap()
+            .is_none());
+        let timeline = reopened.get_timeline(WORKSPACE_A, SESSION).unwrap();
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].payload, original.payload);
+    }
+
+    #[test]
+    fn injected_event_append_failure_rolls_back_association_after_reopen() {
+        let (_temp, path, repository) = repository();
+        repository.create_session(&session(WORKSPACE_A)).unwrap();
+        repository
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_atomic_transcript
+                 BEFORE INSERT ON timeline_events
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced transcript append failure');
+                 END;",
+            )
+            .unwrap();
+        let (transcript, association) = transcript_with_association("event-atomic", "turn-a");
+
+        assert!(matches!(
+            repository.append_transcript_event_with_association(&transcript, &association),
+            Err(RepositoryError::Sql(_))
+        ));
+        repository
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_atomic_transcript;")
+            .unwrap();
+        drop(repository);
+
+        let reopened = SessionRepository::open(&path, &key(0x41)).unwrap();
+        assert!(reopened
+            .get_timeline(WORKSPACE_A, SESSION)
+            .unwrap()
+            .is_empty());
+        assert!(reopened
+            .get_request_turn_associations(WORKSPACE_A, SESSION)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
