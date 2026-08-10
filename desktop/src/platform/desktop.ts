@@ -33,8 +33,8 @@ type StorageHealthDto = {
 
 type CaptureProtectionStatusDto = {
   state: CaptureProtectionState;
-  code?: string;
-  message?: string;
+  code: string | null;
+  message: string | null;
 };
 
 type RequestTurnAssociationDto = {

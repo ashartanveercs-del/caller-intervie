@@ -50,7 +50,7 @@ describe("desktop platform", () => {
     expect(invoke).toHaveBeenNthCalledWith(3, "restart_sidecar");
   });
 
-  it("maps capture protection DTOs and invokes the exact capture commands", async () => {
+  it("maps nullable capture protection DTOs and invokes the exact capture commands", async () => {
     invoke
       .mockResolvedValueOnce({
         state: "unavailable",
@@ -58,7 +58,12 @@ describe("desktop platform", () => {
         message: "Screen capture protection could not be confirmed.",
         internal_diagnostics: "must-not-leak",
       })
-      .mockResolvedValueOnce({ state: "protected", internal_diagnostics: "must-not-leak" });
+      .mockResolvedValueOnce({
+        state: "protected",
+        code: null,
+        message: null,
+        internal_diagnostics: "must-not-leak",
+      });
     const platform = createDesktopPlatform();
 
     expect(await platform.captureProtectionStatus()).toEqual({
