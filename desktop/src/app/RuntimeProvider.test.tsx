@@ -29,10 +29,12 @@ function fakePlatform(): PlatformApi & {
   return {
     sidecarStatus: vi.fn().mockResolvedValue(status()),
     storageHealth: vi.fn().mockResolvedValue({ status: "ready", recoverable: false }),
+    captureProtectionStatus: vi.fn().mockResolvedValue({ state: "protected" }),
     send: vi.fn().mockResolvedValue(undefined),
     associateRequestWithTurn: vi.fn().mockResolvedValue(undefined),
     getRequestTurnAssociations: vi.fn().mockResolvedValue([]),
     restartSidecar: vi.fn().mockResolvedValue(status()),
+    retryCaptureProtection: vi.fn().mockResolvedValue({ state: "protected" }),
     subscribe: vi.fn().mockImplementation(async (next) => {
       listener = next;
       return unlisten;
