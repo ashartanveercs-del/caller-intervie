@@ -4,6 +4,20 @@ use serde::Serialize;
 
 use crate::sidecar::SidecarError;
 
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(not(any(windows, target_os = "macos")))]
+mod unsupported;
+#[cfg(windows)]
+mod windows;
+
+#[cfg(target_os = "macos")]
+pub(crate) use macos::platform_target;
+#[cfg(not(any(windows, target_os = "macos")))]
+pub(crate) use unsupported::platform_target;
+#[cfg(windows)]
+pub(crate) use windows::platform_target;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureProtectionState {
@@ -163,6 +177,36 @@ mod tests {
     use std::thread;
 
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_requires_exact_exclude_from_capture_affinity() {
+        assert!(crate::capture_protection::windows::is_excluded_affinity(17));
+        for affinity in [0, 1, 16, 18, u32::MAX] {
+            assert!(!crate::capture_protection::windows::is_excluded_affinity(
+                affinity
+            ));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_requires_exact_none_sharing_type() {
+        use objc2_app_kit::NSWindowSharingType;
+
+        assert!(crate::capture_protection::macos::is_excluded_sharing_type(
+            NSWindowSharingType::None
+        ));
+        assert!(!crate::capture_protection::macos::is_excluded_sharing_type(
+            NSWindowSharingType::ReadOnly
+        ));
+        assert!(!crate::capture_protection::macos::is_excluded_sharing_type(
+            NSWindowSharingType(2)
+        ));
+        assert!(!crate::capture_protection::macos::is_excluded_sharing_type(
+            NSWindowSharingType(usize::MAX)
+        ));
+    }
 
     struct FakeTarget {
         outcomes: Mutex<VecDeque<Result<(), CaptureProtectionFailure>>>,

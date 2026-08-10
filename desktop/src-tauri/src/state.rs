@@ -4,6 +4,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Manager};
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::capture_protection::CaptureProtectionController;
 use crate::sidecar::{
     PersistenceAwareEventSink, SidecarSupervisor, StorageHealth, StorageHealthTracker,
     TauriEventSink, TauriSidecarLauncher, TauriStorageHealthReporter, PRODUCTION_HANDSHAKE_TIMEOUT,
@@ -29,11 +30,15 @@ pub struct AppState {
     pub repository: Arc<SessionRepository>,
     pub storage_health: StorageHealthTracker,
     pub sidecar: SidecarSupervisor,
+    pub capture_protection: Arc<CaptureProtectionController>,
     pub session_operation_gate: Arc<AsyncMutex<()>>,
 }
 
 impl AppState {
-    pub fn new(app: AppHandle) -> Result<Self, AppStateError> {
+    pub fn new(
+        app: AppHandle,
+        capture_protection: Arc<CaptureProtectionController>,
+    ) -> Result<Self, AppStateError> {
         let app_data = app
             .path()
             .app_data_dir()
@@ -75,6 +80,7 @@ impl AppState {
             repository,
             storage_health,
             sidecar,
+            capture_protection,
             session_operation_gate: Arc::new(AsyncMutex::new(())),
         })
     }

@@ -146,7 +146,28 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
-            let state = state::AppState::new(app.handle().clone())?;
+            let main_window = app
+                .get_webview_window("main")
+                .expect("main window must exist before application setup completes");
+            let capture_protection = Arc::new(
+                capture_protection::CaptureProtectionController::with_target(
+                    capture_protection::platform_target(main_window.clone()),
+                ),
+            );
+            capture_protection.reapply_and_verify();
+            main_window.on_window_event({
+                let capture_protection = capture_protection.clone();
+                move |event| {
+                    if matches!(event, tauri::WindowEvent::Focused(true)) {
+                        let capture_protection = capture_protection.clone();
+                        tauri::async_runtime::spawn(async move {
+                            capture_protection.reapply_and_verify();
+                        });
+                    }
+                }
+            });
+
+            let state = state::AppState::new(app.handle().clone(), capture_protection)?;
             let sidecar = state.sidecar.clone();
             let app_handle = app.handle().clone();
             app.manage(state);
@@ -226,6 +247,14 @@ mod tests {
     use crate::sidecar::{SidecarError, SidecarPort, SidecarState, SidecarSupervisor};
 
     use super::{ExitShutdownAction, ExitShutdownCoordinator, ShutdownOutcome};
+
+    #[test]
+    fn native_window_configuration_enables_capture_protection() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+
+        assert_eq!(config["app"]["windows"][0]["contentProtected"], true);
+    }
 
     #[test]
     fn persistent_session_commands_are_registered_with_tauri() {
