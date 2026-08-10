@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use tauri::Manager;
 
+pub mod capture_protection;
 pub mod commands;
 pub mod protocol;
 pub mod sidecar;
