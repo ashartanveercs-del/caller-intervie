@@ -193,6 +193,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::sidecar_status,
             commands::storage_health,
+            commands::capture_protection_status,
+            commands::retry_capture_protection,
             commands::send_sidecar_command,
             commands::restart_sidecar,
             commands::create_session,
@@ -254,6 +256,20 @@ mod tests {
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
 
         assert_eq!(config["app"]["windows"][0]["contentProtected"], true);
+    }
+
+    #[test]
+    fn capture_protection_commands_are_registered_with_tauri() {
+        let source = include_str!("lib.rs")
+            .split_once("#[cfg(test)]")
+            .expect("lib test module must be present")
+            .0;
+        for command in [
+            "commands::capture_protection_status",
+            "commands::retry_capture_protection",
+        ] {
+            assert!(source.contains(command), "missing Tauri command: {command}");
+        }
     }
 
     #[test]

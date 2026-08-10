@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -5,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tauri::State;
 
+use crate::capture_protection::{CaptureProtectionController, CaptureProtectionStatus};
 use crate::protocol::{
     is_supported_session_mode, validate_command, CommandKind, Envelope, EventKind, ProtocolKind,
     PROTOCOL_VERSION,
@@ -247,41 +249,87 @@ pub async fn storage_health(
 }
 
 #[tauri::command]
+pub fn capture_protection_status(state: State<'_, AppState>) -> CaptureProtectionStatus {
+    state.capture_protection.status()
+}
+
+#[tauri::command]
+pub fn retry_capture_protection(state: State<'_, AppState>) -> CaptureProtectionStatus {
+    state.capture_protection.reapply_and_verify()
+}
+
+#[tauri::command]
 pub async fn send_sidecar_command(
     state: State<'_, AppState>,
     command: Envelope,
 ) -> Result<(), SidecarCommandError> {
     let repository = state.repository.clone();
-    let authorization_command = command.clone();
     let workspace_id = state.workspace_id.clone();
-    let authorization =
-        ensure_sidecar_command_authorized(authorization_command, workspace_id, move |request| {
-            match request {
-                DurableAuthorizationRequest::Query {
-                    workspace_id,
-                    session_id,
-                    request_id,
-                } => repository
-                    .authorize_query_dispatch(&workspace_id, &session_id, &request_id)
-                    .map(DurableAuthorization::Query),
-                DurableAuthorizationRequest::SessionStart {
-                    workspace_id,
-                    session_id,
-                } => repository
-                    .get_session(&workspace_id, &session_id)
-                    .map(|session| {
-                        DurableAuthorization::SessionStart(session.map(|session| session.status))
-                    }),
-            }
-        });
-    state
-        .sidecar
-        .send_with_authorization_and_gate(
-            command,
-            state.session_operation_gate.clone(),
-            authorization,
-        )
-        .await
+    let sidecar = state.sidecar.clone();
+    let session_operation_gate = state.session_operation_gate.clone();
+    let capture_protection = state.capture_protection.clone();
+    let protection_command = command.clone();
+
+    dispatch_with_capture_protection(
+        &protection_command,
+        capture_protection.as_ref(),
+        move || async move {
+            let authorization_command = command.clone();
+            let authorization = ensure_sidecar_command_authorized(
+                authorization_command,
+                workspace_id,
+                move |request| match request {
+                    DurableAuthorizationRequest::Query {
+                        workspace_id,
+                        session_id,
+                        request_id,
+                    } => repository
+                        .authorize_query_dispatch(&workspace_id, &session_id, &request_id)
+                        .map(DurableAuthorization::Query),
+                    DurableAuthorizationRequest::SessionStart {
+                        workspace_id,
+                        session_id,
+                    } => repository
+                        .get_session(&workspace_id, &session_id)
+                        .map(|session| {
+                            DurableAuthorization::SessionStart(
+                                session.map(|session| session.status),
+                            )
+                        }),
+                },
+            );
+            sidecar
+                .send_with_authorization_and_gate(command, session_operation_gate, authorization)
+                .await
+        },
+    )
+    .await
+}
+
+fn command_requires_capture_protection(command: &Envelope) -> bool {
+    matches!(
+        &command.kind,
+        ProtocolKind::Command(CommandKind::SessionStart | CommandKind::QueryTrigger)
+    ) || matches!(
+        &command.kind,
+        ProtocolKind::Command(CommandKind::ListeningSet | CommandKind::AudioSystemSet)
+    ) && command.payload.get("enabled").and_then(Value::as_bool) == Some(true)
+}
+
+async fn dispatch_with_capture_protection<F, Fut>(
+    command: &Envelope,
+    capture_protection: &CaptureProtectionController,
+    dispatch: F,
+) -> Result<(), SidecarError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<(), SidecarError>>,
+{
+    if command_requires_capture_protection(command) {
+        capture_protection.reapply_and_verify();
+        capture_protection.require_protected()?;
+    }
+    dispatch().await
 }
 
 async fn ensure_sidecar_command_authorized<F>(
@@ -723,6 +771,9 @@ mod tests {
     use serde_json::{json, Map, Value};
     use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
+    use crate::capture_protection::{
+        CaptureProtectionController, CaptureProtectionFailure, CaptureProtectionTarget,
+    };
     use crate::protocol::{
         validate_command, CommandKind, Envelope, ProtocolKind, PROTOCOL_VERSION,
     };
@@ -732,6 +783,7 @@ mod tests {
     };
 
     use super::{
+        command_requires_capture_protection, dispatch_with_capture_protection,
         ensure_sidecar_command_authorized, run_repository_with_timeout, timeline_envelope,
         validate_language_tag, validate_mode, validate_uuid, AssociateRequestWithTurnInput,
         CompletionStatusInput, CreateSessionInput, DurableAuthorization,
@@ -869,6 +921,82 @@ mod tests {
             ]),
             correlation_id: None,
         }
+    }
+
+    fn command_with_kind(kind: CommandKind, payload: Map<String, Value>) -> Envelope {
+        let mut command = query_command();
+        command.kind = ProtocolKind::Command(kind);
+        command.payload = payload;
+        command
+    }
+
+    fn listening_command(enabled: bool) -> Envelope {
+        command_with_kind(
+            CommandKind::ListeningSet,
+            Map::from_iter([("enabled".into(), Value::Bool(enabled))]),
+        )
+    }
+
+    fn audio_system_command(enabled: bool) -> Envelope {
+        command_with_kind(
+            CommandKind::AudioSystemSet,
+            Map::from_iter([("enabled".into(), Value::Bool(enabled))]),
+        )
+    }
+
+    fn session_stop_command() -> Envelope {
+        command_with_kind(CommandKind::SessionStop, Map::new())
+    }
+
+    #[test]
+    fn capture_sensitive_commands_require_fresh_protection() {
+        let cases = [
+            ("session.start", session_start_command(), true),
+            ("query.trigger", query_command(), true),
+            ("listening.set enabled", listening_command(true), true),
+            ("audio.system.set enabled", audio_system_command(true), true),
+            ("listening.set disabled", listening_command(false), false),
+            (
+                "audio.system.set disabled",
+                audio_system_command(false),
+                false,
+            ),
+            ("session.stop", session_stop_command(), false),
+        ];
+
+        for (name, command, expected) in cases {
+            assert_eq!(
+                command_requires_capture_protection(&command),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    struct FailingCaptureProtectionTarget;
+
+    impl CaptureProtectionTarget for FailingCaptureProtectionTarget {
+        fn apply_and_verify(&self) -> Result<(), CaptureProtectionFailure> {
+            Err(CaptureProtectionFailure::VerificationFailed)
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_protection_failure_never_reaches_authorization_or_dispatch() {
+        let controller =
+            CaptureProtectionController::with_target(Arc::new(FailingCaptureProtectionTarget));
+
+        let error = dispatch_with_capture_protection(&query_command(), &controller, || async {
+            panic!("unprotected commands must not reach authorization or dispatch")
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), "capture_protection_required");
+        assert_eq!(
+            error.to_string(),
+            "Live mode is unavailable because screen capture protection could not be confirmed."
+        );
     }
 
     #[tokio::test]
