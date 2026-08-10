@@ -34,33 +34,49 @@ pub trait CaptureProtectionTarget: Send + Sync {
 
 pub struct CaptureProtectionController {
     target: Arc<dyn CaptureProtectionTarget>,
-    status: RwLock<CaptureProtectionStatus>,
+    state: RwLock<CaptureProtectionRecord>,
+}
+
+struct CaptureProtectionRecord {
+    generation: u64,
+    status: CaptureProtectionStatus,
 }
 
 impl CaptureProtectionController {
     pub fn with_target(target: Arc<dyn CaptureProtectionTarget>) -> Self {
         Self {
             target,
-            status: RwLock::new(CaptureProtectionStatus::applying()),
+            state: RwLock::new(CaptureProtectionRecord {
+                generation: 0,
+                status: CaptureProtectionStatus::applying(),
+            }),
         }
     }
 
     pub fn status(&self) -> CaptureProtectionStatus {
-        self.status
+        self.state
             .read()
             .expect("capture status lock poisoned")
+            .status
             .clone()
     }
 
     pub fn reapply_and_verify(&self) -> CaptureProtectionStatus {
-        *self.status.write().expect("capture status lock poisoned") =
-            CaptureProtectionStatus::applying();
+        let generation = {
+            let mut state = self.state.write().expect("capture status lock poisoned");
+            state.generation += 1;
+            state.status = CaptureProtectionStatus::applying();
+            state.generation
+        };
 
         let status = match self.target.apply_and_verify() {
             Ok(()) => CaptureProtectionStatus::protected(),
             Err(failure) => CaptureProtectionStatus::from_failure(failure),
         };
-        *self.status.write().expect("capture status lock poisoned") = status.clone();
+        let mut state = self.state.write().expect("capture status lock poisoned");
+        if state.generation == generation {
+            state.status = status.clone();
+        }
         status
     }
 
@@ -79,7 +95,10 @@ impl CaptureProtectionController {
     fn with_status(status: CaptureProtectionStatus) -> Self {
         Self {
             target: Arc::new(UnsupportedTarget),
-            status: RwLock::new(status),
+            state: RwLock::new(CaptureProtectionRecord {
+                generation: 0,
+                status,
+            }),
         }
     }
 
@@ -140,7 +159,8 @@ impl CaptureProtectionTarget for UnsupportedTarget {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::thread;
 
     use super::*;
 
@@ -166,6 +186,45 @@ mod tests {
         }
     }
 
+    struct BlockingTarget {
+        state: Mutex<BlockingTargetState>,
+        wake: Condvar,
+    }
+
+    #[derive(Default)]
+    struct BlockingTargetState {
+        started: usize,
+        released: [bool; 2],
+    }
+
+    impl BlockingTarget {
+        fn wait_until_started(&self, count: usize) {
+            let mut state = self.state.lock().unwrap();
+            while state.started < count {
+                state = self.wake.wait(state).unwrap();
+            }
+        }
+
+        fn release(&self, call: usize) {
+            let mut state = self.state.lock().unwrap();
+            state.released[call - 1] = true;
+            self.wake.notify_all();
+        }
+    }
+
+    impl CaptureProtectionTarget for BlockingTarget {
+        fn apply_and_verify(&self) -> Result<(), CaptureProtectionFailure> {
+            let mut state = self.state.lock().unwrap();
+            let call = state.started;
+            state.started += 1;
+            self.wake.notify_all();
+            while !state.released[call] {
+                state = self.wake.wait(state).unwrap();
+            }
+            Ok(())
+        }
+    }
+
     #[test]
     fn only_a_confirmed_target_result_marks_the_window_protected() {
         let target = Arc::new(FakeTarget::new([
@@ -182,6 +241,37 @@ mod tests {
             controller.reapply_and_verify().state,
             CaptureProtectionState::Protected
         );
+    }
+
+    #[test]
+    fn newer_reapply_cannot_be_bypassed_by_stale_protected_result() {
+        let target = Arc::new(BlockingTarget {
+            state: Mutex::new(BlockingTargetState::default()),
+            wake: Condvar::new(),
+        });
+        let controller = Arc::new(CaptureProtectionController::with_target(target.clone()));
+
+        let first_controller = controller.clone();
+        let first = thread::spawn(move || first_controller.reapply_and_verify());
+        target.wait_until_started(1);
+
+        let second_controller = controller.clone();
+        let second = thread::spawn(move || second_controller.reapply_and_verify());
+        target.wait_until_started(2);
+
+        target.release(1);
+        let first_status = first.join().unwrap();
+        let protection_error = controller
+            .require_protected()
+            .err()
+            .map(|error| error.code());
+
+        target.release(2);
+        let second_status = second.join().unwrap();
+
+        assert_eq!(first_status.state, CaptureProtectionState::Protected);
+        assert_eq!(second_status.state, CaptureProtectionState::Protected);
+        assert_eq!(protection_error, Some("capture_protection_required"));
     }
 
     #[test]
