@@ -769,7 +769,10 @@ fn validate_language_tag(value: &str, allow_auto: bool) -> Result<(), StorageCom
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
     use serde_json::{json, Map, Value};
@@ -1059,13 +1062,12 @@ mod tests {
         );
 
         let reapply_controller = controller.clone();
-        let mut reapply =
-            tokio::task::spawn_blocking(move || reapply_controller.reapply_and_verify());
+        let mut reapply: Pin<Box<_>> = Box::pin(reapply_controller.reapply_and_verify_async());
+        let waker: &Waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
         assert!(
-            tokio::time::timeout(Duration::from_millis(25), &mut reapply)
-                .await
-                .is_err(),
-            "reapply must not transition protection while dispatch is incomplete"
+            matches!(reapply.as_mut().poll(&mut context), Poll::Pending),
+            "reapply must wait for the protected dispatch lease"
         );
         assert_eq!(
             controller.status().state,
@@ -1081,7 +1083,7 @@ mod tests {
             .expect("protected dispatch must complete");
 
         assert_eq!(
-            reapply.await.expect("reapply task must not panic").state,
+            reapply.await.state,
             crate::capture_protection::CaptureProtectionState::Unavailable
         );
     }
