@@ -254,8 +254,10 @@ pub fn capture_protection_status(state: State<'_, AppState>) -> CaptureProtectio
 }
 
 #[tauri::command]
-pub fn retry_capture_protection(state: State<'_, AppState>) -> CaptureProtectionStatus {
-    state.capture_protection.reapply_and_verify()
+pub async fn retry_capture_protection(
+    state: State<'_, AppState>,
+) -> Result<CaptureProtectionStatus, SidecarCommandError> {
+    Ok(state.capture_protection.reapply_and_verify_async().await)
 }
 
 #[tauri::command]
@@ -325,10 +327,11 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<(), SidecarError>>,
 {
-    if command_requires_capture_protection(command) {
-        capture_protection.reapply_and_verify();
-        capture_protection.require_protected()?;
-    }
+    let _protection_lease = if command_requires_capture_protection(command) {
+        Some(capture_protection.acquire_protected_lease().await?)
+    } else {
+        None
+    };
     dispatch().await
 }
 
@@ -765,6 +768,7 @@ fn validate_language_tag(value: &str, allow_auto: bool) -> Result<(), StorageCom
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -981,6 +985,28 @@ mod tests {
         }
     }
 
+    struct FakeCaptureProtectionTarget {
+        outcomes: Mutex<VecDeque<Result<(), CaptureProtectionFailure>>>,
+    }
+
+    impl FakeCaptureProtectionTarget {
+        fn new(outcomes: impl IntoIterator<Item = Result<(), CaptureProtectionFailure>>) -> Self {
+            Self {
+                outcomes: Mutex::new(outcomes.into_iter().collect()),
+            }
+        }
+    }
+
+    impl CaptureProtectionTarget for FakeCaptureProtectionTarget {
+        fn apply_and_verify(&self) -> Result<(), CaptureProtectionFailure> {
+            self.outcomes
+                .lock()
+                .expect("capture protection fake lock must not be poisoned")
+                .pop_front()
+                .expect("capture protection fake must have an outcome")
+        }
+    }
+
     #[tokio::test]
     async fn capture_protection_failure_never_reaches_authorization_or_dispatch() {
         let controller =
@@ -996,6 +1022,67 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "Live mode is unavailable because screen capture protection could not be confirmed."
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_protection_lease_blocks_reapply_until_dispatch_completes() {
+        let controller = Arc::new(CaptureProtectionController::with_target(Arc::new(
+            FakeCaptureProtectionTarget::new([
+                Ok(()),
+                Err(CaptureProtectionFailure::VerificationFailed),
+            ]),
+        )));
+        let (dispatch_started_sender, dispatch_started) = oneshot::channel();
+        let (complete_dispatch, complete_dispatch_receiver) = oneshot::channel();
+        let dispatch_controller = controller.clone();
+        let command = query_command();
+        let dispatch = tokio::spawn(async move {
+            dispatch_with_capture_protection(&command, dispatch_controller.as_ref(), || async {
+                dispatch_started_sender
+                    .send(())
+                    .expect("dispatch start receiver must remain available");
+                complete_dispatch_receiver
+                    .await
+                    .expect("dispatch completion sender must remain available");
+                Ok(())
+            })
+            .await
+        });
+
+        dispatch_started
+            .await
+            .expect("protected dispatch must reach its closure");
+        assert_eq!(
+            controller.status().state,
+            crate::capture_protection::CaptureProtectionState::Protected
+        );
+
+        let reapply_controller = controller.clone();
+        let mut reapply =
+            tokio::task::spawn_blocking(move || reapply_controller.reapply_and_verify());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut reapply)
+                .await
+                .is_err(),
+            "reapply must not transition protection while dispatch is incomplete"
+        );
+        assert_eq!(
+            controller.status().state,
+            crate::capture_protection::CaptureProtectionState::Protected
+        );
+
+        complete_dispatch
+            .send(())
+            .expect("dispatch completion receiver must remain available");
+        dispatch
+            .await
+            .expect("protected dispatch task must not panic")
+            .expect("protected dispatch must complete");
+
+        assert_eq!(
+            reapply.await.expect("reapply task must not panic").state,
+            crate::capture_protection::CaptureProtectionState::Unavailable
         );
     }
 

@@ -161,7 +161,7 @@ pub fn run() {
                     if matches!(event, tauri::WindowEvent::Focused(true)) {
                         let capture_protection = capture_protection.clone();
                         tauri::async_runtime::spawn(async move {
-                            capture_protection.reapply_and_verify();
+                            capture_protection.reapply_and_verify_async().await;
                         });
                     }
                 }

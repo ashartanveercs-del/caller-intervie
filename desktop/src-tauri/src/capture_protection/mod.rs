@@ -1,6 +1,7 @@
 use std::sync::{Arc, RwLock};
 
 use serde::Serialize;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::sidecar::SidecarError;
 
@@ -49,11 +50,16 @@ pub trait CaptureProtectionTarget: Send + Sync {
 pub struct CaptureProtectionController {
     target: Arc<dyn CaptureProtectionTarget>,
     state: RwLock<CaptureProtectionRecord>,
+    operation: Arc<AsyncMutex<()>>,
 }
 
 struct CaptureProtectionRecord {
     generation: u64,
     status: CaptureProtectionStatus,
+}
+
+pub struct CaptureProtectionLease {
+    _operation: OwnedMutexGuard<()>,
 }
 
 impl CaptureProtectionController {
@@ -64,6 +70,7 @@ impl CaptureProtectionController {
                 generation: 0,
                 status: CaptureProtectionStatus::applying(),
             }),
+            operation: Arc::new(AsyncMutex::new(())),
         }
     }
 
@@ -76,6 +83,26 @@ impl CaptureProtectionController {
     }
 
     pub fn reapply_and_verify(&self) -> CaptureProtectionStatus {
+        let _operation = self.operation.clone().blocking_lock_owned();
+        self.reapply_and_verify_while_serialized()
+    }
+
+    pub async fn reapply_and_verify_async(&self) -> CaptureProtectionStatus {
+        let _operation = self.operation.lock().await;
+        self.reapply_and_verify_while_serialized()
+    }
+
+    pub async fn acquire_protected_lease(&self) -> Result<CaptureProtectionLease, SidecarError> {
+        let operation = self.operation.clone().lock_owned().await;
+        self.reapply_and_verify_while_serialized();
+        self.require_protected()?;
+
+        Ok(CaptureProtectionLease {
+            _operation: operation,
+        })
+    }
+
+    fn reapply_and_verify_while_serialized(&self) -> CaptureProtectionStatus {
         let generation = {
             let mut state = self.state.write().expect("capture status lock poisoned");
             state.generation += 1;
@@ -113,6 +140,7 @@ impl CaptureProtectionController {
                 generation: 0,
                 status,
             }),
+            operation: Arc::new(AsyncMutex::new(())),
         }
     }
 
@@ -301,10 +329,10 @@ mod tests {
 
         let second_controller = controller.clone();
         let second = thread::spawn(move || second_controller.reapply_and_verify());
-        target.wait_until_started(2);
 
         target.release(1);
         let first_status = first.join().unwrap();
+        target.wait_until_started(2);
         let protection_error = controller
             .require_protected()
             .err()
