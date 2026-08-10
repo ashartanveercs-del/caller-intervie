@@ -621,6 +621,21 @@ impl SidecarSupervisor {
             .and_then(|active| active.runtime_session_id.clone())
     }
 
+    async fn capture_stop_session(&self) -> Option<String> {
+        let data = self.inner.data.lock().await;
+        if !matches!(data.state, SidecarState::Ready) {
+            return None;
+        }
+        data.active.as_ref().and_then(|active| {
+            active.runtime_session_id.clone().or_else(|| {
+                active
+                    .pending_runtime_session
+                    .as_ref()
+                    .map(|pending| pending.session_id.clone())
+            })
+        })
+    }
+
     pub async fn send(&self, command: Envelope) -> Result<(), SidecarError> {
         self.send_with_authorization(command, async { Ok(()) })
             .await
@@ -628,7 +643,7 @@ impl SidecarSupervisor {
 
     pub async fn stop_for_capture_protection_loss(&self) -> Result<(), SidecarError> {
         let _stop = self.inner.capture_protection_stop.lock().await;
-        let Some(session_id) = self.current_runtime_session().await else {
+        let Some(session_id) = self.capture_stop_session().await else {
             return Ok(());
         };
         let command = Envelope {
@@ -4827,6 +4842,48 @@ mod tests {
         assert!(crate::protocol::validate_command(stop).is_ok());
         assert_eq!(port.kills.load(AtomicOrdering::SeqCst), 0);
         assert_eq!(supervisor.current_runtime_session().await, None);
+    }
+
+    #[tokio::test]
+    async fn capture_protection_loss_stops_a_pending_runtime_session() {
+        let port = FakeSidecarPort::default();
+        let supervisor = SidecarSupervisor::with_port(Arc::new(port.clone()));
+        supervisor
+            .accept_event(0, fixture_envelope())
+            .await
+            .unwrap();
+        supervisor
+            .send(session_start_command(SESSION_ID))
+            .await
+            .unwrap();
+        assert_eq!(supervisor.current_runtime_session().await, None);
+
+        supervisor.stop_for_capture_protection_loss().await.unwrap();
+
+        let stop_commands = port
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|bytes| FrameDecoder::new(MAX_FRAME_BYTES).push(bytes).unwrap())
+            .filter(|command| {
+                matches!(
+                    command.kind,
+                    ProtocolKind::Command(CommandKind::SessionStop)
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(stop_commands.len(), 1);
+        let stop = &stop_commands[0];
+        assert_eq!(stop.session_id.as_deref(), Some(SESSION_ID));
+        assert!(crate::protocol::validate_command(stop).is_ok());
+
+        supervisor
+            .send(session_start_command(
+                "018f0000-0000-7000-8000-000000000024",
+            ))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
