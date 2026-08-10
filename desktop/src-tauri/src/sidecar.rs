@@ -669,7 +669,7 @@ impl SidecarSupervisor {
         &self,
         dispatch_error: SidecarError,
     ) -> Result<(), SidecarError> {
-        match self.shutdown().await {
+        match self.emergency_shutdown_for_capture_protection_loss().await {
             Ok(()) => Err(dispatch_error),
             Err(shutdown_error) => Err(shutdown_error),
         }
@@ -1132,6 +1132,38 @@ impl SidecarSupervisor {
         cleanup_result
     }
 
+    async fn emergency_shutdown_for_capture_protection_loss(&self) -> Result<(), SidecarError> {
+        let _lifecycle = self.inner.lifecycle.lock().await;
+        let _commands = self.inner.commands.lock().await;
+        let _delivery = self.inner.delivery.lock().await;
+        let active = {
+            let mut data = self.inner.data.lock().await;
+            data.explicit_shutdown = true;
+            data.state = SidecarState::Stopped;
+            let active = data.active.take();
+            if let Some(active) = active.as_ref() {
+                data.intentional_exit_generations.insert(active.generation);
+            }
+            active
+        };
+        let sink_result =
+            match tokio::time::timeout(EVENT_SINK_SHUTDOWN_TIMEOUT, self.inner.sink.shutdown())
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(SidecarError::new(
+                    "sidecar_sink_shutdown_timeout",
+                    "sidecar event delivery did not stop in time",
+                )),
+            };
+        let cleanup_result = match active {
+            Some(active) => self.emergency_detach_generation(active).await,
+            None => Ok(()),
+        };
+        sink_result?;
+        cleanup_result
+    }
+
     async fn launch_internal(&self) -> Result<(), SidecarError> {
         let launcher = self.inner.launcher.as_ref().ok_or_else(|| {
             SidecarError::new("sidecar_unavailable", "sidecar launcher is unavailable")
@@ -1258,6 +1290,23 @@ impl SidecarSupervisor {
                     data.active = Some(active);
                 }
                 data.state = SidecarState::Failed;
+                self.push_diagnostic_locked(&mut data, &cleanup_error.to_string());
+                Err(cleanup_error)
+            }
+        }
+    }
+
+    async fn emergency_detach_generation(&self, active: ActiveSidecar) -> Result<(), SidecarError> {
+        match active.port.kill().await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let cleanup_error = SidecarError::new(
+                    "sidecar_cleanup_failed",
+                    format!("sidecar cleanup failed: {error}"),
+                );
+                let mut data = self.inner.data.lock().await;
+                data.explicit_shutdown = true;
+                data.state = SidecarState::Stopped;
                 self.push_diagnostic_locked(&mut data, &cleanup_error.to_string());
                 Err(cleanup_error)
             }
@@ -1527,7 +1576,6 @@ async fn process_control_task(
     mut receiver: mpsc::Receiver<ProcessRequest>,
     exit: watch::Sender<ProcessExit>,
 ) {
-    let mut receiving_controls = true;
     loop {
         tokio::select! {
             status = child.wait() => {
@@ -1536,7 +1584,7 @@ async fn process_control_task(
                     return;
                 }
             }
-            request = receiver.recv(), if receiving_controls => match request {
+            request = receiver.recv() => match request {
                 Some(ProcessRequest::Terminate(result)) => {
                     let termination = match child.start_kill() {
                         Ok(()) => match tokio::time::timeout(CLEANUP_TIMEOUT, child.wait()).await {
@@ -1555,7 +1603,16 @@ async fn process_control_task(
                         return;
                     }
                 }
-                None => receiving_controls = false,
+                None => {
+                    let _ = child.start_kill();
+                    if matches!(
+                        tokio::time::timeout(CLEANUP_TIMEOUT, child.wait()).await,
+                        Ok(Ok(_))
+                    ) {
+                        let _ = exit.send(ProcessExit::Reaped);
+                    }
+                    return;
+                }
             }
         }
     }
@@ -2564,7 +2621,7 @@ mod tests {
     use std::future::Future;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Condvar, Mutex};
-    use std::task::Poll;
+    use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -2580,12 +2637,12 @@ mod tests {
     };
 
     use super::{
-        packaged_sidecar_path, persist_durable_event, redact_diagnostic, DurableEventQueue,
-        DurableEventStore, DurableStoreError, PendingDurableEvent, PersistenceAcknowledgement,
-        PersistenceAwareEventSink, ProcessExit, ProcessRequest, SidecarError, SidecarEventSink,
-        SidecarLauncher, SidecarPort, SidecarState, SidecarSupervisor, StorageHealth,
-        StorageHealthReporter, StorageHealthStatus, TokioCommand, TokioSidecarPort,
-        MAX_PENDING_DURABLE_EVENTS, SIDECAR_PROGRAM,
+        packaged_sidecar_path, persist_durable_event, process_control_task, redact_diagnostic,
+        DurableEventQueue, DurableEventStore, DurableStoreError, PendingDurableEvent,
+        PersistenceAcknowledgement, PersistenceAwareEventSink, ProcessExit, ProcessRequest,
+        SidecarError, SidecarEventSink, SidecarLauncher, SidecarPort, SidecarState,
+        SidecarSupervisor, StorageHealth, StorageHealthReporter, StorageHealthStatus, TokioCommand,
+        TokioSidecarPort, MAX_PENDING_DURABLE_EVENTS, SIDECAR_PROGRAM,
     };
 
     const SESSION_ID: &str = "018f0000-0000-7000-8000-000000000003";
@@ -2719,6 +2776,75 @@ mod tests {
         async fn kill(&self) -> Result<(), SidecarError> {
             self.kills.fetch_add(1, AtomicOrdering::SeqCst);
             Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct BlockingStopPort {
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        kills: Arc<AtomicUsize>,
+        stop_started: Arc<Notify>,
+        release_stop: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl SidecarPort for BlockingStopPort {
+        async fn write(&self, bytes: Vec<u8>) -> Result<(), SidecarError> {
+            let mut decoder = FrameDecoder::new(MAX_FRAME_BYTES);
+            let command = decoder.push(&bytes).unwrap().pop().unwrap();
+            self.writes.lock().unwrap().push(bytes);
+            if matches!(
+                command.kind,
+                ProtocolKind::Command(CommandKind::SessionStop)
+            ) {
+                self.stop_started.notify_waiters();
+                self.release_stop.notified().await;
+            }
+            Ok(())
+        }
+
+        async fn kill(&self) -> Result<(), SidecarError> {
+            self.kills.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct KillFailureDropPort {
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        kills: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for KillFailureDropPort {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl SidecarPort for KillFailureDropPort {
+        async fn write(&self, bytes: Vec<u8>) -> Result<(), SidecarError> {
+            let mut decoder = FrameDecoder::new(MAX_FRAME_BYTES);
+            let command = decoder.push(&bytes).unwrap().pop().unwrap();
+            self.writes.lock().unwrap().push(bytes);
+            if matches!(
+                command.kind,
+                ProtocolKind::Command(CommandKind::SessionStop)
+            ) {
+                return Err(SidecarError::new(
+                    "sidecar_write_failed",
+                    "sidecar stop write failed",
+                ));
+            }
+            Ok(())
+        }
+
+        async fn kill(&self) -> Result<(), SidecarError> {
+            self.kills.fetch_add(1, AtomicOrdering::SeqCst);
+            Err(SidecarError::new(
+                "sidecar_kill_failed",
+                "sidecar kill failed",
+            ))
         }
     }
 
@@ -4645,7 +4771,7 @@ mod tests {
 
     #[tokio::test]
     async fn capture_protection_loss_sends_one_valid_stop_for_the_active_runtime() {
-        let port = FakeSidecarPort::default();
+        let port = BlockingStopPort::default();
         let supervisor = SidecarSupervisor::with_port(Arc::new(port.clone()));
         supervisor
             .accept_event(0, fixture_envelope())
@@ -4660,12 +4786,23 @@ mod tests {
             .await
             .unwrap();
 
-        let (first, second) = tokio::join!(
-            supervisor.stop_for_capture_protection_loss(),
-            supervisor.stop_for_capture_protection_loss(),
+        let stop_started = port.stop_started.notified();
+        let first = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.stop_for_capture_protection_loss().await }
+        });
+        stop_started.await;
+        let second_supervisor = supervisor.clone();
+        let mut second = Box::pin(second_supervisor.stop_for_capture_protection_loss());
+        let waker: &Waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        assert!(
+            matches!(second.as_mut().poll(&mut context), Poll::Pending),
+            "the second stop must wait for the capture protection stop serialization",
         );
-        first.unwrap();
-        second.unwrap();
+        port.release_stop.notify_waiters();
+        first.await.unwrap().unwrap();
+        second.await.unwrap();
 
         let stop_commands = port
             .writes
@@ -4688,6 +4825,7 @@ mod tests {
         assert_eq!(stop.payload, Map::new());
         assert!(stop.timestamp_ms > 0);
         assert!(crate::protocol::validate_command(stop).is_ok());
+        assert_eq!(port.kills.load(AtomicOrdering::SeqCst), 0);
         assert_eq!(supervisor.current_runtime_session().await, None);
     }
 
@@ -4752,6 +4890,76 @@ mod tests {
         assert_eq!(port.kills.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(supervisor.status().await.state, SidecarState::Stopped);
         assert_eq!(supervisor.current_runtime_session().await, None);
+    }
+
+    #[tokio::test]
+    async fn capture_protection_loss_kill_failure_detaches_the_active_runtime() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let kills = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let supervisor = SidecarSupervisor::with_port(Arc::new(KillFailureDropPort {
+            writes,
+            kills: kills.clone(),
+            drops: drops.clone(),
+        }));
+        supervisor
+            .accept_event(0, fixture_envelope())
+            .await
+            .unwrap();
+        supervisor
+            .send(session_start_command(SESSION_ID))
+            .await
+            .unwrap();
+        supervisor
+            .accept_event(0, runtime_session_event(SESSION_ID, "listening"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            supervisor
+                .stop_for_capture_protection_loss()
+                .await
+                .unwrap_err()
+                .code(),
+            "sidecar_cleanup_failed"
+        );
+        assert_eq!(kills.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(drops.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(supervisor.status().await.state, SidecarState::Stopped);
+        assert_eq!(supervisor.current_runtime_session().await, None);
+
+        supervisor.handle_unexpected_exit(0).await;
+        assert_eq!(supervisor.status().await.state, SidecarState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn capture_protection_loss_control_channel_close_reaps_the_owned_child() {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = TokioCommand::new("cmd.exe");
+            command.args(["/d", "/c", "ping -n 30 127.0.0.1 > nul"]);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = TokioCommand::new("sh");
+            command.args(["-c", "sleep 30"]);
+            command
+        };
+        command.kill_on_drop(true);
+        let child = command.spawn().unwrap();
+        let (control_sender, control_receiver) = mpsc::channel(1);
+        let (exit_sender, mut exit_receiver) = watch::channel(ProcessExit::Pending);
+        tokio::spawn(process_control_task(child, control_receiver, exit_sender));
+        drop(control_sender);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            exit_receiver.wait_for(|state| matches!(state, ProcessExit::Reaped)),
+        )
+        .await
+        .expect("closing the control channel must reap the owned child")
+        .unwrap();
     }
 
     #[tokio::test]

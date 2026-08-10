@@ -11,7 +11,7 @@ use crate::protocol::{
     is_supported_session_mode, validate_command, CommandKind, Envelope, EventKind, ProtocolKind,
     PROTOCOL_VERSION,
 };
-use crate::sidecar::{SidecarError, SidecarStatus, StorageHealth};
+use crate::sidecar::{SidecarError, SidecarStatus, SidecarSupervisor, StorageHealth};
 use crate::state::AppState;
 use crate::storage::{
     NewSession, NewSessionBrief, QueryDispatchAuthorization, RepositoryError,
@@ -257,7 +257,11 @@ pub fn capture_protection_status(state: State<'_, AppState>) -> CaptureProtectio
 pub async fn retry_capture_protection(
     state: State<'_, AppState>,
 ) -> Result<CaptureProtectionStatus, SidecarCommandError> {
-    Ok(state.capture_protection.reapply_and_verify_async().await)
+    Ok(reapply_capture_protection_and_stop_on_loss(
+        state.capture_protection.as_ref(),
+        &state.sidecar,
+    )
+    .await)
 }
 
 #[tauri::command]
@@ -268,6 +272,7 @@ pub async fn send_sidecar_command(
     let repository = state.repository.clone();
     let workspace_id = state.workspace_id.clone();
     let sidecar = state.sidecar.clone();
+    let protection_sidecar = sidecar.clone();
     let session_operation_gate = state.session_operation_gate.clone();
     let capture_protection = state.capture_protection.clone();
     let protection_command = command.clone();
@@ -275,6 +280,7 @@ pub async fn send_sidecar_command(
     dispatch_with_capture_protection(
         &protection_command,
         capture_protection.as_ref(),
+        &protection_sidecar,
         move || async move {
             let authorization_command = command.clone();
             let authorization = ensure_sidecar_command_authorized(
@@ -321,6 +327,7 @@ fn command_requires_capture_protection(command: &Envelope) -> bool {
 async fn dispatch_with_capture_protection<F, Fut>(
     command: &Envelope,
     capture_protection: &CaptureProtectionController,
+    sidecar: &SidecarSupervisor,
     dispatch: F,
 ) -> Result<(), SidecarError>
 where
@@ -328,11 +335,28 @@ where
     Fut: Future<Output = Result<(), SidecarError>>,
 {
     let _protection_lease = if command_requires_capture_protection(command) {
-        Some(capture_protection.acquire_protected_lease().await?)
+        match capture_protection.acquire_protected_lease().await {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                let _ = sidecar.stop_for_capture_protection_loss().await;
+                return Err(error);
+            }
+        }
     } else {
         None
     };
     dispatch().await
+}
+
+pub(crate) async fn reapply_capture_protection_and_stop_on_loss(
+    capture_protection: &CaptureProtectionController,
+    sidecar: &SidecarSupervisor,
+) -> CaptureProtectionStatus {
+    let status = capture_protection.reapply_and_verify_async().await;
+    if status.state != crate::capture_protection::CaptureProtectionState::Protected {
+        let _ = sidecar.stop_for_capture_protection_loss().await;
+    }
+    status
 }
 
 async fn ensure_sidecar_command_authorized<F>(
@@ -775,6 +799,7 @@ mod tests {
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
+    use async_trait::async_trait;
     use serde_json::{json, Map, Value};
     use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
@@ -782,8 +807,10 @@ mod tests {
         CaptureProtectionController, CaptureProtectionFailure, CaptureProtectionTarget,
     };
     use crate::protocol::{
-        validate_command, CommandKind, Envelope, ProtocolKind, PROTOCOL_VERSION,
+        validate_command, CommandKind, Envelope, EventKind, FrameDecoder, ProtocolKind,
+        MAX_FRAME_BYTES, PROTOCOL_VERSION,
     };
+    use crate::sidecar::{SidecarError, SidecarPort, SidecarSupervisor};
     use crate::storage::{
         QueryDispatchAuthorization, RepositoryError, SessionRepository, SessionStatus,
         StoredSession, StoredSessionBrief, StoredTimelineEvent, TimelineEventKind,
@@ -791,11 +818,11 @@ mod tests {
 
     use super::{
         command_requires_capture_protection, dispatch_with_capture_protection,
-        ensure_sidecar_command_authorized, run_repository_with_timeout, timeline_envelope,
-        validate_language_tag, validate_mode, validate_uuid, AssociateRequestWithTurnInput,
-        CompletionStatusInput, CreateSessionInput, DurableAuthorization,
-        DurableAuthorizationRequest, SaveSessionBriefInput, SessionRecordDto, StorageCommandError,
-        MAX_BRIEF_BYTES,
+        ensure_sidecar_command_authorized, reapply_capture_protection_and_stop_on_loss,
+        run_repository_with_timeout, timeline_envelope, validate_language_tag, validate_mode,
+        validate_uuid, AssociateRequestWithTurnInput, CompletionStatusInput, CreateSessionInput,
+        DurableAuthorization, DurableAuthorizationRequest, SaveSessionBriefInput, SessionRecordDto,
+        StorageCommandError, MAX_BRIEF_BYTES,
     };
 
     const WORKSPACE_ID: &str = "018f0000-0000-7000-8000-000000000099";
@@ -1010,22 +1037,123 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct RecordingSidecarPort {
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    #[async_trait]
+    impl SidecarPort for RecordingSidecarPort {
+        async fn write(&self, bytes: Vec<u8>) -> Result<(), SidecarError> {
+            self.writes.lock().unwrap().push(bytes);
+            Ok(())
+        }
+
+        async fn kill(&self) -> Result<(), SidecarError> {
+            Ok(())
+        }
+    }
+
+    async fn active_runtime(port: &RecordingSidecarPort) -> SidecarSupervisor {
+        let supervisor = SidecarSupervisor::with_port(Arc::new(port.clone()));
+        supervisor
+            .accept_event(
+                0,
+                Envelope {
+                    version: PROTOCOL_VERSION,
+                    id: "018f0000-0000-7000-8000-000000000030".into(),
+                    session_id: None,
+                    sequence: 0,
+                    timestamp_ms: 1,
+                    kind: ProtocolKind::Event(EventKind::SidecarReady),
+                    payload: Map::from_iter([("status".into(), json!("ready"))]),
+                    correlation_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        supervisor.send(session_start_command()).await.unwrap();
+        supervisor
+            .accept_event(
+                0,
+                Envelope {
+                    version: PROTOCOL_VERSION,
+                    id: "018f0000-0000-7000-8000-000000000031".into(),
+                    session_id: Some(SESSION_ID.into()),
+                    sequence: 1,
+                    timestamp_ms: 2,
+                    kind: ProtocolKind::Event(EventKind::SessionState),
+                    payload: Map::from_iter([
+                        ("state".into(), json!("listening")),
+                        ("mode".into(), json!("interview")),
+                        ("input_language".into(), json!("auto")),
+                        ("response_language".into(), json!("en")),
+                        ("review_language".into(), json!("en")),
+                        ("you_source".into(), json!("mic")),
+                        ("listening".into(), json!(true)),
+                        ("system_audio_enabled".into(), json!(false)),
+                    ]),
+                    correlation_id: Some("018f0000-0000-7000-8000-000000000020".into()),
+                },
+            )
+            .await
+            .unwrap();
+        supervisor
+    }
+
+    fn stop_frame_count(port: &RecordingSidecarPort) -> usize {
+        port.writes
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|bytes| FrameDecoder::new(MAX_FRAME_BYTES).push(bytes).unwrap())
+            .filter(|command| {
+                matches!(
+                    command.kind,
+                    ProtocolKind::Command(CommandKind::SessionStop)
+                )
+            })
+            .count()
+    }
+
     #[tokio::test]
-    async fn capture_protection_failure_never_reaches_authorization_or_dispatch() {
+    async fn protected_dispatch_loss_stops_the_active_runtime_before_returning() {
         let controller =
             CaptureProtectionController::with_target(Arc::new(FailingCaptureProtectionTarget));
+        let port = RecordingSidecarPort::default();
+        let sidecar = active_runtime(&port).await;
 
-        let error = dispatch_with_capture_protection(&query_command(), &controller, || async {
-            panic!("unprotected commands must not reach authorization or dispatch")
-        })
-        .await
-        .unwrap_err();
+        let error =
+            dispatch_with_capture_protection(&query_command(), &controller, &sidecar, || async {
+                panic!("unprotected commands must not reach authorization or dispatch")
+            })
+            .await
+            .unwrap_err();
 
         assert_eq!(error.code(), "capture_protection_required");
         assert_eq!(
             error.to_string(),
             "Live mode is unavailable because screen capture protection could not be confirmed."
         );
+        assert_eq!(stop_frame_count(&port), 1);
+        assert_eq!(sidecar.current_runtime_session().await, None);
+    }
+
+    #[tokio::test]
+    async fn manual_retry_loss_stops_the_active_runtime_before_returning() {
+        let controller =
+            CaptureProtectionController::with_target(Arc::new(FailingCaptureProtectionTarget));
+        let port = RecordingSidecarPort::default();
+        let sidecar = active_runtime(&port).await;
+
+        let status = reapply_capture_protection_and_stop_on_loss(&controller, &sidecar).await;
+
+        assert_eq!(
+            status.state,
+            crate::capture_protection::CaptureProtectionState::Unavailable
+        );
+        assert_eq!(stop_frame_count(&port), 1);
+        assert_eq!(sidecar.current_runtime_session().await, None);
     }
 
     #[tokio::test]
@@ -1039,17 +1167,25 @@ mod tests {
         let (dispatch_started_sender, dispatch_started) = oneshot::channel();
         let (complete_dispatch, complete_dispatch_receiver) = oneshot::channel();
         let dispatch_controller = controller.clone();
+        let port = RecordingSidecarPort::default();
+        let sidecar = active_runtime(&port).await;
+        let dispatch_sidecar = sidecar.clone();
         let command = query_command();
         let dispatch = tokio::spawn(async move {
-            dispatch_with_capture_protection(&command, dispatch_controller.as_ref(), || async {
-                dispatch_started_sender
-                    .send(())
-                    .expect("dispatch start receiver must remain available");
-                complete_dispatch_receiver
-                    .await
-                    .expect("dispatch completion sender must remain available");
-                Ok(())
-            })
+            dispatch_with_capture_protection(
+                &command,
+                dispatch_controller.as_ref(),
+                &dispatch_sidecar,
+                || async {
+                    dispatch_started_sender
+                        .send(())
+                        .expect("dispatch start receiver must remain available");
+                    complete_dispatch_receiver
+                        .await
+                        .expect("dispatch completion sender must remain available");
+                    Ok(())
+                },
+            )
             .await
         });
 
@@ -1062,7 +1198,10 @@ mod tests {
         );
 
         let reapply_controller = controller.clone();
-        let mut reapply: Pin<Box<_>> = Box::pin(reapply_controller.reapply_and_verify_async());
+        let mut reapply: Pin<Box<_>> = Box::pin(reapply_capture_protection_and_stop_on_loss(
+            reapply_controller.as_ref(),
+            &sidecar,
+        ));
         let waker: &Waker = Waker::noop();
         let mut context = Context::from_waker(waker);
         assert!(
@@ -1086,6 +1225,8 @@ mod tests {
             reapply.await.state,
             crate::capture_protection::CaptureProtectionState::Unavailable
         );
+        assert_eq!(stop_frame_count(&port), 1);
+        assert_eq!(sidecar.current_runtime_session().await, None);
     }
 
     #[tokio::test]

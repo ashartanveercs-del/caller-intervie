@@ -170,19 +170,11 @@ pub fn run() {
                         let capture_protection = capture_protection.clone();
                         let sidecar = app_handle.state::<state::AppState>().sidecar.clone();
                         tauri::async_runtime::spawn(async move {
-                            let previous = capture_protection.status().state;
-                            let current = capture_protection.reapply_and_verify_async().await.state;
-                            if previous == capture_protection::CaptureProtectionState::Protected
-                                && current != capture_protection::CaptureProtectionState::Protected
-                            {
-                                if let Err(error) = sidecar.stop_for_capture_protection_loss().await
-                                {
-                                    eprintln!(
-                                        "capture protection loss stop failed: code={}",
-                                        error.code()
-                                    );
-                                }
-                            }
+                            commands::reapply_capture_protection_and_stop_on_loss(
+                                capture_protection.as_ref(),
+                                &sidecar,
+                            )
+                            .await;
                         });
                     }
                 }
@@ -286,6 +278,17 @@ mod tests {
         ] {
             assert!(source.contains(command), "missing Tauri command: {command}");
         }
+    }
+
+    #[test]
+    fn focus_reapply_uses_the_loss_safety_helper_without_a_previous_snapshot() {
+        let source = include_str!("lib.rs")
+            .split_once("#[cfg(test)]")
+            .expect("lib test module must be present")
+            .0;
+
+        assert!(source.contains("commands::reapply_capture_protection_and_stop_on_loss"));
+        assert!(!source.contains("let previous = capture_protection.status().state"));
     }
 
     #[test]
