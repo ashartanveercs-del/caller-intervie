@@ -17,6 +17,14 @@ export type StorageHealth = {
   recoverable: boolean;
 };
 
+export type CaptureProtectionState = "applying" | "protected" | "unavailable" | "unsupported";
+
+export type CaptureProtectionStatus = {
+  state: CaptureProtectionState;
+  code?: string;
+  message?: string;
+};
+
 export type RequestTurnAssociation = {
   requestId: string;
   turnId: string;
@@ -57,8 +65,10 @@ export type SessionRecord = {
 export interface PlatformApi {
   sidecarStatus(): Promise<SidecarStatus>;
   storageHealth(): Promise<StorageHealth>;
+  captureProtectionStatus(): Promise<CaptureProtectionStatus>;
   send(command: Envelope): Promise<void>;
   restartSidecar(): Promise<SidecarStatus>;
+  retryCaptureProtection(): Promise<CaptureProtectionStatus>;
   subscribe(listener: (event: Envelope) => void): Promise<() => void>;
   subscribeStorageHealth(listener: (health: StorageHealth) => void): Promise<() => void>;
   associateRequestWithTurn(input: AssociateRequestWithTurnInput): Promise<void>;

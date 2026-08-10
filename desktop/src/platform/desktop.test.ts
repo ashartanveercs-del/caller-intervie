@@ -50,6 +50,30 @@ describe("desktop platform", () => {
     expect(invoke).toHaveBeenNthCalledWith(3, "restart_sidecar");
   });
 
+  it("maps capture protection DTOs and invokes the exact capture commands", async () => {
+    invoke
+      .mockResolvedValueOnce({
+        state: "unavailable",
+        code: "capture_protection_unavailable",
+        message: "Screen capture protection could not be confirmed.",
+        internal_diagnostics: "must-not-leak",
+      })
+      .mockResolvedValueOnce({ state: "protected", internal_diagnostics: "must-not-leak" });
+    const platform = createDesktopPlatform();
+
+    expect(await platform.captureProtectionStatus()).toEqual({
+      state: "unavailable",
+      code: "capture_protection_unavailable",
+      message: "Screen capture protection could not be confirmed.",
+    });
+    expect(await platform.retryCaptureProtection()).toEqual({ state: "protected" });
+
+    expect(invoke.mock.calls).toEqual([
+      ["capture_protection_status"],
+      ["retry_capture_protection"],
+    ]);
+  });
+
   it("forwards valid sidecar events and exposes Tauri listener cleanup", async () => {
     const unlisten = vi.fn();
     let callback: ((event: { payload: unknown }) => void) | undefined;

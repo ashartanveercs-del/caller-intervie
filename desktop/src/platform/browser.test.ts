@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { EventKind, type Envelope } from "../shared/protocol";
+import { CommandKind, EventKind, type Envelope } from "../shared/protocol";
 import { createBrowserPlatform } from "./browser";
 
 const sessionId = "018f0000-0000-7000-8000-000000000001";
@@ -17,7 +17,77 @@ function transcript(sequence: number): Envelope {
   };
 }
 
+function command(kind: CommandKind, payload: Record<string, unknown> = {}): Envelope {
+  return {
+    version: 1,
+    id: "018f0000-0000-7000-8000-000000000003",
+    session_id: sessionId,
+    sequence: 1,
+    timestamp_ms: 1,
+    kind,
+    payload,
+    correlation_id: null,
+  };
+}
+
 describe("browser platform", () => {
+  it("always reports capture protection as unsupported in browser preview", async () => {
+    const platform = createBrowserPlatform();
+
+    expect(await platform.captureProtectionStatus()).toEqual({
+      state: "unsupported",
+      code: "browser_preview",
+    });
+    expect(await platform.retryCaptureProtection()).toEqual({
+      state: "unsupported",
+      code: "browser_preview",
+    });
+  });
+
+  it("rejects every command that requires capture protection", async () => {
+    const platform = createBrowserPlatform();
+    const protectedCommands = [
+      command(CommandKind.SESSION_START),
+      command(CommandKind.QUERY_TRIGGER),
+      command(CommandKind.LISTENING_SET, { enabled: true }),
+      command(CommandKind.AUDIO_SYSTEM_SET, { enabled: true }),
+    ];
+
+    for (const protectedCommand of protectedCommands) {
+      await expect(platform.send(protectedCommand)).rejects.toMatchObject({
+        code: "capture_protection_required",
+        message: "Live mode is unavailable because screen capture protection could not be confirmed.",
+      });
+    }
+
+    expect(platform.sentCommands()).toEqual([]);
+  });
+
+  it("allows capture-safe commands and only boolean enabled values trigger the browser gate", async () => {
+    const platform = createBrowserPlatform();
+    const allowedCommands = [
+      command(CommandKind.SESSION_STOP),
+      command(CommandKind.LISTENING_SET, { enabled: false }),
+      command(CommandKind.AUDIO_SYSTEM_SET, { enabled: false }),
+      command(CommandKind.LISTENING_SET, { enabled: "true" }),
+      command(CommandKind.AUDIO_SYSTEM_SET, { enabled: 1 }),
+    ];
+
+    for (const allowedCommand of allowedCommands) {
+      await expect(platform.send(allowedCommand)).resolves.toBeUndefined();
+    }
+
+    expect(platform.sentCommands()).toEqual(allowedCommands);
+  });
+
+  it("preserves protocol validation before applying capture protection rules", async () => {
+    const platform = createBrowserPlatform();
+    const malformedStart = { ...command(CommandKind.SESSION_START), payload: [] } as unknown as Envelope;
+
+    await expect(platform.send(malformedStart)).rejects.toThrow(/payload/i);
+    expect(platform.sentCommands()).toEqual([]);
+  });
+
   it("persists deterministic CRUD state and publishes subscriptions", async () => {
     const platform = createBrowserPlatform();
     const received: Envelope[] = [];

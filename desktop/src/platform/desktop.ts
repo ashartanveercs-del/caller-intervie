@@ -2,6 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { decodeEnvelope } from "../shared/protocol";
 import type {
+  CaptureProtectionState,
+  CaptureProtectionStatus,
   CreateSessionInput,
   AssociateRequestWithTurnInput,
   PlatformApi,
@@ -27,6 +29,12 @@ type StorageHealthDto = {
   code?: string;
   message?: string;
   recoverable: boolean;
+};
+
+type CaptureProtectionStatusDto = {
+  state: CaptureProtectionState;
+  code?: string;
+  message?: string;
 };
 
 type RequestTurnAssociationDto = {
@@ -64,6 +72,14 @@ function mapStorageHealth(dto: StorageHealthDto): StorageHealth {
   };
 }
 
+function mapCaptureProtectionStatus(dto: CaptureProtectionStatusDto): CaptureProtectionStatus {
+  return {
+    state: dto.state,
+    ...(typeof dto.code === "string" ? { code: dto.code } : {}),
+    ...(typeof dto.message === "string" ? { message: dto.message } : {}),
+  };
+}
+
 function mapRequestTurnAssociation(dto: RequestTurnAssociationDto): RequestTurnAssociation {
   return { requestId: dto.request_id, turnId: dto.turn_id };
 }
@@ -93,11 +109,21 @@ export function createDesktopPlatform(): PlatformApi {
     async storageHealth() {
       return mapStorageHealth(await invoke<StorageHealthDto>("storage_health"));
     },
+    async captureProtectionStatus() {
+      return mapCaptureProtectionStatus(
+        await invoke<CaptureProtectionStatusDto>("capture_protection_status"),
+      );
+    },
     async send(command) {
       await invoke("send_sidecar_command", { command: decodeEnvelope(command) });
     },
     async restartSidecar() {
       return mapStatus(await invoke<SidecarStatusDto>("restart_sidecar"));
+    },
+    async retryCaptureProtection() {
+      return mapCaptureProtectionStatus(
+        await invoke<CaptureProtectionStatusDto>("retry_capture_protection"),
+      );
     },
     async subscribe(listener) {
       return listen<unknown>("sidecar://event", (event) => listener(decodeEnvelope(event.payload)));

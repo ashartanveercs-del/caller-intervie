@@ -1,6 +1,7 @@
-import { decodeEnvelope, type Envelope } from "../shared/protocol";
+import { CommandKind, decodeEnvelope, type Envelope } from "../shared/protocol";
 import type {
   AssociateRequestWithTurnInput,
+  CaptureProtectionStatus,
   PlatformApi,
   SessionRecord,
   SidecarStatus,
@@ -15,6 +16,12 @@ export type BrowserPlatform = PlatformApi & {
 
 const initialStatus: SidecarStatus = { state: "ready", restartCount: 0, diagnostics: [] };
 const initialStorageHealth: StorageHealth = { status: "ready", recoverable: false };
+const browserPreviewCaptureProtection: CaptureProtectionStatus = {
+  state: "unsupported",
+  code: "browser_preview",
+};
+const captureProtectionRequiredMessage =
+  "Live mode is unavailable because screen capture protection could not be confirmed.";
 
 export function createBrowserPlatform(): BrowserPlatform {
   const sessions = new Map<string, SessionRecord>();
@@ -55,12 +62,22 @@ export function createBrowserPlatform(): BrowserPlatform {
     async storageHealth() {
       return cloneStorageHealth(storageHealth);
     },
+    async captureProtectionStatus() {
+      return { ...browserPreviewCaptureProtection };
+    },
     async send(command) {
-      commands.push(decodeEnvelope(command));
+      const decoded = decodeEnvelope(command);
+      if (commandRequiresCaptureProtection(decoded)) {
+        throw captureProtectionRequiredError();
+      }
+      commands.push(decoded);
     },
     async restartSidecar() {
       status = { state: "ready", restartCount: status.restartCount + 1, diagnostics: [] };
       return { ...status, diagnostics: [] };
+    },
+    async retryCaptureProtection() {
+      return { ...browserPreviewCaptureProtection };
     },
     async subscribe(listener) {
       listeners.add(listener);
@@ -161,6 +178,19 @@ function cloneStorageHealth(health: StorageHealth): StorageHealth {
     ...(health.message ? { message: health.message } : {}),
     recoverable: health.recoverable,
   };
+}
+
+function commandRequiresCaptureProtection(command: Envelope): boolean {
+  return command.kind === CommandKind.SESSION_START
+    || command.kind === CommandKind.QUERY_TRIGGER
+    || ((command.kind === CommandKind.LISTENING_SET || command.kind === CommandKind.AUDIO_SYSTEM_SET)
+      && command.payload.enabled === true);
+}
+
+function captureProtectionRequiredError(): Error & { code: "capture_protection_required" } {
+  return Object.assign(new Error(captureProtectionRequiredMessage), {
+    code: "capture_protection_required" as const,
+  });
 }
 
 function associateRequestWithTurn(
