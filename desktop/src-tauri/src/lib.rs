@@ -155,22 +155,38 @@ pub fn run() {
                 ),
             );
             capture_protection.reapply_and_verify();
-            main_window.on_window_event({
-                let capture_protection = capture_protection.clone();
-                move |event| {
-                    if matches!(event, tauri::WindowEvent::Focused(true)) {
-                        let capture_protection = capture_protection.clone();
-                        tauri::async_runtime::spawn(async move {
-                            capture_protection.reapply_and_verify_async().await;
-                        });
-                    }
-                }
-            });
-
             let state = state::AppState::new(app.handle().clone(), capture_protection)?;
             let sidecar = state.sidecar.clone();
             let app_handle = app.handle().clone();
             app.manage(state);
+            main_window.on_window_event({
+                let capture_protection = app_handle
+                    .state::<state::AppState>()
+                    .capture_protection
+                    .clone();
+                let app_handle = app_handle.clone();
+                move |event| {
+                    if matches!(event, tauri::WindowEvent::Focused(true)) {
+                        let capture_protection = capture_protection.clone();
+                        let sidecar = app_handle.state::<state::AppState>().sidecar.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let previous = capture_protection.status().state;
+                            let current = capture_protection.reapply_and_verify_async().await.state;
+                            if previous == capture_protection::CaptureProtectionState::Protected
+                                && current != capture_protection::CaptureProtectionState::Protected
+                            {
+                                if let Err(error) = sidecar.stop_for_capture_protection_loss().await
+                                {
+                                    eprintln!(
+                                        "capture protection loss stop failed: code={}",
+                                        error.code()
+                                    );
+                                }
+                            }
+                        });
+                    }
+                }
+            });
             tauri::async_runtime::spawn(async move {
                 let start = sidecar.start().await;
                 if !smoke_mode {

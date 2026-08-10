@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde::Serialize;
@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex};
 
 use crate::protocol::{
     encode_frame, validate_command, validate_event, CommandKind, Envelope, EventKind, FrameDecoder,
-    ProtocolKind, MAX_FRAME_BYTES,
+    ProtocolKind, MAX_FRAME_BYTES, MAX_SAFE_INTEGER, PROTOCOL_VERSION,
 };
 use crate::storage::{
     AppendEventResult, NewTimelineEvent, RepositoryError, RequestTurnAssociation,
@@ -37,6 +37,7 @@ const EVENT_SINK_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const PERSISTENCE_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(5);
+const CAPTURE_PROTECTION_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub fn packaged_sidecar_path(host_executable: &std::path::Path) -> std::path::PathBuf {
     let mut path = host_executable
@@ -500,6 +501,7 @@ struct SupervisorInner {
     data: AsyncMutex<SupervisorData>,
     lifecycle: AsyncMutex<()>,
     commands: AsyncMutex<()>,
+    capture_protection_stop: AsyncMutex<()>,
     delivery: AsyncMutex<DeliveryState>,
     launcher: Option<Arc<dyn SidecarLauncher>>,
     sink: Arc<dyn SidecarEventSink>,
@@ -536,6 +538,7 @@ impl SidecarSupervisor {
                 }),
                 lifecycle: AsyncMutex::new(()),
                 commands: AsyncMutex::new(()),
+                capture_protection_stop: AsyncMutex::new(()),
                 delivery: AsyncMutex::new(DeliveryState::default()),
                 launcher: None,
                 sink: Arc::new(NoopEventSink),
@@ -577,6 +580,7 @@ impl SidecarSupervisor {
                 data: AsyncMutex::new(SupervisorData::default()),
                 lifecycle: AsyncMutex::new(()),
                 commands: AsyncMutex::new(()),
+                capture_protection_stop: AsyncMutex::new(()),
                 delivery: AsyncMutex::new(DeliveryState::default()),
                 launcher: Some(launcher),
                 sink,
@@ -620,6 +624,55 @@ impl SidecarSupervisor {
     pub async fn send(&self, command: Envelope) -> Result<(), SidecarError> {
         self.send_with_authorization(command, async { Ok(()) })
             .await
+    }
+
+    pub async fn stop_for_capture_protection_loss(&self) -> Result<(), SidecarError> {
+        let _stop = self.inner.capture_protection_stop.lock().await;
+        let Some(session_id) = self.current_runtime_session().await else {
+            return Ok(());
+        };
+        let command = Envelope {
+            version: PROTOCOL_VERSION,
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: Some(session_id),
+            sequence: 0,
+            timestamp_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .try_into()
+                .unwrap_or(MAX_SAFE_INTEGER),
+            kind: CommandKind::SessionStop.into(),
+            payload: Default::default(),
+            correlation_id: None,
+        };
+
+        match tokio::time::timeout(
+            CAPTURE_PROTECTION_STOP_TIMEOUT,
+            self.dispatch_owned(command, None, async { Ok(()) }),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => self.shutdown_after_capture_protection_loss(error).await,
+            Err(_) => {
+                self.shutdown_after_capture_protection_loss(SidecarError::new(
+                    "sidecar_stop_timeout",
+                    "sidecar session stop timed out",
+                ))
+                .await
+            }
+        }
+    }
+
+    async fn shutdown_after_capture_protection_loss(
+        &self,
+        dispatch_error: SidecarError,
+    ) -> Result<(), SidecarError> {
+        match self.shutdown().await {
+            Ok(()) => Err(dispatch_error),
+            Err(shutdown_error) => Err(shutdown_error),
+        }
     }
 
     pub async fn send_with_authorization<A>(
@@ -2640,6 +2693,35 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct HangingStopPort {
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        kills: Arc<AtomicUsize>,
+        stop_started: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl SidecarPort for HangingStopPort {
+        async fn write(&self, bytes: Vec<u8>) -> Result<(), SidecarError> {
+            let mut decoder = FrameDecoder::new(MAX_FRAME_BYTES);
+            let command = decoder.push(&bytes).unwrap().pop().unwrap();
+            self.writes.lock().unwrap().push(bytes);
+            if matches!(
+                command.kind,
+                ProtocolKind::Command(CommandKind::SessionStop)
+            ) {
+                self.stop_started.notify_waiters();
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+
+        async fn kill(&self) -> Result<(), SidecarError> {
+            self.kills.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(())
+        }
+    }
+
     #[derive(Clone)]
     struct BlockingCommandPort {
         writes: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -4559,6 +4641,117 @@ mod tests {
                 .code(),
             "query_runtime_session_inactive"
         );
+    }
+
+    #[tokio::test]
+    async fn capture_protection_loss_sends_one_valid_stop_for_the_active_runtime() {
+        let port = FakeSidecarPort::default();
+        let supervisor = SidecarSupervisor::with_port(Arc::new(port.clone()));
+        supervisor
+            .accept_event(0, fixture_envelope())
+            .await
+            .unwrap();
+        supervisor
+            .send(session_start_command(SESSION_ID))
+            .await
+            .unwrap();
+        supervisor
+            .accept_event(0, runtime_session_event(SESSION_ID, "listening"))
+            .await
+            .unwrap();
+
+        let (first, second) = tokio::join!(
+            supervisor.stop_for_capture_protection_loss(),
+            supervisor.stop_for_capture_protection_loss(),
+        );
+        first.unwrap();
+        second.unwrap();
+
+        let stop_commands = port
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|bytes| FrameDecoder::new(MAX_FRAME_BYTES).push(bytes).unwrap())
+            .filter(|command| {
+                matches!(
+                    command.kind,
+                    ProtocolKind::Command(CommandKind::SessionStop)
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(stop_commands.len(), 1);
+        let stop = &stop_commands[0];
+        assert_eq!(stop.version, PROTOCOL_VERSION);
+        assert!(uuid::Uuid::parse_str(&stop.id).is_ok());
+        assert_eq!(stop.session_id.as_deref(), Some(SESSION_ID));
+        assert_eq!(stop.payload, Map::new());
+        assert!(stop.timestamp_ms > 0);
+        assert!(crate::protocol::validate_command(stop).is_ok());
+        assert_eq!(supervisor.current_runtime_session().await, None);
+    }
+
+    #[tokio::test]
+    async fn capture_protection_loss_write_failure_shuts_down_the_active_runtime() {
+        let port = ToggleWriteFailurePort::new(true);
+        let supervisor = SidecarSupervisor::with_port(Arc::new(port.clone()));
+        supervisor
+            .accept_event(0, fixture_envelope())
+            .await
+            .unwrap();
+        supervisor
+            .send(session_start_command(SESSION_ID))
+            .await
+            .unwrap();
+        supervisor
+            .accept_event(0, runtime_session_event(SESSION_ID, "listening"))
+            .await
+            .unwrap();
+        port.set_fail_writes(true);
+
+        assert_eq!(
+            supervisor
+                .stop_for_capture_protection_loss()
+                .await
+                .unwrap_err()
+                .code(),
+            "sidecar_write_failed"
+        );
+        assert_eq!(supervisor.status().await.state, SidecarState::Stopped);
+        assert_eq!(supervisor.current_runtime_session().await, None);
+    }
+
+    #[tokio::test]
+    async fn capture_protection_loss_hanging_stop_shuts_down_the_active_runtime() {
+        let port = HangingStopPort::default();
+        let supervisor = SidecarSupervisor::with_port(Arc::new(port.clone()));
+        supervisor
+            .accept_event(0, fixture_envelope())
+            .await
+            .unwrap();
+        supervisor
+            .send(session_start_command(SESSION_ID))
+            .await
+            .unwrap();
+        supervisor
+            .accept_event(0, runtime_session_event(SESSION_ID, "listening"))
+            .await
+            .unwrap();
+
+        let stop_started = port.stop_started.notified();
+        let stop = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.stop_for_capture_protection_loss().await }
+        });
+        stop_started.await;
+
+        assert_eq!(
+            stop.await.unwrap().unwrap_err().code(),
+            "sidecar_stop_timeout"
+        );
+        assert_eq!(port.kills.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(supervisor.status().await.state, SidecarState::Stopped);
+        assert_eq!(supervisor.current_runtime_session().await, None);
     }
 
     #[tokio::test]
