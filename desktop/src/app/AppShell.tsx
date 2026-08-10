@@ -3,8 +3,10 @@ import { type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { NavLink } from "react-router-dom";
 import { HealthIndicator } from "../components/HealthIndicator";
+import { CaptureProtectionIndicator } from "../components/CaptureProtectionIndicator";
 import { IconButton } from "../components/IconButton";
 import "../i18n";
+import { useRuntime } from "./RuntimeProvider";
 
 type AppShellProps = {
   children?: ReactNode;
@@ -19,6 +21,7 @@ const modes = [
 
 export function AppShell({ children }: AppShellProps) {
   const { t } = useTranslation();
+  const { captureProtection, retryCaptureProtection } = useRuntime();
 
   return (
     <div className="app-shell">
@@ -58,6 +61,10 @@ export function AppShell({ children }: AppShellProps) {
       </main>
       <footer className="app-shell__statusbar">
         <HealthIndicator label={t("health.connected")} state="healthy" />
+        <CaptureProtectionIndicator
+          captureProtection={captureProtection}
+          onRetry={() => void retryCaptureProtection()}
+        />
       </footer>
     </div>
   );

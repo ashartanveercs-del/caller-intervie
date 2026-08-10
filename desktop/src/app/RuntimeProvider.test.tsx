@@ -1,9 +1,9 @@
 import { StrictMode } from "react";
-import { act, render, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { EventKind, type Envelope } from "../shared/protocol";
 import { CommandKind } from "../shared/protocol";
-import type { PlatformApi, SessionRecord, SidecarStatus, StorageHealth } from "../platform";
+import type { CaptureProtectionStatus, PlatformApi, SessionRecord, SidecarStatus, StorageHealth } from "../platform";
 import { RuntimeProvider, useRuntime } from "./RuntimeProvider";
 
 const sessionId = "018f0000-0000-7000-8000-000000000001";
@@ -67,6 +67,12 @@ function Consumer() {
   return <button onClick={() => void runtime.restart()}>restart</button>;
 }
 
+function CaptureProtectionConsumer({ onRuntime }: { onRuntime(runtime: ReturnType<typeof useRuntime>): void }) {
+  const runtime = useRuntime();
+  onRuntime(runtime);
+  return <output>{runtime.captureProtection.state}</output>;
+}
+
 function session(id: string): SessionRecord {
   return {
     id,
@@ -112,6 +118,80 @@ function query(sessionId: string, requestId = "018f0000-0000-7000-8000-000000000
 }
 
 describe("RuntimeProvider", () => {
+  it("starts capture protection as applying and resolves the authoritative platform status", async () => {
+    const platform = fakePlatform();
+    const protection = deferred<{ state: "protected" }>();
+    vi.mocked(platform.captureProtectionStatus).mockReturnValueOnce(protection.promise);
+
+    render(
+      <RuntimeProvider platform={platform}>
+        <CaptureProtectionConsumer onRuntime={() => undefined} />
+      </RuntimeProvider>,
+    );
+
+    expect(screen.getByText("applying")).toBeVisible();
+    await act(async () => {
+      protection.resolve({ state: "protected" });
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText("protected")).toBeVisible();
+  });
+
+  it("deduplicates unavailable capture protection retries and safely restores unavailable on rejection", async () => {
+    const platform = fakePlatform();
+    const retry = deferred<{ state: "protected" }>();
+    vi.mocked(platform.captureProtectionStatus).mockResolvedValueOnce({ state: "unavailable" });
+    vi.mocked(platform.retryCaptureProtection).mockReturnValueOnce(retry.promise);
+    let runtime: ReturnType<typeof useRuntime> | undefined;
+
+    render(
+      <RuntimeProvider platform={platform}>
+        <CaptureProtectionConsumer onRuntime={(value) => { runtime = value; }} />
+      </RuntimeProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByText("unavailable")).toBeVisible());
+    let first!: Promise<CaptureProtectionStatus>;
+    let second!: Promise<CaptureProtectionStatus>;
+    act(() => {
+      first = runtime!.retryCaptureProtection();
+      second = runtime!.retryCaptureProtection();
+    });
+
+    expect(first).toBe(second);
+    expect(platform.retryCaptureProtection).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("applying")).toBeVisible();
+
+    await act(async () => {
+      retry.reject(new Error("protection unavailable"));
+      await Promise.all([first, second]);
+    });
+
+    expect(screen.getByText("unavailable")).toBeVisible();
+  });
+
+  it("ignores a capture protection status that resolves after unmount", async () => {
+    const platform = fakePlatform();
+    const protection = deferred<{ state: "protected" }>();
+    vi.mocked(platform.captureProtectionStatus).mockReturnValueOnce(protection.promise);
+    let runtime: ReturnType<typeof useRuntime> | undefined;
+    const view = render(
+      <RuntimeProvider platform={platform}>
+        <CaptureProtectionConsumer onRuntime={(value) => { runtime = value; }} />
+      </RuntimeProvider>,
+    );
+
+    view.unmount();
+    await act(async () => {
+      protection.resolve({ state: "protected" });
+      await Promise.resolve();
+    });
+
+    expect(view.container).toBeEmptyDOMElement();
+    expect(runtime?.captureProtection).toEqual({ state: "applying" });
+  });
+
   it("subscribes and unsubscribes exactly once under StrictMode", async () => {
     const platform = fakePlatform();
     let runtime: ReturnType<typeof useRuntime> | undefined;

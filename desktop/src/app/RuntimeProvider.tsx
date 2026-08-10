@@ -1,7 +1,13 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { StoreApi } from "zustand/vanilla";
 import { CommandKind, type Envelope } from "../shared/protocol";
-import { createPlatform, type PlatformApi, type SidecarStatus, type StorageHealth } from "../platform";
+import {
+  createPlatform,
+  type CaptureProtectionStatus,
+  type PlatformApi,
+  type SidecarStatus,
+  type StorageHealth,
+} from "../platform";
 import { createSessionStore, type SessionStoreState } from "../stores/sessionStore";
 
 type RuntimeContextValue = {
@@ -9,6 +15,8 @@ type RuntimeContextValue = {
   store: StoreApi<SessionStoreState>;
   send(command: Envelope, questionTurnId?: string): Promise<void>;
   restart(): Promise<SidecarStatus | null>;
+  captureProtection: CaptureProtectionStatus;
+  retryCaptureProtection(): Promise<CaptureProtectionStatus>;
 };
 
 type SubscriptionLifecycle = {
@@ -48,6 +56,10 @@ export function RuntimeProvider({ children, platform: suppliedPlatform }: Runtim
   const storageHealthLifecycleRef = useRef<StorageHealthLifecycle | null>(null);
   const restoreLifecycleRef = useRef<RestoreLifecycle | null>(null);
   const startedRef = useRef(false);
+  const captureProtectionRequestRef = useRef(0);
+  const captureProtectionRetryRef = useRef<Promise<CaptureProtectionStatus> | null>(null);
+  const mountedRef = useRef(false);
+  const [captureProtection, setCaptureProtection] = useState<CaptureProtectionStatus>({ state: "applying" });
 
   if (!platformRef.current) {
     platformRef.current = suppliedPlatform ?? createPlatform();
@@ -58,6 +70,34 @@ export function RuntimeProvider({ children, platform: suppliedPlatform }: Runtim
 
   const platform = platformRef.current;
   const store = storeRef.current;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    const request = ++captureProtectionRequestRef.current;
+    let active = true;
+
+    void platform.captureProtectionStatus()
+      .then((status) => {
+        if (active && request === captureProtectionRequestRef.current) {
+          setCaptureProtection(status);
+        }
+      })
+      .catch(() => {
+        if (active && request === captureProtectionRequestRef.current) {
+          setCaptureProtection({ state: "unavailable" });
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [platform]);
 
   useEffect(() => {
     let lifecycle = restoreLifecycleRef.current;
@@ -264,7 +304,47 @@ export function RuntimeProvider({ children, platform: suppliedPlatform }: Runtim
     }
   }, [platform, store]);
 
-  const value = useMemo<RuntimeContextValue>(() => ({ platform, store, send, restart }), [platform, restart, send, store]);
+  const retryCaptureProtection = useCallback(() => {
+    if (captureProtectionRetryRef.current) {
+      return captureProtectionRetryRef.current;
+    }
+
+    const request = ++captureProtectionRequestRef.current;
+    if (mountedRef.current) {
+      setCaptureProtection({ state: "applying" });
+    }
+    const retry = platform.retryCaptureProtection()
+      .then((status) => {
+        if (mountedRef.current && request === captureProtectionRequestRef.current) {
+          setCaptureProtection(status);
+        }
+        return status;
+      })
+      .catch(() => {
+        const status: CaptureProtectionStatus = { state: "unavailable" };
+        if (mountedRef.current && request === captureProtectionRequestRef.current) {
+          setCaptureProtection(status);
+        }
+        return status;
+      });
+
+    captureProtectionRetryRef.current = retry;
+    void retry.finally(() => {
+      if (captureProtectionRetryRef.current === retry) {
+        captureProtectionRetryRef.current = null;
+      }
+    });
+    return retry;
+  }, [platform]);
+
+  const value = useMemo<RuntimeContextValue>(() => ({
+    platform,
+    store,
+    send,
+    restart,
+    captureProtection,
+    retryCaptureProtection,
+  }), [captureProtection, platform, restart, retryCaptureProtection, send, store]);
 
   return <RuntimeContext.Provider value={value}>{children}</RuntimeContext.Provider>;
 }

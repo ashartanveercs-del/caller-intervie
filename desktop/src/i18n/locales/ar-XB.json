@@ -16,6 +16,14 @@
   "health": {
     "connected": "[[ R~unti~me c~onne~cted ]]"
   },
+  "captureProtection": {
+    "protected": "[[ C~aptu~re p~rote~cted ]]",
+    "applying": "[[ C~hecki~ng c~aptu~re p~rote~ction ]]",
+    "unavailable": "[[ C~aptu~re p~rote~ction u~navai~lable ]]",
+    "desktopAppRequired": "[[ L~ive m~ode r~equi~res t~he d~eskto~p a~pp ]]",
+    "liveBlocked": "[[ L~ive m~ode i~s b~locke~d b~ecau~se s~creen c~aptu~re p~rote~ction c~ould n~ot b~e c~onfir~med. ]]",
+    "retry": "[[ R~etry c~aptu~re p~rote~ction ]]"
+  },
   "home": {
     "title": "[[ I~nte~rvie~w w~orks~pace ]]",
     "description": "[[ P~repa~re a~nd r~un a s~truc~ture~d i~nte~rvie~w s~essi~on. ]]"

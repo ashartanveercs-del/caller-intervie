@@ -16,6 +16,14 @@
   "health": {
     "connected": "Runtime connected"
   },
+  "captureProtection": {
+    "protected": "Capture protected",
+    "applying": "Checking capture protection",
+    "unavailable": "Capture protection unavailable",
+    "desktopAppRequired": "Live mode requires the desktop app",
+    "liveBlocked": "Live mode is blocked because screen capture protection could not be confirmed.",
+    "retry": "Retry capture protection"
+  },
   "home": {
     "title": "Interview workspace",
     "description": "Prepare and run a structured interview session."

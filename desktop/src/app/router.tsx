@@ -1,6 +1,8 @@
-import { createBrowserRouter, Outlet, useParams } from "react-router-dom";
+import { createBrowserRouter, Outlet, type RouteObject, useParams } from "react-router-dom";
 import { useTranslation } from "react-i18next";
+import { RotateCw } from "lucide-react";
 import { AppShell } from "./AppShell";
+import { useRuntime } from "./RuntimeProvider";
 
 function AppLayout() {
   return (
@@ -30,6 +32,31 @@ function PrepareRoute() {
 
 function LiveRoute() {
   const { t } = useTranslation();
+  const { captureProtection, retryCaptureProtection } = useRuntime();
+
+  if (captureProtection.state !== "protected") {
+    const message = captureProtection.state === "unsupported"
+      ? t("captureProtection.desktopAppRequired")
+      : captureProtection.state === "unavailable"
+        ? t("captureProtection.liveBlocked")
+        : t("captureProtection.applying");
+
+    return (
+      <section className="live-blocker" role="alert">
+        <p>{message}</p>
+        {captureProtection.state === "unavailable" ? (
+          <button
+            onClick={() => void retryCaptureProtection()}
+            title={t("captureProtection.retry")}
+            type="button"
+          >
+            <RotateCw aria-hidden="true" size={16} strokeWidth={1.8} />
+            {t("captureProtection.retry")}
+          </button>
+        ) : null}
+      </section>
+    );
+  }
 
   return <RouteView description={t("live.description")} title={t("live.title")} />;
 }
@@ -54,7 +81,7 @@ function RouteView({ title, description }: RouteViewProps) {
   );
 }
 
-export const router = createBrowserRouter([
+export const routes: RouteObject[] = [
   {
     element: <AppLayout />,
     children: [
@@ -64,4 +91,6 @@ export const router = createBrowserRouter([
       { path: "/review/:sessionId", element: <ReviewRoute /> },
     ],
   },
-]);
+];
+
+export const router = createBrowserRouter(routes);
