@@ -13,12 +13,6 @@ from dotenv import load_dotenv
 
 from ai_assistant.config import Config
 from ai_assistant.core.events import EventType
-from ai_assistant.runtime import (
-    RuntimeConfigurationError,
-    RuntimeStateError,
-    SessionConfig,
-    build_runtime,
-)
 from ai_assistant.ui.app import AssistantApp
 
 logger = logging.getLogger(__name__)
@@ -122,6 +116,13 @@ def _setup_logging() -> None:
 
 async def async_main() -> None:
     # Logging + dotenv are initialised once in main() before the loop starts.
+    from ai_assistant.runtime import (
+        RuntimeConfigurationError,
+        RuntimeStateError,
+        SessionConfig,
+        build_runtime,
+    )
+
     config = Config.from_env()
 
     if not config.deepgram_api_key:
@@ -352,14 +353,15 @@ def main() -> None:
 
     try:
         import qasync
-        loop = qasync.QEventLoop(qt_app)
-        asyncio.set_event_loop(loop)
-
-        with loop:
-            loop.run_until_complete(async_main())
     except ImportError:
         logger.error("qasync is required: pip install qasync")
         sys.exit(1)
+
+    loop = qasync.QEventLoop(qt_app)
+    asyncio.set_event_loop(loop)
+
+    with loop:
+        loop.run_until_complete(async_main())
 
 
 if __name__ == "__main__":

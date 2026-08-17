@@ -2,12 +2,16 @@
 
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 import subprocess
 import sys
 import textwrap
 import threading
+import types
+
+import pytest
 
 import ai_assistant.main as main
 
@@ -54,6 +58,54 @@ def test_qt_about_to_quit_awaits_runtime_shutdown() -> None:
 
     runtime = asyncio.run(scenario())
     assert runtime.stop_calls == 1
+
+
+def test_runtime_import_error_is_not_reported_as_missing_qasync(
+    monkeypatch, caplog
+) -> None:
+    class FakeApplication:
+        @classmethod
+        def instance(cls):
+            return None
+
+        def __init__(self, _arguments) -> None:
+            pass
+
+        def setQuitOnLastWindowClosed(self, _enabled: bool) -> None:
+            pass
+
+    class FakeLoop:
+        def __init__(self, _application) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
+            pass
+
+        def run_until_complete(self, awaitable) -> None:
+            asyncio.run(awaitable)
+
+    async def failing_async_main() -> None:
+        raise ImportError("runtime dependency unavailable")
+
+    qasync = types.ModuleType("qasync")
+    qasync.QEventLoop = FakeLoop
+    qt_widgets = types.ModuleType("PySide6.QtWidgets")
+    qt_widgets.QApplication = FakeApplication
+    monkeypatch.setitem(sys.modules, "qasync", qasync)
+    monkeypatch.setitem(sys.modules, "PySide6.QtWidgets", qt_widgets)
+    monkeypatch.setattr(main, "_setup_logging", lambda: None)
+    monkeypatch.setattr(main, "load_dotenv", lambda: None)
+    monkeypatch.setattr(main.asyncio, "set_event_loop", lambda _loop: None)
+    monkeypatch.setattr(main, "async_main", failing_async_main)
+
+    with caplog.at_level(logging.ERROR, logger=main.__name__):
+        with pytest.raises(ImportError, match="runtime dependency unavailable"):
+            main.main()
+
+    assert "qasync is required" not in caplog.text
 
 
 def test_real_tray_quit_drains_runtime_before_qt_exits() -> None:
