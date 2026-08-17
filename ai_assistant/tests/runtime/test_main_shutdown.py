@@ -60,6 +60,42 @@ def test_qt_about_to_quit_awaits_runtime_shutdown() -> None:
     assert runtime.stop_calls == 1
 
 
+def test_importing_entrypoint_keeps_runtime_backends_lazy() -> None:
+    script = textwrap.dedent(
+        """
+        import json
+        import sys
+
+        import ai_assistant.main
+
+        modules = (
+            "ai_assistant.runtime",
+            "ai_assistant.audio.pipeline",
+            "anthropic",
+        )
+        print("RESULT=" + json.dumps({name: name in sys.modules for name in modules}))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[3],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    result_line = next(
+        line for line in result.stdout.splitlines() if line.startswith("RESULT=")
+    )
+    assert json.loads(result_line.removeprefix("RESULT=")) == {
+        "ai_assistant.runtime": False,
+        "ai_assistant.audio.pipeline": False,
+        "anthropic": False,
+    }
+
+
 def test_runtime_import_error_is_not_reported_as_missing_qasync(
     monkeypatch, caplog
 ) -> None:
