@@ -457,6 +457,15 @@ git commit -m "feat: show fail-closed capture protection status"
 - Consumes all prior tasks.
 - Produces recorded Windows affinity, capture-tool, regression, release, and macOS CI evidence.
 
+**Scope amendment (2026-08-17):** This task closes the Windows implementation and branch-integration
+gate. The current host cannot verify Zoom, OBS, or macOS. The named third-party capture-app matrix
+and macOS verification remain required pre-GA platform gates before making support claims, but do
+not block integration of the verified Windows implementation. No result permits a claim of universal
+capture invisibility. The aggregate Rust command is scoped to `--lib` because the standalone
+`storage` target duplicates the same 93 tests already compiled into the library target.
+The clean-exit rerun uses the shipped release profile and four bounded test workers; the identical
+library suite already passed serially in the debug profile.
+
 - [ ] **Step 1: Run complete automated verification**
 
 ~~~powershell
@@ -464,7 +473,7 @@ cargo fmt --manifest-path desktop/src-tauri/Cargo.toml -- --check
 pnpm --dir desktop test --run
 pnpm --dir desktop build
 python -m pytest ai_assistant/tests -q
-.\desktop\src-tauri\scripts\windows-native-build.ps1 -CargoArguments @('test','--manifest-path','desktop/src-tauri/Cargo.toml','--','--test-threads=1')
+.\desktop\src-tauri\scripts\windows-native-build.ps1 -CargoArguments @('test','--release','--manifest-path','desktop/src-tauri/Cargo.toml','--lib','--','--test-threads=4')
 .\desktop\src-tauri\scripts\windows-native-build.ps1 -CargoArguments @('clippy','--release','--manifest-path','desktop/src-tauri/Cargo.toml','--all-targets','--','-D','warnings')
 .\desktop\src-tauri\scripts\windows-native-build.ps1 -CargoArguments @('build','--release','--manifest-path','desktop/src-tauri/Cargo.toml')
 ~~~
@@ -475,11 +484,17 @@ Expected: every command exits zero and Clippy emits no warnings.
 
 Launch the newly built app, invoke capture_protection_status, and require state protected. Independently query the main HWND with GetWindowDisplayAffinity and require decimal 17. Record executable hash, Windows build, and status.
 
-- [ ] **Step 3: Perform capture-tool acceptance**
+- [ ] **Step 3: Perform Windows capture acceptance**
 
-Share the entire display in Zoom, Teams, and Google Meet; record with OBS; capture with Snipping Tool. Confirm CallerInterview is omitted or replaced by protected-content treatment. Use a test target returning Unavailable and confirm no protected command reaches the sidecar.
+Capture the protected window with an independent Windows screen-copy path and confirm
+CallerInterview is omitted or replaced by protected-content treatment. Use a test target returning
+Unavailable and confirm no protected command reaches the sidecar.
 
-- [ ] **Step 4: Verify macOS on supported CI or a clean machine**
+Pre-GA manual gate: share the entire display in Zoom, Teams, and Google Meet; record with OBS;
+capture with Snipping Tool. Record exact app versions and results. Leave each tool unclaimed until
+it has been exercised on the release artifact.
+
+- [ ] **Step 4: Keep the macOS platform gate explicit**
 
 Run tests, release build, and native NSWindow sharingType == None assertion. Record macOS and capture-app versions. Do not mark macOS supported without this evidence.
 

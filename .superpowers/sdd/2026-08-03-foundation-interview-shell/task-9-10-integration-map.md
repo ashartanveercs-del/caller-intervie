@@ -160,6 +160,8 @@ Keep protocol runtime state separate from the persisted session status. In parti
   its library target: 220 passed, 0 failed, in 5747.42s. It was intentionally interrupted as
   Cargo began the separately declared `storage` target, because Cargo.toml points that target
   directly to `src/storage/mod.rs`, duplicating the same 93 storage tests with no added coverage.
+  The amended release-profile `--lib` command then passed 220/220, 0 failed, in 73.73s of test
+  execution with four bounded workers, and the complete native-wrapper command exited zero.
 - Exact release artifact: SHA-256
   `FD761B79195D74EF2808FDF72818AB1A9454069A4A48C864D78203BA3DFA29BD`;
   Windows build `22631`. The exact newly built executable was launched, and an independent
@@ -167,13 +169,19 @@ Keep protocol runtime state separate from the persisted session status. In parti
   PID with `GetWindowDisplayAffinity == 17` (`WDA_EXCLUDEFROMCAPTURE`). The process was closed;
   no HWND was retained.
 - Controller evidence: desktop Vitest passed 93/93 (30.33s); desktop production build passed
-  (1,935 modules, 22.73s); Python focused shutdown tests passed 3/3 and full
-  `ai_assistant/tests` passed 129/129 (113.80s), with one pre-existing unawaited
-  `AsyncClient.aclose` warning.
-- Capture-tool acceptance is unverified: no ordinary PowerShell endpoint exists for
-  `capture_protection_status`; it was not inferred. Snipping Tool and Teams are installed but
+  (1,935 modules, 22.73s); Python focused shutdown tests passed 4/4 (9.26s) and full
+  `ai_assistant/tests` passed 130/130 (117.00s) with no warning summary. The exact release app's
+  React provider invoked `capture_protection_status` on mount; Windows UI Automation found the
+  resulting status element with exact accessible label `Capture protected`, proving the
+  end-to-end app-reported controller state.
+- Focused fail-closed acceptance passed 1/1: an Unavailable capture target prevented the
+  protected dispatch closure from running, returned `capture_protection_required`, stopped the
+  active sidecar runtime, and cleared runtime authorization.
+- Third-party capture-tool acceptance is unverified. Snipping Tool and Teams are installed but
   were not exercised, while OBS and Zoom are not installed. Google Meet and macOS capture/CI
-  evidence were unavailable, so macOS remains unclaimed.
+  evidence were unavailable, so macOS remains unclaimed. These remain pre-GA platform gates and
+  cannot support claims for those tools or macOS; they do not block integration of the verified
+  Windows implementation.
 - Additional controller acceptance used only the Windows `System.Drawing.Graphics.CopyFromScreen`
   `SourceCopy` path. It launched the exact release executable, selected exactly one visible
   ownerless `CallerInterview` window for its launched process, reconfirmed affinity 17, and
