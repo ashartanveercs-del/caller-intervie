@@ -679,12 +679,12 @@ fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTimelineEve
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AssociateRequestResult, QueryDispatchAuthorization, RepositoryError, SessionRepository,
-    };
-    use crate::storage::{
+    use super::super::{
         AppendEventResult, ModelError, NewSession, NewSessionBrief, NewTimelineEvent,
         RequestTurnAssociation, SessionStatus, TimelineEventKind,
+    };
+    use super::{
+        AssociateRequestResult, QueryDispatchAuthorization, RepositoryError, SessionRepository,
     };
     use rusqlite::{params, ErrorCode};
     use serde_json::json;

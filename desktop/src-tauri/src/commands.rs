@@ -441,7 +441,6 @@ where
             "session_start_not_active",
             "The durable session is missing or no longer active.",
         )),
-        _ => Err(unavailable()),
     }
 }
 

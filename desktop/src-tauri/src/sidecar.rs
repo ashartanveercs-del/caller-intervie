@@ -877,10 +877,11 @@ impl SidecarSupervisor {
             let mut first_error = None;
             let mut accepted_events = Vec::new();
             for event in envelopes {
-                let accepted = match {
+                let accepted_result = {
                     let mut data = self.inner.data.lock().await;
                     self.accept_event_locked(&mut data, generation, event)
-                } {
+                };
+                let accepted = match accepted_result {
                     Ok(accepted) => accepted,
                     Err(error) => {
                         first_error.get_or_insert(error);
@@ -2254,6 +2255,7 @@ fn spawn_persistence_attempt(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_persistence_worker(
     workspace_id: String,
     store: Arc<dyn DurableEventStore>,
@@ -6105,7 +6107,7 @@ mod tests {
         assert_eq!(error.code(), "storage_event_collision");
         assert_eq!(
             downstream.events.lock().unwrap().as_slice(),
-            &[original.clone()]
+            std::slice::from_ref(&original)
         );
         assert!(health.reports.lock().unwrap().iter().any(|report| {
             report.code == Some("storage_event_collision") && !report.recoverable
@@ -6117,13 +6119,14 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(250), store.persisted.notified())
             .await
             .expect("the original event must persist after the store recovers");
-        let stored = store.events.lock().unwrap();
-        assert_eq!(stored.len(), 1);
-        assert_eq!(
-            stored[0].source_sequence,
-            i64::try_from(original.sequence).unwrap()
-        );
-        drop(stored);
+        {
+            let stored = store.events.lock().unwrap();
+            assert_eq!(stored.len(), 1);
+            assert_eq!(
+                stored[0].source_sequence,
+                i64::try_from(original.sequence).unwrap()
+            );
+        }
         sink.shutdown().await.unwrap();
     }
 
