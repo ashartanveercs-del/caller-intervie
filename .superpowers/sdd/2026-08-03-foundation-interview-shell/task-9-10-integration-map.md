@@ -174,3 +174,10 @@ Keep protocol runtime state separate from the persisted session status. In parti
   `capture_protection_status`; it was not inferred. Snipping Tool and Teams are installed but
   were not exercised, while OBS and Zoom are not installed. Google Meet and macOS capture/CI
   evidence were unavailable, so macOS remains unclaimed.
+- Additional controller acceptance used only the Windows `System.Drawing.Graphics.CopyFromScreen`
+  `SourceCopy` path. It launched the exact release executable, selected exactly one visible
+  ownerless `CallerInterview` window for its launched process, reconfirmed affinity 17, and
+  captured that window rectangle. Visual inspection showed the underlying desktop across the
+  full crop with no CallerInterview content; the app closed cleanly. This confirms exclusion
+  only for that screen-copy API and does not verify Snipping Tool, Teams, Google Meet, OBS,
+  Zoom, or macOS.

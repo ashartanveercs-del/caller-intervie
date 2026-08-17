@@ -38,7 +38,18 @@ Snipping Tool and Teams are installed but were not exercised. OBS and Zoom are n
 Google Meet was not exercised. macOS CI/runtime and native sharingType evidence were unavailable,
 so macOS is unclaimed.
 
+## Windows screen-copy acceptance
+
+Controller verification launched the exact release executable, selected exactly one visible
+ownerless `CallerInterview` window for its launched process, and reconfirmed
+`GetWindowDisplayAffinity == 17`. It captured only that window's screen rectangle with
+`System.Drawing.Graphics.CopyFromScreen` using `SourceCopy`. Visual inspection found the
+underlying desktop across the entire crop and no CallerInterview content, confirming exclusion
+for this Windows screen-copy capture API. The app then closed cleanly. This result does not
+cover Snipping Tool, Teams, Google Meet, OBS, Zoom, or macOS; all remain unverified.
+
 ## Commits
 
 - `3c4a4ac` `fix: resolve Rust warning gate`
-- Evidence commit follows this report.
+- `5b58f72` `docs: record capture exclusion verification`
+- Windows screen-copy evidence commit follows this report.
