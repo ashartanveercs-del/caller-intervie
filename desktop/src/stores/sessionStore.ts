@@ -1,6 +1,6 @@
 import { createStore, type StoreApi } from "zustand/vanilla";
 import { decodeEnvelope, EventKind, type Envelope } from "../shared/protocol";
-import type { SessionRecord, SessionStatus, SidecarStatus, StorageHealth } from "../platform";
+import type { SessionBrief, SessionRecord, SessionStatus, SidecarStatus, StorageHealth } from "../platform";
 
 export type RuntimeHealthStatus = "unknown" | "pending" | "ready" | "degraded" | "error" | "offline";
 
@@ -82,6 +82,7 @@ export type SessionStoreState = {
   cancelRestoreReplay(): void;
   clearTransientState(): void;
   setLanguages(languages: SessionLanguages): void;
+  updateSessionBrief(sessionId: string, brief: SessionBrief): void;
   setSidecarStatus(status: SidecarStatus): void;
   setStorageHealth(health: StorageHealth): void;
   recordError(error: unknown): void;
@@ -304,6 +305,11 @@ export function createSessionStore(): StoreApi<SessionStoreState> {
       setLanguages(languages) {
         if (collectingRestoreEvents) restoreLanguagesChanged = true;
         set({ languages });
+      },
+      updateSessionBrief(sessionId, brief) {
+        set((state) => state.session?.id === sessionId
+          ? { session: { ...state.session, brief } }
+          : {});
       },
       setSidecarStatus(status) {
         set((state) => ({

@@ -13,10 +13,10 @@ type AppShellProps = {
 };
 
 const modes = [
-  { key: "interview", href: "/" },
-  { key: "sales", href: "/prepare/sales" },
-  { key: "meeting", href: "/prepare/meeting" },
-  { key: "presentation", href: "/prepare/presentation" },
+  { key: "interview", href: "/", releaseState: "available" },
+  { key: "sales", href: "/prepare/sales", releaseState: "planned" },
+  { key: "meeting", href: "/prepare/meeting", releaseState: "planned" },
+  { key: "presentation", href: "/prepare/presentation", releaseState: "planned" },
 ] as const;
 
 export function AppShell({ children }: AppShellProps) {
@@ -28,14 +28,20 @@ export function AppShell({ children }: AppShellProps) {
       <header className="app-shell__topbar">
         <h1 className="app-shell__brand">{t("app.name")}</h1>
         <nav aria-label={t("app.navigation")} className="app-shell__modes">
-          {modes.map(({ key, href }) => (
-            <NavLink
-              className="app-shell__mode-link"
-              key={key}
-              to={href}
-            >
+          {modes.map(({ key, href, releaseState }) => releaseState === "available" ? (
+            <NavLink className="app-shell__mode-link" key={key} to={href}>
               {t(`modes.${key}`)}
             </NavLink>
+          ) : (
+            <span
+              aria-disabled="true"
+              className="app-shell__mode-link app-shell__mode-link--disabled"
+              key={key}
+              role="link"
+              title={t("home.planned.label")}
+            >
+              {t(`modes.${key}`)}
+            </span>
           ))}
         </nav>
         <div className="app-shell__actions">

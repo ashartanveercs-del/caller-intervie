@@ -1,6 +1,10 @@
-import { createBrowserRouter, Outlet, type RouteObject, useParams } from "react-router-dom";
+import { createBrowserRouter, Outlet, type RouteObject } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { RotateCw } from "lucide-react";
+import { HomePage } from "../features/home/HomePage";
+import { LivePage } from "../features/live/LivePage";
+import { InterviewPreparePage } from "../features/prepare/InterviewPreparePage";
+import { ReviewPage } from "../features/review/ReviewPage";
 import { AppShell } from "./AppShell";
 import { useRuntime } from "./RuntimeProvider";
 
@@ -9,24 +13,6 @@ function AppLayout() {
     <AppShell>
       <Outlet />
     </AppShell>
-  );
-}
-
-function HomeRoute() {
-  const { t } = useTranslation();
-
-  return <RouteView description={t("home.description")} title={t("home.title")} />;
-}
-
-function PrepareRoute() {
-  const { mode = "interview" } = useParams();
-  const { t } = useTranslation();
-
-  return (
-    <RouteView
-      description={t("prepare.description")}
-      title={t("prepare.title", { mode: t(`modes.${mode}`) })}
-    />
   );
 }
 
@@ -58,37 +44,17 @@ function LiveRoute() {
     );
   }
 
-  return <RouteView description={t("live.description")} title={t("live.title")} />;
-}
-
-function ReviewRoute() {
-  const { t } = useTranslation();
-
-  return <RouteView description={t("review.description")} title={t("review.title")} />;
-}
-
-type RouteViewProps = {
-  title: string;
-  description: string;
-};
-
-function RouteView({ title, description }: RouteViewProps) {
-  return (
-    <section className="route-view">
-      <h2>{title}</h2>
-      <p>{description}</p>
-    </section>
-  );
+  return <LivePage />;
 }
 
 export const routes: RouteObject[] = [
   {
     element: <AppLayout />,
     children: [
-      { index: true, element: <HomeRoute /> },
-      { path: "/prepare/:mode", element: <PrepareRoute /> },
+      { index: true, element: <HomePage /> },
+      { path: "/prepare/interview", element: <InterviewPreparePage /> },
       { path: "/live/:sessionId", element: <LiveRoute /> },
-      { path: "/review/:sessionId", element: <ReviewRoute /> },
+      { path: "/review/:sessionId", element: <ReviewPage /> },
     ],
   },
 ];

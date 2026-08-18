@@ -89,6 +89,17 @@ a:focus-visible {
   font-weight: 600;
 }
 
+.app-shell__mode-link--disabled {
+  color: var(--color-ink-muted);
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+.app-shell__mode-link--disabled:hover {
+  color: var(--color-ink-muted);
+  background: transparent;
+}
+
 .app-shell__actions {
   display: flex;
   flex: 0 0 auto;
@@ -280,6 +291,10 @@ a:focus-visible {
 
   .app-shell__mode-link {
     padding-inline: var(--space-2);
+  }
+
+  .app-shell__mode-link--disabled {
+    display: none;
   }
 
   .app-shell__content {

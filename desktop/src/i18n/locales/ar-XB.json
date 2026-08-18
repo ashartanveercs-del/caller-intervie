@@ -24,20 +24,342 @@
     "liveBlocked": "[[ L~ive m~ode i~s b~locke~d b~ecau~se s~creen c~aptu~re p~rote~ction c~ould n~ot b~e c~onfir~med. ]]",
     "retry": "[[ R~etry c~aptu~re p~rote~ction ]]"
   },
+  "common": {
+    "retry": "[[ R~etry ]]",
+    "close": "[[ C~lose ]]"
+  },
+  "languages": {
+    "names": {
+      "en": "[[ E~ngli~sh ]]",
+      "ur": "[[ U~rdu ]]",
+      "ar": "[[ A~rabi~c ]]",
+      "hi": "[[ H~indi ]]",
+      "es": "[[ S~pani~sh ]]",
+      "fr": "[[ F~renc~h ]]",
+      "de": "[[ G~erma~n ]]",
+      "pt": "[[ P~ortu~gues~e ]]"
+    }
+  },
   "home": {
     "title": "[[ I~nte~rvie~w w~orks~pace ]]",
-    "description": "[[ P~repa~re a~nd r~un a s~truc~ture~d i~nte~rvie~w s~essi~on. ]]"
+    "description": "[[ P~repa~re a~nd r~un a s~truc~ture~d i~nte~rvie~w s~essi~on. ]]",
+    "eyebrow": "[[ C~onve~rsat~ion w~orks~pace ]]",
+    "modeActions": "[[ S~tart a c~onve~rsat~ion ]]",
+    "actions": {
+      "startInterview": "[[ S~tart I~nte~rvie~w ]]",
+      "startSales": "[[ S~tart S~ale~s C~all ]]",
+      "startMeeting": "[[ S~tart M~eeti~ng ]]",
+      "startPresentation": "[[ S~tart P~rese~ntat~ion ]]"
+    },
+    "available": {
+      "label": "[[ A~vaila~ble ]]"
+    },
+    "planned": {
+      "label": "[[ P~lanne~d ]]",
+      "description": "[[ I~nte~rvie~w i~s a~vaila~ble n~ow. T~his w~orkf~low i~s b~eing p~repa~red f~or a l~ater r~elea~se. ]]",
+      "interview": {
+        "title": "[[ I~nte~rvie~w i~s a~vaila~ble ]]"
+      },
+      "sales": {
+        "title": "[[ S~ale~s C~all i~s c~omin~g s~oon ]]"
+      },
+      "meeting": {
+        "title": "[[ M~eeti~ng m~ode i~s c~omin~g s~oon ]]"
+      },
+      "presentation": {
+        "title": "[[ P~rese~ntat~ion m~ode i~s c~omin~g s~oon ]]"
+      }
+    },
+    "recent": {
+      "title": "[[ R~ecen~t s~essi~ons ]]",
+      "description": "[[ R~esum~e a~ctiv~e w~ork o~r r~evie~w a f~inis~hed s~essi~on. ]]",
+      "loading": "[[ L~oadi~ng r~ecen~t s~essi~ons... ]]",
+      "error": "[[ R~ecen~t s~essi~ons c~ould n~ot b~e l~oade~d. ]]",
+      "empty": "[[ S~tart a~n i~nte~rvie~w t~o c~reat~e y~our f~irst s~essi~on. ]]",
+      "resume": "[[ R~esum~e ]]",
+      "review": "[[ R~evie~w ]]",
+      "resumeLabel": "[[ R~esum~e {{mode}} s~essi~on ]]",
+      "reviewLabel": "[[ R~evie~w {{mode}} s~essi~on ]]",
+      "status": {
+        "active": "[[ A~ctiv~e ]]",
+        "completed": "[[ C~ompl~eted ]]",
+        "interrupted": "[[ I~nter~rupt~ed ]]"
+      }
+    }
   },
   "prepare": {
     "title": "[[ P~repa~re {{mode}} s~essi~on ]]",
-    "description": "[[ S~et t~he s~essi~on b~rief b~efor~e g~oing l~ive. ]]"
+    "description": "[[ S~et t~he s~essi~on b~rief b~efor~e g~oing l~ive. ]]",
+    "back": "[[ B~ack t~o H~ome ]]",
+    "interview": {
+      "eyebrow": "[[ I~nte~rvie~w ]]",
+      "title": "[[ P~repa~re f~or y~our i~nte~rvie~w ]]",
+      "description": "[[ A~dd w~hat y~ou k~now n~ow. E~very c~onte~xt f~ield i~s o~ptio~nal f~or Q~uick S~tart. ]]"
+    },
+    "errors": {
+      "title": "[[ I~nte~rvie~w c~ould n~ot s~tart ]]",
+      "invalidBrief": "[[ R~evie~w t~he h~ighl~ight~ed p~repa~rati~on d~etai~ls a~nd t~ry a~gain. ]]",
+      "captureProtection": "[[ C~onfi~rm s~cree~n-c~aptu~re p~rote~ction i~n t~he d~eskto~p a~pp, t~hen t~ry a~gain. ]]",
+      "runtime": "[[ C~heck t~he r~unti~me c~onne~ction a~nd p~rovi~der c~onfi~gura~tion, t~hen t~ry a~gain. ]]"
+    },
+    "steps": {
+      "context": "[[ 1. C~onte~xt ]]",
+      "knowledge": "[[ 2. K~nowl~edge ]]",
+      "briefing": "[[ 3. B~rief~ing ]]"
+    },
+    "context": {
+      "title": "[[ I~nte~rvie~w c~onte~xt ]]",
+      "role": "[[ T~arge~t r~ole ]]",
+      "rolePlaceholder": "[[ e.g. S~enio~r p~rodu~ct d~esig~ner ]]",
+      "company": "[[ C~ompa~ny ]]",
+      "companyPlaceholder": "[[ e.g. A~cme ]]",
+      "stage": "[[ I~nte~rvie~w s~tage ]]",
+      "stagePlaceholder": "[[ e.g. H~irin~g m~anag~er r~ound ]]"
+    },
+    "knowledge": {
+      "title": "[[ G~roun~d y~our a~nswe~rs ]]",
+      "resume": "[[ R~esum~e ]]",
+      "jobDescription": "[[ J~ob d~escr~ipti~on ]]",
+      "stories": "[[ S~tory v~ault ]]",
+      "noStories": "[[ N~o s~aved s~tori~es a~re a~vaila~ble y~et. Q~uick S~tart s~till w~orks. ]]"
+    },
+    "briefing": {
+      "title": "[[ S~hape y~our g~uida~nce ]]",
+      "interviewType": "[[ I~nte~rvie~w t~ype ]]",
+      "answerStyle": "[[ A~nswe~r s~tyle ]]",
+      "guidance": "[[ C~usto~m g~uida~nce ]]",
+      "guidancePlaceholder": "[[ O~ptio~nal t~one, s~truc~ture, o~r t~opic~s t~o e~mpha~size ]]"
+    },
+    "interviewTypes": {
+      "mixed": "[[ M~ixed i~nte~rvie~w ]]",
+      "behavioral": "[[ B~ehav~iora~l ]]",
+      "technical": "[[ T~echn~ical ]]",
+      "coding": "[[ C~odin~g ]]",
+      "system-design": "[[ S~yste~m d~esig~n ]]",
+      "case": "[[ C~ase i~nte~rvie~w ]]",
+      "phone": "[[ P~hone s~cree~n ]]",
+      "panel": "[[ P~anel ]]",
+      "one-way": "[[ O~ne-w~ay i~nte~rvie~w ]]"
+    },
+    "answerStyles": {
+      "concise": "[[ C~onci~se b~ulle~ts ]]",
+      "natural": "[[ N~atur~al s~poke~n r~espo~nse ]]",
+      "star": "[[ S~TAR r~espo~nse ]]",
+      "detailed": "[[ D~etai~led r~espo~nse ]]",
+      "technical": "[[ T~echn~ical e~xpla~nati~on ]]",
+      "coding": "[[ C~odin~g p~lan ]]",
+      "system-design": "[[ S~yste~m-d~esig~n s~truc~ture ]]",
+      "case": "[[ C~ase f~rame~work ]]",
+      "executive": "[[ E~xecu~tive s~umma~ry ]]"
+    },
+    "languages": {
+      "title": "[[ L~angu~ages ]]",
+      "description": "[[ C~hoos~e w~hat y~ou h~ear s~epar~atel~y f~rom t~he l~angu~age u~sed f~or s~ugge~stio~ns a~nd r~evie~w. ]]",
+      "interface": "[[ I~nter~face l~angu~age ]]",
+      "spoken": "[[ S~poke~n l~angu~age ]]",
+      "auto": "[[ D~etec~t a~utom~atic~ally ]]",
+      "suggestion": "[[ S~ugge~stio~n l~angu~age ]]",
+      "review": "[[ R~evie~w l~angu~age ]]"
+    },
+    "readiness": {
+      "title": "[[ S~essi~on r~eadi~ness ]]",
+      "ready": "[[ Y~ou c~an s~tart n~ow. O~ptio~nal c~onte~xt m~akes s~ugge~stio~ns m~ore p~erso~nal. ]]",
+      "complete": "[[ Y~our c~ore i~nte~rvie~w c~onte~xt i~s r~eady. ]]",
+      "gaps": {
+        "role": "[[ A~dd a t~arge~t r~ole f~or m~ore r~elev~ant s~ugge~stio~ns. ]]",
+        "company": "[[ A~dd t~he c~ompa~ny f~or b~ette~r c~onte~xt. ]]",
+        "resume": "[[ A~ttac~h a r~esum~e t~o g~roun~d a~nswe~rs i~n y~our e~xper~ienc~e. ]]",
+        "jobDescription": "[[ A~ttac~h t~he j~ob d~escr~ipti~on t~o f~ocus l~ikel~y q~uest~ions. ]]",
+        "story": "[[ S~elec~t a s~tory t~o s~tren~gthe~n e~vide~nce-b~ased a~nswe~rs. ]]"
+      }
+    },
+    "quickStart": "[[ Q~uick S~tart u~ses y~our l~angu~age a~nd f~orma~t c~hoic~es e~ven w~itho~ut a~dded c~onte~xt. ]]",
+    "starting": "[[ S~tart~ing... ]]",
+    "start": "[[ S~tart i~nte~rvie~w ]]"
   },
   "live": {
     "title": "[[ L~ive s~essi~on ]]",
-    "description": "[[ T~he l~ive c~onve~rsat~ion w~orks~pace w~ill a~ppea~r h~ere. ]]"
+    "description": "[[ T~he l~ive c~onve~rsat~ion w~orks~pace w~ill a~ppea~r h~ere. ]]",
+    "blockers": {
+      "capture": {
+        "title": "[[ L~ive u~navai~lable ]]",
+        "unavailable": "[[ L~ive i~s b~locke~d u~ntil c~aptu~re p~rote~ction i~s c~onfir~med. ]]",
+        "unsupported": "[[ L~ive r~equi~res t~he p~rote~cted d~eskto~p w~indo~w; b~rows~er p~revi~ew c~anno~t s~tart a s~essi~on. ]]",
+        "applying": "[[ C~onfi~rmin~g c~aptu~re p~rote~ction b~efor~e L~ive c~an s~tart. ]]",
+        "retry": "[[ R~etry c~aptu~re p~rote~ction ]]"
+      },
+      "noActive": {
+        "title": "[[ N~o a~ctiv~e s~essi~on ]]",
+        "message": "[[ R~etur~n t~o p~repa~rati~on a~nd s~tart a s~essi~on b~efor~e o~peni~ng L~ive. ]]"
+      },
+      "sessionMismatch": {
+        "title": "[[ L~ive s~essi~on u~navai~lable ]]",
+        "message": "[[ T~his L~ive l~ink d~oes n~ot m~atch t~he a~ctiv~e s~essi~on. ]]"
+      }
+    },
+    "toolbar": {
+      "label": "[[ L~ive s~essi~on c~ontro~ls ]]",
+      "pause": "[[ P~ause l~iste~ning ]]",
+      "resume": "[[ R~esum~e l~iste~ning ]]",
+      "manual": {
+        "label": "[[ A~sk m~anua~lly ]]",
+        "placeholder": "[[ A~sk t~he c~opil~ot ]]",
+        "submit": "[[ A~sk ]]"
+      },
+      "answerFormat": {
+        "label": "[[ A~nswe~r f~orma~t ]]",
+        "concise": "[[ C~onci~se ]]",
+        "detailed": "[[ D~etai~led ]]"
+      },
+      "addNote": "[[ A~dd n~ote ]]",
+      "closeNote": "[[ C~lose n~ote ]]",
+      "pin": "[[ P~in c~urre~nt q~uest~ion ]]",
+      "unpin": "[[ U~npin c~urre~nt q~uest~ion ]]",
+      "copy": "[[ C~opy c~urre~nt a~nswe~r ]]",
+      "end": "[[ E~nd s~essi~on ]]",
+      "ending": "[[ E~ndin~g s~essi~on ]]"
+    },
+    "question": {
+      "current": "[[ C~urre~nt q~uest~ion ]]",
+      "manual": "[[ M~anua~l p~romp~t ]]",
+      "waiting": "[[ L~iste~ning f~or t~he n~ext q~uest~ion... ]]",
+      "listening": "[[ L~iste~ning... ]]"
+    },
+    "answer": {
+      "suggested": "[[ S~ugge~sted a~nswe~r ]]",
+      "generating": "[[ G~ener~atin~g ]]",
+      "waitingForQuestion": "[[ A~n a~nswe~r w~ill a~ppea~r w~hen a q~uest~ion i~s r~eady. ]]",
+      "preparing": "[[ P~repa~ring a~n a~nswe~r... ]]",
+      "expandDetails": "[[ E~xpan~d a~nswe~r d~etai~ls ]]",
+      "showConcise": "[[ S~how c~onci~se a~nswe~r ]]",
+      "updates": "[[ A~nswe~r u~pdat~es ]]",
+      "ready": "[[ A~nswe~r r~eady ]]",
+      "previous": "[[ P~revi~ous a~nswe~rs ]]",
+      "expandPrevious": "[[ E~xpan~d {{ordinal}} a~nswe~r ]]",
+      "ordinals": {
+        "first": "[[ f~irst ]]",
+        "second": "[[ s~econ~d ]]",
+        "third": "[[ t~hird ]]",
+        "other": "[[ {{count}}t~h ]]"
+      }
+    },
+    "notes": {
+      "draftLabel": "[[ N~ote d~raft ]]",
+      "sessionNote": "[[ S~essi~on n~ote ]]",
+      "cancel": "[[ C~ance~l ]]",
+      "saving": "[[ S~avin~g... ]]",
+      "keep": "[[ K~eep d~raft ]]"
+    },
+    "transcript": {
+      "show": "[[ S~how t~rans~crip~t ]]",
+      "hide": "[[ H~ide t~rans~crip~t ]]",
+      "timeline": "[[ T~rans~crip~t t~imel~ine ]]",
+      "live": "[[ L~ive ]]",
+      "empty": "[[ T~rans~crip~t w~ill a~ppea~r h~ere. ]]",
+      "speakers": {
+        "interviewer": "[[ I~nte~rvie~wer ]]",
+        "you": "[[ Y~ou ]]",
+        "manual": "[[ M~anua~l p~romp~t ]]",
+        "default": "[[ S~peak~er ]]"
+      }
+    },
+    "health": {
+      "label": "[[ L~ive r~unti~me h~ealt~h ]]",
+      "dependencies": {
+        "microphone": "[[ M~icro~phon~e ]]",
+        "systemAudio": "[[ S~yste~m a~udio ]]",
+        "transcription": "[[ T~rans~crip~tion ]]",
+        "aiProvider": "[[ A~I p~rovi~der ]]"
+      },
+      "status": {
+        "ready": "[[ R~eady ]]",
+        "pending": "[[ S~tart~ing ]]",
+        "degraded": "[[ D~egra~ded ]]",
+        "error": "[[ E~rror ]]",
+        "offline": "[[ O~ffli~ne ]]",
+        "unknown": "[[ U~nkno~wn ]]"
+      },
+      "statusDescription": {
+        "ready": "[[ r~eady ]]",
+        "pending": "[[ s~tart~ing ]]",
+        "degraded": "[[ d~egra~ded ]]",
+        "error": "[[ i~n e~rror ]]",
+        "offline": "[[ o~ffli~ne ]]",
+        "unknown": "[[ u~nkno~wn ]]"
+      },
+      "accessible": "[[ {{dependency}}: {{status}} ]]",
+      "accessibleWithMessage": "[[ {{dependency}}: {{status}}. {{message}} ]]",
+      "issue": {
+        "message": "[[ {{message}}. T~rans~crip~t a~nd s~essi~on c~ontro~ls r~emai~n a~vaila~ble. ]]",
+        "status": "[[ {{dependency}} i~s {{status}}. T~rans~crip~t a~nd s~essi~on c~ontro~ls r~emai~n a~vaila~ble. ]]"
+      },
+      "retry": "[[ R~etry r~unti~me ]]"
+    },
+    "status": {
+      "pinned": "[[ G~uida~nce p~inne~d ]]",
+      "unpinned": "[[ G~uida~nce u~npin~ned ]]",
+      "copied": "[[ A~nswe~r c~opie~d ]]",
+      "savedNotes_one": "[[ {{count}} s~aved n~ote ]]",
+      "savedNotes_other": "[[ {{count}} s~aved n~otes ]]",
+      "action": "[[ L~ive a~ctio~n s~tatu~s ]]",
+      "actionFailed": "[[ L~ive a~ctio~n f~aile~d ]]",
+      "runtimeError": "[[ R~unti~me e~rror ]]"
+    },
+    "errors": {
+      "clipboardUnavailable": "[[ C~lipb~oard a~cces~s i~s u~navai~lable ]]",
+      "sidecarUnavailable": "[[ S~idec~ar u~navai~lable ]]",
+      "stopTimeout": "[[ T~imed o~ut w~aiti~ng f~or t~he s~essi~on t~o s~top ]]",
+      "listeningControl": "[[ L~iste~ning c~ontro~l c~ould n~ot b~e c~hang~ed. ]]",
+      "manualPrompt": "[[ P~romp~t c~ould n~ot b~e s~ent. Y~ou c~an r~etry w~itho~ut r~etyp~ing i~t. ]]"
+    }
   },
   "review": {
     "title": "[[ S~essi~on r~evie~w ]]",
-    "description": "[[ T~he r~ecor~ded s~essi~on t~imel~ine w~ill a~ppea~r h~ere. ]]"
+    "description": "[[ T~he r~ecor~ded s~essi~on t~imel~ine w~ill a~ppea~r h~ere. ]]",
+    "eyebrow": "[[ S~aved s~essi~on ]]",
+    "loading": "[[ L~oadi~ng r~evie~w... ]]",
+    "backHome": "[[ B~ack t~o H~ome ]]",
+    "errors": {
+      "title": "[[ R~evie~w u~navai~lable ]]",
+      "missingSession": "[[ T~his r~evie~w l~ink i~s m~issi~ng a s~essi~on. ]]",
+      "load": "[[ T~he s~aved s~essi~on c~ould n~ot b~e l~oade~d. ]]"
+    },
+    "metadata": {
+      "mode": "[[ M~ode ]]",
+      "spokenLanguage": "[[ S~poke~n l~angu~age ]]",
+      "suggestionLanguage": "[[ S~ugge~stio~n l~angu~age ]]",
+      "reviewLanguage": "[[ R~evie~w l~angu~age ]]"
+    },
+    "transcript": {
+      "title": "[[ O~rigi~nal t~rans~crip~t ]]",
+      "description": "[[ W~hat w~as h~eard, i~n i~ts o~rigi~nal l~angu~age. ]]",
+      "empty": "[[ N~o f~inal t~rans~crip~t w~as s~aved. ]]"
+    },
+    "suggestions": {
+      "title": "[[ A~I s~ugge~stio~ns ]]",
+      "description": "[[ G~ener~ated g~uida~nce, k~ept s~epar~ate f~rom t~he o~rigi~nal t~rans~crip~t. ]]",
+      "empty": "[[ N~o c~ompl~eted s~ugge~stio~ns w~ere s~aved. ]]"
+    },
+    "notes": {
+      "title": "[[ S~essi~on n~otes ]]",
+      "description": "[[ N~otes y~ou s~aved w~hile t~he c~onve~rsat~ion w~as l~ive. ]]"
+    },
+    "pins": {
+      "title": "[[ P~inne~d g~uida~nce ]]",
+      "description": "[[ Q~uest~ions a~nd c~ompl~eted g~uida~nce y~ou m~arke~d f~or f~ollo~w-u~p. ]]"
+    },
+    "translations": {
+      "title": "[[ G~ener~ated t~rans~lati~ons ]]",
+      "description": "[[ G~ener~ated t~rans~lati~on f~or r~evie~w; t~he o~rigi~nal r~emai~ns u~ncha~nged a~bove. ]]"
+    },
+    "interruptions": {
+      "title": "[[ R~unti~me i~nter~rupt~ions ]]",
+      "description": "[[ I~ssue~s r~ecor~ded w~hile t~he s~essi~on w~as a~ctiv~e. ]]"
+    },
+    "status": {
+      "active": "[[ A~ctiv~e ]]",
+      "completed": "[[ C~ompl~eted ]]",
+      "interrupted": "[[ I~nter~rupt~ed ]]"
+    }
   }
 }

@@ -24,20 +24,342 @@
     "liveBlocked": "Live mode is blocked because screen capture protection could not be confirmed.",
     "retry": "Retry capture protection"
   },
+  "common": {
+    "retry": "Retry",
+    "close": "Close"
+  },
+  "languages": {
+    "names": {
+      "en": "English",
+      "ur": "Urdu",
+      "ar": "Arabic",
+      "hi": "Hindi",
+      "es": "Spanish",
+      "fr": "French",
+      "de": "German",
+      "pt": "Portuguese"
+    }
+  },
   "home": {
     "title": "Interview workspace",
-    "description": "Prepare and run a structured interview session."
+    "description": "Prepare and run a structured interview session.",
+    "eyebrow": "Conversation workspace",
+    "modeActions": "Start a conversation",
+    "actions": {
+      "startInterview": "Start Interview",
+      "startSales": "Start Sales Call",
+      "startMeeting": "Start Meeting",
+      "startPresentation": "Start Presentation"
+    },
+    "available": {
+      "label": "Available"
+    },
+    "planned": {
+      "label": "Planned",
+      "description": "Interview is available now. This workflow is being prepared for a later release.",
+      "interview": {
+        "title": "Interview is available"
+      },
+      "sales": {
+        "title": "Sales Call is coming soon"
+      },
+      "meeting": {
+        "title": "Meeting mode is coming soon"
+      },
+      "presentation": {
+        "title": "Presentation mode is coming soon"
+      }
+    },
+    "recent": {
+      "title": "Recent sessions",
+      "description": "Resume active work or review a finished session.",
+      "loading": "Loading recent sessions...",
+      "error": "Recent sessions could not be loaded.",
+      "empty": "Start an interview to create your first session.",
+      "resume": "Resume",
+      "review": "Review",
+      "resumeLabel": "Resume {{mode}} session",
+      "reviewLabel": "Review {{mode}} session",
+      "status": {
+        "active": "Active",
+        "completed": "Completed",
+        "interrupted": "Interrupted"
+      }
+    }
   },
   "prepare": {
     "title": "Prepare {{mode}} session",
-    "description": "Set the session brief before going live."
+    "description": "Set the session brief before going live.",
+    "back": "Back to Home",
+    "interview": {
+      "eyebrow": "Interview",
+      "title": "Prepare for your interview",
+      "description": "Add what you know now. Every context field is optional for Quick Start."
+    },
+    "errors": {
+      "title": "Interview could not start",
+      "invalidBrief": "Review the highlighted preparation details and try again.",
+      "captureProtection": "Confirm screen-capture protection in the desktop app, then try again.",
+      "runtime": "Check the runtime connection and provider configuration, then try again."
+    },
+    "steps": {
+      "context": "1. Context",
+      "knowledge": "2. Knowledge",
+      "briefing": "3. Briefing"
+    },
+    "context": {
+      "title": "Interview context",
+      "role": "Target role",
+      "rolePlaceholder": "e.g. Senior product designer",
+      "company": "Company",
+      "companyPlaceholder": "e.g. Acme",
+      "stage": "Interview stage",
+      "stagePlaceholder": "e.g. Hiring manager round"
+    },
+    "knowledge": {
+      "title": "Ground your answers",
+      "resume": "Resume",
+      "jobDescription": "Job description",
+      "stories": "Story vault",
+      "noStories": "No saved stories are available yet. Quick Start still works."
+    },
+    "briefing": {
+      "title": "Shape your guidance",
+      "interviewType": "Interview type",
+      "answerStyle": "Answer style",
+      "guidance": "Custom guidance",
+      "guidancePlaceholder": "Optional tone, structure, or topics to emphasize"
+    },
+    "interviewTypes": {
+      "mixed": "Mixed interview",
+      "behavioral": "Behavioral",
+      "technical": "Technical",
+      "coding": "Coding",
+      "system-design": "System design",
+      "case": "Case interview",
+      "phone": "Phone screen",
+      "panel": "Panel",
+      "one-way": "One-way interview"
+    },
+    "answerStyles": {
+      "concise": "Concise bullets",
+      "natural": "Natural spoken response",
+      "star": "STAR response",
+      "detailed": "Detailed response",
+      "technical": "Technical explanation",
+      "coding": "Coding plan",
+      "system-design": "System-design structure",
+      "case": "Case framework",
+      "executive": "Executive summary"
+    },
+    "languages": {
+      "title": "Languages",
+      "description": "Choose what you hear separately from the language used for suggestions and review.",
+      "interface": "Interface language",
+      "spoken": "Spoken language",
+      "auto": "Detect automatically",
+      "suggestion": "Suggestion language",
+      "review": "Review language"
+    },
+    "readiness": {
+      "title": "Session readiness",
+      "ready": "You can start now. Optional context makes suggestions more personal.",
+      "complete": "Your core interview context is ready.",
+      "gaps": {
+        "role": "Add a target role for more relevant suggestions.",
+        "company": "Add the company for better context.",
+        "resume": "Attach a resume to ground answers in your experience.",
+        "jobDescription": "Attach the job description to focus likely questions.",
+        "story": "Select a story to strengthen evidence-based answers."
+      }
+    },
+    "quickStart": "Quick Start uses your language and format choices even without added context.",
+    "starting": "Starting...",
+    "start": "Start interview"
   },
   "live": {
     "title": "Live session",
-    "description": "The live conversation workspace will appear here."
+    "description": "The live conversation workspace will appear here.",
+    "blockers": {
+      "capture": {
+        "title": "Live unavailable",
+        "unavailable": "Live is blocked until capture protection is confirmed.",
+        "unsupported": "Live requires the protected desktop window; browser preview cannot start a session.",
+        "applying": "Confirming capture protection before Live can start.",
+        "retry": "Retry capture protection"
+      },
+      "noActive": {
+        "title": "No active session",
+        "message": "Return to preparation and start a session before opening Live."
+      },
+      "sessionMismatch": {
+        "title": "Live session unavailable",
+        "message": "This Live link does not match the active session."
+      }
+    },
+    "toolbar": {
+      "label": "Live session controls",
+      "pause": "Pause listening",
+      "resume": "Resume listening",
+      "manual": {
+        "label": "Ask manually",
+        "placeholder": "Ask the copilot",
+        "submit": "Ask"
+      },
+      "answerFormat": {
+        "label": "Answer format",
+        "concise": "Concise",
+        "detailed": "Detailed"
+      },
+      "addNote": "Add note",
+      "closeNote": "Close note",
+      "pin": "Pin current question",
+      "unpin": "Unpin current question",
+      "copy": "Copy current answer",
+      "end": "End session",
+      "ending": "Ending session"
+    },
+    "question": {
+      "current": "Current question",
+      "manual": "Manual prompt",
+      "waiting": "Listening for the next question...",
+      "listening": "Listening..."
+    },
+    "answer": {
+      "suggested": "Suggested answer",
+      "generating": "Generating",
+      "waitingForQuestion": "An answer will appear when a question is ready.",
+      "preparing": "Preparing an answer...",
+      "expandDetails": "Expand answer details",
+      "showConcise": "Show concise answer",
+      "updates": "Answer updates",
+      "ready": "Answer ready",
+      "previous": "Previous answers",
+      "expandPrevious": "Expand {{ordinal}} answer",
+      "ordinals": {
+        "first": "first",
+        "second": "second",
+        "third": "third",
+        "other": "{{count}}th"
+      }
+    },
+    "notes": {
+      "draftLabel": "Note draft",
+      "sessionNote": "Session note",
+      "cancel": "Cancel",
+      "saving": "Saving...",
+      "keep": "Keep draft"
+    },
+    "transcript": {
+      "show": "Show transcript",
+      "hide": "Hide transcript",
+      "timeline": "Transcript timeline",
+      "live": "Live",
+      "empty": "Transcript will appear here.",
+      "speakers": {
+        "interviewer": "Interviewer",
+        "you": "You",
+        "manual": "Manual prompt",
+        "default": "Speaker"
+      }
+    },
+    "health": {
+      "label": "Live runtime health",
+      "dependencies": {
+        "microphone": "Microphone",
+        "systemAudio": "System audio",
+        "transcription": "Transcription",
+        "aiProvider": "AI provider"
+      },
+      "status": {
+        "ready": "Ready",
+        "pending": "Starting",
+        "degraded": "Degraded",
+        "error": "Error",
+        "offline": "Offline",
+        "unknown": "Unknown"
+      },
+      "statusDescription": {
+        "ready": "ready",
+        "pending": "starting",
+        "degraded": "degraded",
+        "error": "in error",
+        "offline": "offline",
+        "unknown": "unknown"
+      },
+      "accessible": "{{dependency}}: {{status}}",
+      "accessibleWithMessage": "{{dependency}}: {{status}}. {{message}}",
+      "issue": {
+        "message": "{{message}}. Transcript and session controls remain available.",
+        "status": "{{dependency}} is {{status}}. Transcript and session controls remain available."
+      },
+      "retry": "Retry runtime"
+    },
+    "status": {
+      "pinned": "Guidance pinned",
+      "unpinned": "Guidance unpinned",
+      "copied": "Answer copied",
+      "savedNotes_one": "{{count}} saved note",
+      "savedNotes_other": "{{count}} saved notes",
+      "action": "Live action status",
+      "actionFailed": "Live action failed",
+      "runtimeError": "Runtime error"
+    },
+    "errors": {
+      "clipboardUnavailable": "Clipboard access is unavailable",
+      "sidecarUnavailable": "Sidecar unavailable",
+      "stopTimeout": "Timed out waiting for the session to stop",
+      "listeningControl": "Listening control could not be changed.",
+      "manualPrompt": "Prompt could not be sent. You can retry without retyping it."
+    }
   },
   "review": {
     "title": "Session review",
-    "description": "The recorded session timeline will appear here."
+    "description": "The recorded session timeline will appear here.",
+    "eyebrow": "Saved session",
+    "loading": "Loading review...",
+    "backHome": "Back to Home",
+    "errors": {
+      "title": "Review unavailable",
+      "missingSession": "This review link is missing a session.",
+      "load": "The saved session could not be loaded."
+    },
+    "metadata": {
+      "mode": "Mode",
+      "spokenLanguage": "Spoken language",
+      "suggestionLanguage": "Suggestion language",
+      "reviewLanguage": "Review language"
+    },
+    "transcript": {
+      "title": "Original transcript",
+      "description": "What was heard, in its original language.",
+      "empty": "No final transcript was saved."
+    },
+    "suggestions": {
+      "title": "AI suggestions",
+      "description": "Generated guidance, kept separate from the original transcript.",
+      "empty": "No completed suggestions were saved."
+    },
+    "notes": {
+      "title": "Session notes",
+      "description": "Notes you saved while the conversation was live."
+    },
+    "pins": {
+      "title": "Pinned guidance",
+      "description": "Questions and completed guidance you marked for follow-up."
+    },
+    "translations": {
+      "title": "Generated translations",
+      "description": "Generated translation for review; the original remains unchanged above."
+    },
+    "interruptions": {
+      "title": "Runtime interruptions",
+      "description": "Issues recorded while the session was active."
+    },
+    "status": {
+      "active": "Active",
+      "completed": "Completed",
+      "interrupted": "Interrupted"
+    }
   }
 }

@@ -16,6 +16,7 @@ function fakePlatform(): PlatformApi {
     restartSidecar: vi.fn().mockResolvedValue({ state: "ready", restartCount: 0, diagnostics: [] }),
     subscribe: vi.fn().mockResolvedValue(() => undefined),
     subscribeStorageHealth: vi.fn().mockResolvedValue(() => undefined),
+    subscribeCaptureProtection: vi.fn().mockResolvedValue(() => undefined),
     associateRequestWithTurn: vi.fn().mockResolvedValue(undefined),
     getRequestTurnAssociations: vi.fn().mockResolvedValue([]),
     createSession: vi.fn(),
@@ -60,16 +61,15 @@ describe("AppShell", () => {
     expect(screen.getByRole("button", { name: "Open settings" })).toBeVisible();
   });
 
-  it("navigates modes through the router and updates the active mode", () => {
+  it("keeps planned modes visible without exposing broken navigation", () => {
     const router = renderAppShell();
+    const sales = screen.getByRole("link", { name: "Sales" });
 
-    fireEvent.click(screen.getByRole("link", { name: "Sales" }));
+    fireEvent.click(sales);
 
-    expect(router.state.location.pathname).toBe("/prepare/sales");
-    expect(screen.getByRole("link", { name: "Sales" })).toHaveAttribute(
-      "aria-current",
-      "page",
-    );
+    expect(router.state.location.pathname).toBe("/");
+    expect(sales).toHaveAttribute("aria-disabled", "true");
+    expect(sales).not.toHaveAttribute("href");
   });
 
   it("sets document direction from the active locale", async () => {
