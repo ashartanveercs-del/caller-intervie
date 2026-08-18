@@ -42,6 +42,15 @@ type StorageHealthLifecycle = {
   ready: Promise<void>;
 };
 
+type CaptureProtectionLifecycle = {
+  users: number;
+  disposed: boolean;
+  releaseTimer: ReturnType<typeof setTimeout> | null;
+  unlisten: (() => void) | null;
+  eventRevision: number;
+  ready: Promise<void>;
+};
+
 const RuntimeContext = createContext<RuntimeContextValue | null>(null);
 
 export type RuntimeProviderProps = {
@@ -54,6 +63,7 @@ export function RuntimeProvider({ children, platform: suppliedPlatform }: Runtim
   const storeRef = useRef<StoreApi<SessionStoreState> | null>(null);
   const lifecycleRef = useRef<SubscriptionLifecycle | null>(null);
   const storageHealthLifecycleRef = useRef<StorageHealthLifecycle | null>(null);
+  const captureProtectionLifecycleRef = useRef<CaptureProtectionLifecycle | null>(null);
   const restoreLifecycleRef = useRef<RestoreLifecycle | null>(null);
   const startedRef = useRef(false);
   const captureProtectionRequestRef = useRef(0);
@@ -79,24 +89,65 @@ export function RuntimeProvider({ children, platform: suppliedPlatform }: Runtim
   }, []);
 
   useEffect(() => {
-    const request = ++captureProtectionRequestRef.current;
-    let active = true;
-
-    void platform.captureProtectionStatus()
-      .then((status) => {
-        if (active && request === captureProtectionRequestRef.current) {
+    let lifecycle = captureProtectionLifecycleRef.current;
+    if (!lifecycle) {
+      lifecycle = {
+        users: 0,
+        disposed: false,
+        releaseTimer: null,
+        unlisten: null,
+        eventRevision: 0,
+        ready: Promise.resolve(),
+      };
+      lifecycle.ready = platform.subscribeCaptureProtection((status) => {
+        lifecycle!.eventRevision += 1;
+        captureProtectionRequestRef.current += 1;
+        if (isSubscriptionActive(lifecycle!)) {
           setCaptureProtection(status);
         }
       })
-      .catch(() => {
-        if (active && request === captureProtectionRequestRef.current) {
-          setCaptureProtection({ state: "unavailable" });
-        }
-      });
+        .then(async (unlisten) => {
+          lifecycle!.unlisten = unlisten;
+          if (!isSubscriptionActive(lifecycle!)) {
+            unlisten();
+            lifecycle!.unlisten = null;
+            return;
+          }
+          const eventRevision = lifecycle!.eventRevision;
+          const request = ++captureProtectionRequestRef.current;
+          try {
+            const status = await platform.captureProtectionStatus();
+            if (
+              isSubscriptionActive(lifecycle!)
+              && lifecycle!.eventRevision === eventRevision
+              && request === captureProtectionRequestRef.current
+            ) {
+              setCaptureProtection(status);
+            }
+          } catch {
+            if (
+              isSubscriptionActive(lifecycle!)
+              && lifecycle!.eventRevision === eventRevision
+              && request === captureProtectionRequestRef.current
+            ) {
+              setCaptureProtection({ state: "unavailable" });
+            }
+          }
+        })
+        .catch(() => {
+          if (isSubscriptionActive(lifecycle!)) {
+            setCaptureProtection({ state: "unavailable" });
+          }
+        });
+      captureProtectionLifecycleRef.current = lifecycle;
+    }
+    lifecycle.users += 1;
+    if (lifecycle.releaseTimer !== null) {
+      clearTimeout(lifecycle.releaseTimer);
+      lifecycle.releaseTimer = null;
+    }
 
-    return () => {
-      active = false;
-    };
+    return () => releaseSubscriptionLifecycle(lifecycle!, captureProtectionLifecycleRef);
   }, [platform]);
 
   useEffect(() => {
@@ -362,13 +413,17 @@ function releaseRestoreLifecycle(
   }, 0);
 }
 
-function isSubscriptionActive(lifecycle: SubscriptionLifecycle | StorageHealthLifecycle) {
+function isSubscriptionActive(
+  lifecycle: SubscriptionLifecycle | StorageHealthLifecycle | CaptureProtectionLifecycle,
+) {
   return lifecycle.users > 0 && !lifecycle.disposed;
 }
 
 function releaseSubscriptionLifecycle(
-  lifecycle: SubscriptionLifecycle | StorageHealthLifecycle,
-  reference: { current: SubscriptionLifecycle | StorageHealthLifecycle | null },
+  lifecycle: SubscriptionLifecycle | StorageHealthLifecycle | CaptureProtectionLifecycle,
+  reference: {
+    current: SubscriptionLifecycle | StorageHealthLifecycle | CaptureProtectionLifecycle | null;
+  },
 ) {
   lifecycle.users -= 1;
   if (lifecycle.users !== 0) return;

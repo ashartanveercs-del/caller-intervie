@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 pub mod capture_protection;
 pub mod commands;
@@ -138,6 +138,18 @@ async fn finish_smoke(
     }
 }
 
+async fn reapply_capture_protection_and_emit_status<F>(
+    capture_protection: &capture_protection::CaptureProtectionController,
+    sidecar: &sidecar::SidecarSupervisor,
+    emit: F,
+) where
+    F: FnOnce(&'static str, &capture_protection::CaptureProtectionStatus),
+{
+    let _ =
+        commands::reapply_capture_protection_and_stop_on_loss(capture_protection, sidecar).await;
+    commands::emit_current_capture_protection_status(capture_protection, emit).await;
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let smoke_mode = sidecar_smoke_requested();
@@ -169,10 +181,16 @@ pub fn run() {
                     if matches!(event, tauri::WindowEvent::Focused(true)) {
                         let capture_protection = capture_protection.clone();
                         let sidecar = app_handle.state::<state::AppState>().sidecar.clone();
+                        let app_handle = app_handle.clone();
                         tauri::async_runtime::spawn(async move {
-                            commands::reapply_capture_protection_and_stop_on_loss(
+                            reapply_capture_protection_and_emit_status(
                                 capture_protection.as_ref(),
                                 &sidecar,
+                                |event, status| {
+                                    if let Err(error) = app_handle.emit(event, status) {
+                                        eprintln!("capture protection status emit failed: {error}");
+                                    }
+                                },
                             )
                             .await;
                         });
@@ -247,13 +265,18 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::future::pending;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use async_trait::async_trait;
 
+    use crate::capture_protection::{
+        CaptureProtectionController, CaptureProtectionFailure, CaptureProtectionState,
+        CaptureProtectionStatus, CaptureProtectionTarget,
+    };
     use crate::sidecar::{SidecarError, SidecarPort, SidecarState, SidecarSupervisor};
 
     use super::{ExitShutdownAction, ExitShutdownCoordinator, ShutdownOutcome};
@@ -289,6 +312,123 @@ mod tests {
 
         assert!(source.contains("commands::reapply_capture_protection_and_stop_on_loss"));
         assert!(!source.contains("let previous = capture_protection.status().state"));
+    }
+
+    #[tokio::test]
+    async fn focus_reapply_emits_the_resulting_status_on_the_stable_event() {
+        struct UnavailableTarget;
+
+        impl CaptureProtectionTarget for UnavailableTarget {
+            fn apply_and_verify(&self) -> Result<(), CaptureProtectionFailure> {
+                Err(CaptureProtectionFailure::VerificationFailed)
+            }
+        }
+
+        struct IdlePort;
+
+        #[async_trait]
+        impl SidecarPort for IdlePort {
+            async fn write(&self, _bytes: Vec<u8>) -> Result<(), SidecarError> {
+                Ok(())
+            }
+
+            async fn kill(&self) -> Result<(), SidecarError> {
+                Ok(())
+            }
+        }
+
+        let capture_protection =
+            CaptureProtectionController::with_target(Arc::new(UnavailableTarget));
+        let sidecar = SidecarSupervisor::with_port(Arc::new(IdlePort));
+        let mut emitted = None;
+
+        super::reapply_capture_protection_and_emit_status(
+            &capture_protection,
+            &sidecar,
+            |event, status| emitted = Some((event, status.clone())),
+        )
+        .await;
+
+        assert_eq!(
+            emitted,
+            Some((
+                "capture-protection://status",
+                CaptureProtectionStatus {
+                    state: CaptureProtectionState::Unavailable,
+                    code: Some("capture_protection_unavailable"),
+                    message: Some("Screen capture protection could not be confirmed."),
+                },
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn status_emission_reads_authoritative_state_after_a_newer_reapply() {
+        struct SequencedTarget {
+            outcomes: Mutex<VecDeque<Result<(), CaptureProtectionFailure>>>,
+        }
+
+        impl CaptureProtectionTarget for SequencedTarget {
+            fn apply_and_verify(&self) -> Result<(), CaptureProtectionFailure> {
+                self.outcomes
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("capture protection outcome must be available")
+            }
+        }
+
+        struct IdlePort;
+
+        #[async_trait]
+        impl SidecarPort for IdlePort {
+            async fn write(&self, _bytes: Vec<u8>) -> Result<(), SidecarError> {
+                Ok(())
+            }
+
+            async fn kill(&self) -> Result<(), SidecarError> {
+                Ok(())
+            }
+        }
+
+        let capture_protection =
+            CaptureProtectionController::with_target(Arc::new(SequencedTarget {
+                outcomes: Mutex::new(VecDeque::from([
+                    Err(CaptureProtectionFailure::VerificationFailed),
+                    Ok(()),
+                ])),
+            }));
+        let sidecar = SidecarSupervisor::with_port(Arc::new(IdlePort));
+
+        let stale = crate::commands::reapply_capture_protection_and_stop_on_loss(
+            &capture_protection,
+            &sidecar,
+        )
+        .await;
+        assert_eq!(stale.state, CaptureProtectionState::Unavailable);
+        assert_eq!(
+            capture_protection.reapply_and_verify_async().await.state,
+            CaptureProtectionState::Protected
+        );
+
+        let mut emitted = None;
+        crate::commands::emit_current_capture_protection_status(
+            &capture_protection,
+            |event, status| emitted = Some((event, status.clone())),
+        )
+        .await;
+
+        assert_eq!(
+            emitted,
+            Some((
+                "capture-protection://status",
+                CaptureProtectionStatus {
+                    state: CaptureProtectionState::Protected,
+                    code: None,
+                    message: None,
+                },
+            ))
+        );
     }
 
     #[test]

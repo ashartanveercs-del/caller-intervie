@@ -44,6 +44,16 @@ describe("browser platform", () => {
     });
   });
 
+  it("provides a no-op capture protection subscription in browser preview", async () => {
+    const platform = createBrowserPlatform();
+    const received: unknown[] = [];
+
+    const cleanup = await platform.subscribeCaptureProtection((status) => received.push(status));
+
+    expect(cleanup()).toBeUndefined();
+    expect(received).toEqual([]);
+  });
+
   it("rejects every command that requires capture protection", async () => {
     const platform = createBrowserPlatform();
     const protectedCommands = [

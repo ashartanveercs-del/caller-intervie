@@ -37,6 +37,8 @@ type CaptureProtectionStatusDto = {
   message: string | null;
 };
 
+const CAPTURE_PROTECTION_STATUS_EVENT = "capture-protection://status";
+
 type RequestTurnAssociationDto = {
   request_id: string;
   turn_id: string;
@@ -130,6 +132,11 @@ export function createDesktopPlatform(): PlatformApi {
     },
     async subscribeStorageHealth(listener) {
       return listen<StorageHealthDto>("storage://health", (event) => listener(mapStorageHealth(event.payload)));
+    },
+    async subscribeCaptureProtection(listener) {
+      return listen<CaptureProtectionStatusDto>(CAPTURE_PROTECTION_STATUS_EVENT, (event) => {
+        listener(mapCaptureProtectionStatus(event.payload));
+      });
     },
     async associateRequestWithTurn(input) {
       await invoke("associate_request_with_turn", { input: toRequestTurnAssociationDto(input) });

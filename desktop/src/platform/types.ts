@@ -71,6 +71,7 @@ export interface PlatformApi {
   retryCaptureProtection(): Promise<CaptureProtectionStatus>;
   subscribe(listener: (event: Envelope) => void): Promise<() => void>;
   subscribeStorageHealth(listener: (health: StorageHealth) => void): Promise<() => void>;
+  subscribeCaptureProtection(listener: (status: CaptureProtectionStatus) => void): Promise<() => void>;
   associateRequestWithTurn(input: AssociateRequestWithTurnInput): Promise<void>;
   getRequestTurnAssociations(sessionId: string): Promise<RequestTurnAssociation[]>;
   createSession(input: CreateSessionInput): Promise<SessionRecord>;

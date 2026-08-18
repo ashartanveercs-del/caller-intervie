@@ -15,16 +15,23 @@ function status(state: SidecarStatus["state"] = "ready"): SidecarStatus {
 function fakePlatform(): PlatformApi & {
   emit(event: Envelope): void;
   emitStorageHealth(health: StorageHealth): void;
+  emitCaptureProtection(status: CaptureProtectionStatus): void;
+  subscribeCaptureProtection(listener: (status: CaptureProtectionStatus) => void): Promise<() => void>;
   unlisten: () => void;
   storageUnlisten: () => void;
+  captureUnlisten: () => void;
 } {
   let listener: ((event: Envelope) => void) | undefined;
   let storageListener: ((health: StorageHealth) => void) | undefined;
+  let captureListener: ((status: CaptureProtectionStatus) => void) | undefined;
   const unlisten: () => void = vi.fn(() => {
     listener = undefined;
   });
   const storageUnlisten: () => void = vi.fn(() => {
     storageListener = undefined;
+  });
+  const captureUnlisten: () => void = vi.fn(() => {
+    captureListener = undefined;
   });
   return {
     sidecarStatus: vi.fn().mockResolvedValue(status()),
@@ -43,6 +50,10 @@ function fakePlatform(): PlatformApi & {
       storageListener = next;
       return storageUnlisten;
     }),
+    subscribeCaptureProtection: vi.fn().mockImplementation(async (next) => {
+      captureListener = next;
+      return captureUnlisten;
+    }),
     createSession: vi.fn(),
     saveSessionBrief: vi.fn(),
     completeSession: vi.fn(),
@@ -57,8 +68,12 @@ function fakePlatform(): PlatformApi & {
     emitStorageHealth(health) {
       storageListener?.(health);
     },
+    emitCaptureProtection(status) {
+      captureListener?.(status);
+    },
     unlisten,
     storageUnlisten,
+    captureUnlisten,
   };
 }
 
@@ -136,6 +151,76 @@ describe("RuntimeProvider", () => {
     });
 
     expect(screen.getByText("protected")).toBeVisible();
+  });
+
+  it("applies a protected-to-unavailable capture protection event immediately", async () => {
+    const platform = fakePlatform();
+    let runtime: ReturnType<typeof useRuntime> | undefined;
+
+    render(
+      <RuntimeProvider platform={platform}>
+        <CaptureProtectionConsumer onRuntime={(value) => { runtime = value; }} />
+      </RuntimeProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByText("protected")).toBeVisible());
+    await waitFor(() => expect(platform.subscribeCaptureProtection).toHaveBeenCalledTimes(1));
+    act(() => platform.emitCaptureProtection({
+      state: "unavailable",
+      code: "capture_protection_unavailable",
+      message: "Screen capture protection could not be confirmed.",
+    }));
+
+    expect(screen.getByText("unavailable")).toBeVisible();
+    expect(runtime?.captureProtection).toEqual({
+      state: "unavailable",
+      code: "capture_protection_unavailable",
+      message: "Screen capture protection could not be confirmed.",
+    });
+  });
+
+  it("cleans up the capture protection listener on unmount under StrictMode", async () => {
+    const platform = fakePlatform();
+    const view = render(
+      <StrictMode>
+        <RuntimeProvider platform={platform}>
+          <CaptureProtectionConsumer onRuntime={() => undefined} />
+        </RuntimeProvider>
+      </StrictMode>,
+    );
+
+    await waitFor(() => expect(platform.subscribeCaptureProtection).toHaveBeenCalledTimes(1));
+    view.unmount();
+
+    await waitFor(() => expect(platform.captureUnlisten).toHaveBeenCalledTimes(1));
+  });
+
+  it("does not let a stale initial capture snapshot overwrite a newer event", async () => {
+    const platform = fakePlatform();
+    const initialProtection = deferred<CaptureProtectionStatus>();
+    vi.mocked(platform.captureProtectionStatus).mockReturnValueOnce(initialProtection.promise);
+
+    render(
+      <RuntimeProvider platform={platform}>
+        <CaptureProtectionConsumer onRuntime={() => undefined} />
+      </RuntimeProvider>,
+    );
+
+    await waitFor(() => expect(platform.subscribeCaptureProtection).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(platform.captureProtectionStatus).toHaveBeenCalledTimes(1));
+    act(() => platform.emitCaptureProtection({
+      state: "unavailable",
+      code: "capture_protection_unavailable",
+      message: "Screen capture protection could not be confirmed.",
+    }));
+    expect(screen.getByText("unavailable")).toBeVisible();
+
+    await act(async () => {
+      initialProtection.resolve({ state: "protected" });
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText("unavailable")).toBeVisible();
   });
 
   it("deduplicates unavailable capture protection retries and safely restores unavailable on rejection", async () => {

@@ -87,6 +87,9 @@ export function createBrowserPlatform(): BrowserPlatform {
       storageHealthListeners.add(listener);
       return () => storageHealthListeners.delete(listener);
     },
+    async subscribeCaptureProtection(_listener) {
+      return () => undefined;
+    },
     async associateRequestWithTurn(input) {
       requireSession(sessions, input.sessionId);
       associateRequestWithTurn(requestTurnAssociations, input);

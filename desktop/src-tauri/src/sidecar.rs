@@ -348,6 +348,7 @@ struct ActiveSidecar {
     handshake_id: Option<String>,
     pending_runtime_session: Option<PendingRuntimeSession>,
     runtime_session_id: Option<String>,
+    pending_capture_protection_stop: Option<PendingCaptureProtectionStop>,
 }
 
 struct PendingRuntimeSession {
@@ -355,7 +356,22 @@ struct PendingRuntimeSession {
     command_id: String,
 }
 
+struct PendingCaptureProtectionStop {
+    session_id: String,
+    command_id: String,
+    acknowledgement: oneshot::Sender<Result<(), SidecarError>>,
+}
+
+enum CaptureProtectionStopPlan {
+    None,
+    Graceful(String),
+    Emergency,
+}
+
 fn apply_runtime_session_event(active: &mut ActiveSidecar, event: &Envelope) {
+    if apply_capture_protection_stop_event(active, event) {
+        return;
+    }
     if matches!(&event.kind, ProtocolKind::Event(EventKind::RuntimeError)) {
         let clears_pending_start = active
             .pending_runtime_session
@@ -390,7 +406,7 @@ fn apply_runtime_session_event(active: &mut ActiveSidecar, event: &Envelope) {
                 active.pending_runtime_session = None;
             }
         }
-        Some("stopping" | "stopped" | "error") => {
+        Some("stopped" | "error") => {
             let Some(session_id) = session_id else {
                 return;
             };
@@ -409,6 +425,53 @@ fn apply_runtime_session_event(active: &mut ActiveSidecar, event: &Envelope) {
         }
         _ => {}
     }
+}
+
+fn apply_capture_protection_stop_event(active: &mut ActiveSidecar, event: &Envelope) -> bool {
+    let Some(pending) = active.pending_capture_protection_stop.as_ref() else {
+        return false;
+    };
+    let correlation_matches = event.correlation_id.as_deref() == Some(pending.command_id.as_str());
+    if matches!(&event.kind, ProtocolKind::Event(EventKind::RuntimeError)) {
+        if correlation_matches {
+            let pending = active
+                .pending_capture_protection_stop
+                .take()
+                .expect("capture stop acknowledgement must remain registered");
+            let _ = pending.acknowledgement.send(Err(SidecarError::new(
+                "sidecar_stop_failed",
+                "The sidecar reported an error while stopping capture.",
+            )));
+            return true;
+        }
+        return false;
+    }
+    if !matches!(&event.kind, ProtocolKind::Event(EventKind::SessionState)) {
+        return false;
+    }
+
+    let state = event.payload.get("state").and_then(Value::as_str);
+    let session_matches = event.session_id.as_deref() == Some(pending.session_id.as_str());
+    if session_matches && correlation_matches && matches!(state, Some("stopped" | "error")) {
+        let pending = active
+            .pending_capture_protection_stop
+            .take()
+            .expect("capture stop acknowledgement must remain registered");
+        if state == Some("stopped") {
+            active.pending_runtime_session = None;
+            active.runtime_session_id = None;
+            let _ = pending.acknowledgement.send(Ok(()));
+        } else {
+            let _ = pending.acknowledgement.send(Err(SidecarError::new(
+                "sidecar_stop_failed",
+                "The sidecar reported an error while stopping capture.",
+            )));
+        }
+        return true;
+    }
+
+    session_matches && matches!(state, Some("stopping" | "stopped" | "error"))
+        || state == Some("idle")
 }
 
 fn validate_runtime_command(
@@ -533,6 +596,7 @@ impl SidecarSupervisor {
                         handshake_id: None,
                         pending_runtime_session: None,
                         runtime_session_id: None,
+                        pending_capture_protection_stop: None,
                     }),
                     ..SupervisorData::default()
                 }),
@@ -621,19 +685,27 @@ impl SidecarSupervisor {
             .and_then(|active| active.runtime_session_id.clone())
     }
 
-    async fn capture_stop_session(&self) -> Option<String> {
+    async fn capture_protection_stop_plan(&self) -> CaptureProtectionStopPlan {
         let data = self.inner.data.lock().await;
+        let Some(active) = data.active.as_ref() else {
+            return CaptureProtectionStopPlan::None;
+        };
         if !matches!(data.state, SidecarState::Ready) {
-            return None;
+            return CaptureProtectionStopPlan::Emergency;
         }
-        data.active.as_ref().and_then(|active| {
-            active.runtime_session_id.clone().or_else(|| {
+        active
+            .runtime_session_id
+            .clone()
+            .or_else(|| {
                 active
                     .pending_runtime_session
                     .as_ref()
                     .map(|pending| pending.session_id.clone())
             })
-        })
+            .map_or(
+                CaptureProtectionStopPlan::None,
+                CaptureProtectionStopPlan::Graceful,
+            )
     }
 
     pub async fn send(&self, command: Envelope) -> Result<(), SidecarError> {
@@ -642,9 +714,33 @@ impl SidecarSupervisor {
     }
 
     pub async fn stop_for_capture_protection_loss(&self) -> Result<(), SidecarError> {
+        let supervisor = self.clone();
+        let (result_sender, result_receiver) = oneshot::channel();
+        tauri::async_runtime::spawn(async move {
+            let result = supervisor.stop_for_capture_protection_loss_owned().await;
+            let _ = result_sender.send(result);
+        });
+        result_receiver.await.map_err(|_| {
+            SidecarError::new(
+                "sidecar_stop_failed",
+                "The sidecar capture cleanup task failed.",
+            )
+        })?
+    }
+
+    async fn stop_for_capture_protection_loss_owned(&self) -> Result<(), SidecarError> {
         let _stop = self.inner.capture_protection_stop.lock().await;
-        let Some(session_id) = self.capture_stop_session().await else {
-            return Ok(());
+        let session_id = match self.capture_protection_stop_plan().await {
+            CaptureProtectionStopPlan::None => return Ok(()),
+            CaptureProtectionStopPlan::Graceful(session_id) => session_id,
+            CaptureProtectionStopPlan::Emergency => {
+                return self
+                    .shutdown_after_capture_protection_loss(SidecarError::new(
+                        "sidecar_stop_failed",
+                        "The sidecar was not ready for protected session cleanup.",
+                    ))
+                    .await;
+            }
         };
         let command = Envelope {
             version: PROTOCOL_VERSION,
@@ -661,11 +757,23 @@ impl SidecarSupervisor {
             payload: Default::default(),
             correlation_id: None,
         };
+        let (acknowledgement_sender, acknowledgement_receiver) = oneshot::channel();
 
-        match tokio::time::timeout(
-            CAPTURE_PROTECTION_STOP_TIMEOUT,
-            self.dispatch_owned(command, None, async { Ok(()) }),
-        )
+        match tokio::time::timeout(CAPTURE_PROTECTION_STOP_TIMEOUT, async {
+            self.dispatch_owned(
+                command,
+                None,
+                async { Ok(()) },
+                Some(acknowledgement_sender),
+            )
+            .await?;
+            acknowledgement_receiver.await.map_err(|_| {
+                SidecarError::new(
+                    "sidecar_stop_failed",
+                    "The sidecar stopped before acknowledging capture cleanup.",
+                )
+            })?
+        })
         .await
         {
             Ok(Ok(())) => Ok(()),
@@ -698,7 +806,7 @@ impl SidecarSupervisor {
     where
         A: Future<Output = Result<(), SidecarError>> + Send + 'static,
     {
-        self.spawn_owned_dispatch(command, None, authorization)
+        self.spawn_owned_dispatch(command, None, authorization, ())
             .await
     }
 
@@ -711,25 +819,53 @@ impl SidecarSupervisor {
     where
         A: Future<Output = Result<(), SidecarError>> + Send + 'static,
     {
-        self.spawn_owned_dispatch(command, Some(session_operation_gate), authorization)
-            .await
+        self.send_with_authorization_and_gate_with_keepalive(
+            command,
+            session_operation_gate,
+            authorization,
+            (),
+        )
+        .await
     }
 
-    async fn spawn_owned_dispatch<A>(
+    pub async fn send_with_authorization_and_gate_with_keepalive<A, K>(
+        &self,
+        command: Envelope,
+        session_operation_gate: Arc<AsyncMutex<()>>,
+        authorization: A,
+        keepalive: K,
+    ) -> Result<(), SidecarError>
+    where
+        A: Future<Output = Result<(), SidecarError>> + Send + 'static,
+        K: Send + 'static,
+    {
+        self.spawn_owned_dispatch(
+            command,
+            Some(session_operation_gate),
+            authorization,
+            keepalive,
+        )
+        .await
+    }
+
+    async fn spawn_owned_dispatch<A, K>(
         &self,
         command: Envelope,
         session_operation_gate: Option<Arc<AsyncMutex<()>>>,
         authorization: A,
+        keepalive: K,
     ) -> Result<(), SidecarError>
     where
         A: Future<Output = Result<(), SidecarError>> + Send + 'static,
+        K: Send + 'static,
     {
         let supervisor = self.clone();
         let (result_sender, result_receiver) = oneshot::channel();
         tauri::async_runtime::spawn(async move {
             let result = supervisor
-                .dispatch_owned(command, session_operation_gate, authorization)
+                .dispatch_owned(command, session_operation_gate, authorization, None)
                 .await;
+            drop(keepalive);
             let _ = result_sender.send(result);
         });
         result_receiver.await.map_err(|_| {
@@ -745,6 +881,7 @@ impl SidecarSupervisor {
         command: Envelope,
         session_operation_gate: Option<Arc<AsyncMutex<()>>>,
         authorization: A,
+        capture_stop_acknowledgement: Option<oneshot::Sender<Result<(), SidecarError>>>,
     ) -> Result<(), SidecarError>
     where
         A: Future<Output = Result<(), SidecarError>> + Send,
@@ -810,6 +947,7 @@ impl SidecarSupervisor {
             (active.port.clone(), active.generation)
         };
 
+        let mut capture_stop_acknowledgement = capture_stop_acknowledgement;
         match port.write(bytes).await {
             Ok(()) => {
                 let mut data = self.inner.data.lock().await;
@@ -838,8 +976,20 @@ impl SidecarSupervisor {
                             });
                     }
                     ProtocolKind::Command(CommandKind::SessionStop) => {
-                        active.pending_runtime_session = None;
-                        active.runtime_session_id = None;
+                        if let Some(acknowledgement) = capture_stop_acknowledgement.take() {
+                            let session_id = command_session_id.ok_or_else(|| {
+                                SidecarError::new(
+                                    "invalid_session_id",
+                                    "sidecar command validation failed",
+                                )
+                            })?;
+                            active.pending_capture_protection_stop =
+                                Some(PendingCaptureProtectionStop {
+                                    session_id,
+                                    command_id,
+                                    acknowledgement,
+                                });
+                        }
                     }
                     _ => {}
                 }
@@ -1200,6 +1350,7 @@ impl SidecarSupervisor {
                 handshake_id: Some(handshake_id.clone()),
                 pending_runtime_session: None,
                 runtime_session_id: None,
+                pending_capture_protection_stop: None,
             });
             generation
         };
@@ -2801,7 +2952,9 @@ mod tests {
         writes: Arc<Mutex<Vec<Vec<u8>>>>,
         kills: Arc<AtomicUsize>,
         stop_started: Arc<Notify>,
+        stop_written: Arc<Notify>,
         release_stop: Arc<Notify>,
+        killed: Arc<Notify>,
     }
 
     #[async_trait]
@@ -2816,12 +2969,14 @@ mod tests {
             ) {
                 self.stop_started.notify_waiters();
                 self.release_stop.notified().await;
+                self.stop_written.notify_waiters();
             }
             Ok(())
         }
 
         async fn kill(&self) -> Result<(), SidecarError> {
             self.kills.fetch_add(1, AtomicOrdering::SeqCst);
+            self.killed.notify_waiters();
             Ok(())
         }
     }
@@ -3528,6 +3683,48 @@ mod tests {
             ]),
             correlation_id: Some(correlation_id.into()),
         }
+    }
+
+    async fn active_runtime_for_capture_stop(port: Arc<dyn SidecarPort>) -> SidecarSupervisor {
+        let supervisor = SidecarSupervisor::with_port(port);
+        supervisor
+            .accept_event(0, fixture_envelope())
+            .await
+            .unwrap();
+        supervisor
+            .send(session_start_command(SESSION_ID))
+            .await
+            .unwrap();
+        supervisor
+            .accept_event(0, runtime_session_event(SESSION_ID, "listening"))
+            .await
+            .unwrap();
+        supervisor
+    }
+
+    fn last_capture_stop(writes: &Mutex<Vec<Vec<u8>>>) -> Envelope {
+        writes
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|bytes| FrameDecoder::new(MAX_FRAME_BYTES).push(bytes).unwrap())
+            .find(|command| {
+                matches!(
+                    command.kind,
+                    ProtocolKind::Command(CommandKind::SessionStop)
+                )
+            })
+            .expect("capture protection stop must be written")
+    }
+
+    fn correlated_runtime_session_event(
+        session_id: &str,
+        state: &str,
+        correlation_id: &str,
+    ) -> Envelope {
+        let mut event = runtime_session_event(session_id, state);
+        event.correlation_id = Some(correlation_id.into());
+        event
     }
 
     async fn unreachable_authorization() -> Result<(), SidecarError> {
@@ -4754,7 +4951,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_session_stop_clears_runtime_authorization() {
+    async fn terminal_session_stop_event_clears_runtime_authorization() {
         let port = FakeSidecarPort::default();
         let supervisor = SidecarSupervisor::with_port(Arc::new(port));
         supervisor
@@ -4775,6 +4972,14 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(
+            supervisor.current_runtime_session().await.as_deref(),
+            Some(SESSION_ID)
+        );
+        supervisor
+            .accept_event(0, runtime_session_event(SESSION_ID, "stopped"))
+            .await
+            .unwrap();
         assert_eq!(supervisor.current_runtime_session().await, None);
         assert_eq!(
             supervisor
@@ -4804,6 +5009,7 @@ mod tests {
             .unwrap();
 
         let stop_started = port.stop_started.notified();
+        let stop_written = port.stop_written.notified();
         let first = tokio::spawn({
             let supervisor = supervisor.clone();
             async move { supervisor.stop_for_capture_protection_loss().await }
@@ -4818,6 +5024,15 @@ mod tests {
             "the second stop must wait for the capture protection stop serialization",
         );
         port.release_stop.notify_waiters();
+        stop_written.await;
+        let stop_command = last_capture_stop(port.writes.as_ref());
+        supervisor
+            .accept_event(
+                0,
+                correlated_runtime_session_event(SESSION_ID, "stopped", &stop_command.id),
+            )
+            .await
+            .unwrap();
         first.await.unwrap().unwrap();
         second.await.unwrap();
 
@@ -4847,8 +5062,321 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capture_protection_stop_without_ack_times_out_and_kills_the_sidecar() {
+        let port = BlockingStopPort::default();
+        let supervisor =
+            active_runtime_for_capture_stop(Arc::new(port.clone()) as Arc<dyn SidecarPort>).await;
+        let stop_started = port.stop_started.notified();
+        let stop_written = port.stop_written.notified();
+        let killed = port.killed.notified();
+        let stop = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.stop_for_capture_protection_loss().await }
+        });
+        stop_started.await;
+        port.release_stop.notify_waiters();
+        stop_written.await;
+
+        assert!(
+            !stop.is_finished(),
+            "writing session.stop must not count as stopping capture"
+        );
+        assert_eq!(
+            supervisor.current_runtime_session().await.as_deref(),
+            Some(SESSION_ID)
+        );
+        assert_eq!(
+            stop.await.unwrap().unwrap_err().code(),
+            "sidecar_stop_timeout"
+        );
+        killed.await;
+        assert_eq!(port.kills.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(supervisor.status().await.state, SidecarState::Stopped);
+        assert_eq!(supervisor.current_runtime_session().await, None);
+    }
+
+    #[tokio::test]
+    async fn capture_loss_after_unacknowledged_ordinary_stop_still_awaits_cleanup_and_kills() {
+        let port = BlockingStopPort::default();
+        let supervisor =
+            active_runtime_for_capture_stop(Arc::new(port.clone()) as Arc<dyn SidecarPort>).await;
+        let ordinary_stop_started = port.stop_started.notified();
+        let ordinary_stop_written = port.stop_written.notified();
+        let ordinary_stop = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.send(session_stop_command(SESSION_ID)).await }
+        });
+        ordinary_stop_started.await;
+        port.release_stop.notify_waiters();
+        ordinary_stop_written.await;
+        ordinary_stop.await.unwrap().unwrap();
+
+        assert_eq!(
+            supervisor.current_runtime_session().await.as_deref(),
+            Some(SESSION_ID),
+            "an ordinary stop write is not a terminal runtime event"
+        );
+
+        let cleanup_stop_started = port.stop_started.notified();
+        let cleanup_stop_written = port.stop_written.notified();
+        let killed = port.killed.notified();
+        let cleanup = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.stop_for_capture_protection_loss().await }
+        });
+        tokio::time::timeout(Duration::from_millis(100), cleanup_stop_started)
+            .await
+            .expect("capture loss must send its own protected stop after an ordinary stop");
+        port.release_stop.notify_waiters();
+        cleanup_stop_written.await;
+
+        assert!(
+            !cleanup.is_finished(),
+            "the protected stop write must still await a correlated terminal event"
+        );
+        assert_eq!(
+            port.writes
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|bytes| FrameDecoder::new(MAX_FRAME_BYTES).push(bytes).unwrap())
+                .filter(|command| matches!(
+                    command.kind,
+                    ProtocolKind::Command(CommandKind::SessionStop)
+                ))
+                .count(),
+            2
+        );
+        assert_eq!(
+            cleanup.await.unwrap().unwrap_err().code(),
+            "sidecar_stop_timeout"
+        );
+        killed.await;
+        assert_eq!(port.kills.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(supervisor.status().await.state, SidecarState::Stopped);
+        assert_eq!(supervisor.current_runtime_session().await, None);
+    }
+
+    #[tokio::test]
+    async fn capture_loss_emergency_stops_a_retained_child_when_supervisor_is_not_ready() {
+        let port = BlockingStopPort::default();
+        let supervisor =
+            active_runtime_for_capture_stop(Arc::new(port.clone()) as Arc<dyn SidecarPort>).await;
+        {
+            let mut data = supervisor.inner.data.lock().await;
+            data.state = SidecarState::Failed;
+        }
+
+        assert_eq!(
+            supervisor
+                .stop_for_capture_protection_loss()
+                .await
+                .unwrap_err()
+                .code(),
+            "sidecar_stop_failed"
+        );
+        assert_eq!(port.kills.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(supervisor.status().await.state, SidecarState::Stopped);
+        assert_eq!(supervisor.current_runtime_session().await, None);
+        assert_eq!(
+            port.writes
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|bytes| FrameDecoder::new(MAX_FRAME_BYTES).push(bytes).unwrap())
+                .filter(|command| matches!(
+                    command.kind,
+                    ProtocolKind::Command(CommandKind::SessionStop)
+                ))
+                .count(),
+            0,
+            "a non-ready retained child must be killed without trusting protocol dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_capture_protection_stop_ack_succeeds_and_clears_tracking() {
+        let port = BlockingStopPort::default();
+        let supervisor =
+            active_runtime_for_capture_stop(Arc::new(port.clone()) as Arc<dyn SidecarPort>).await;
+        let stop_started = port.stop_started.notified();
+        let stop_written = port.stop_written.notified();
+        let stop = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.stop_for_capture_protection_loss().await }
+        });
+        stop_started.await;
+        port.release_stop.notify_waiters();
+        stop_written.await;
+
+        assert!(
+            !stop.is_finished(),
+            "privacy stop must wait for the correlated stopped state"
+        );
+        assert_eq!(
+            supervisor.current_runtime_session().await.as_deref(),
+            Some(SESSION_ID)
+        );
+        let stop_command = last_capture_stop(port.writes.as_ref());
+        supervisor
+            .accept_event(
+                0,
+                correlated_runtime_session_event(SESSION_ID, "stopped", &stop_command.id),
+            )
+            .await
+            .unwrap();
+
+        stop.await.unwrap().unwrap();
+        assert_eq!(port.kills.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(supervisor.current_runtime_session().await, None);
+    }
+
+    #[tokio::test]
+    async fn wrong_capture_protection_stop_correlation_is_ignored() {
+        let port = BlockingStopPort::default();
+        let supervisor =
+            active_runtime_for_capture_stop(Arc::new(port.clone()) as Arc<dyn SidecarPort>).await;
+        let stop_started = port.stop_started.notified();
+        let stop_written = port.stop_written.notified();
+        let stop = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.stop_for_capture_protection_loss().await }
+        });
+        stop_started.await;
+        port.release_stop.notify_waiters();
+        stop_written.await;
+
+        supervisor
+            .accept_event(
+                0,
+                correlated_runtime_session_event(
+                    SESSION_ID,
+                    "stopped",
+                    "018f0000-0000-7000-8000-000000000025",
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !stop.is_finished(),
+            "an unrelated stopped state must not acknowledge the privacy stop"
+        );
+        assert_eq!(
+            supervisor.current_runtime_session().await.as_deref(),
+            Some(SESSION_ID)
+        );
+
+        let stop_command = last_capture_stop(port.writes.as_ref());
+        supervisor
+            .accept_event(
+                0,
+                correlated_runtime_session_event(SESSION_ID, "stopped", &stop_command.id),
+            )
+            .await
+            .unwrap();
+        stop.await.unwrap().unwrap();
+        assert_eq!(port.kills.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn matching_capture_protection_stop_state_error_kills_the_sidecar() {
+        let port = BlockingStopPort::default();
+        let supervisor =
+            active_runtime_for_capture_stop(Arc::new(port.clone()) as Arc<dyn SidecarPort>).await;
+        let stop_started = port.stop_started.notified();
+        let stop_written = port.stop_written.notified();
+        let killed = port.killed.notified();
+        let stop = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.stop_for_capture_protection_loss().await }
+        });
+        stop_started.await;
+        port.release_stop.notify_waiters();
+        stop_written.await;
+
+        let stop_command = last_capture_stop(port.writes.as_ref());
+        supervisor
+            .accept_event(
+                0,
+                correlated_runtime_session_event(SESSION_ID, "error", &stop_command.id),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stop.await.unwrap().unwrap_err().code(),
+            "sidecar_stop_failed"
+        );
+        killed.await;
+        assert_eq!(port.kills.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(supervisor.status().await.state, SidecarState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn matching_capture_protection_stop_runtime_error_kills_the_sidecar() {
+        let port = BlockingStopPort::default();
+        let supervisor =
+            active_runtime_for_capture_stop(Arc::new(port.clone()) as Arc<dyn SidecarPort>).await;
+        let stop_started = port.stop_started.notified();
+        let stop_written = port.stop_written.notified();
+        let killed = port.killed.notified();
+        let stop = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.stop_for_capture_protection_loss().await }
+        });
+        stop_started.await;
+        port.release_stop.notify_waiters();
+        stop_written.await;
+
+        let stop_command = last_capture_stop(port.writes.as_ref());
+        supervisor
+            .accept_event(0, runtime_error_event(&stop_command.id))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stop.await.unwrap().unwrap_err().code(),
+            "sidecar_stop_failed"
+        );
+        killed.await;
+        assert_eq!(port.kills.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(supervisor.status().await.state, SidecarState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_does_not_cancel_capture_protection_stop_cleanup() {
+        let port = BlockingStopPort::default();
+        let supervisor =
+            active_runtime_for_capture_stop(Arc::new(port.clone()) as Arc<dyn SidecarPort>).await;
+        let stop_started = port.stop_started.notified();
+        let stop_written = port.stop_written.notified();
+        let killed = port.killed.notified();
+        let caller = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.stop_for_capture_protection_loss().await }
+        });
+        stop_started.await;
+
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        port.release_stop.notify_waiters();
+        tokio::time::timeout(Duration::from_millis(100), stop_written)
+            .await
+            .expect("owned privacy cleanup must finish the stop write after caller cancellation");
+        tokio::time::timeout(Duration::from_secs(2), killed)
+            .await
+            .expect(
+                "owned privacy cleanup must kill after the one-second acknowledgement deadline",
+            );
+
+        assert_eq!(port.kills.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(supervisor.status().await.state, SidecarState::Stopped);
+        assert_eq!(supervisor.current_runtime_session().await, None);
+    }
+
+    #[tokio::test]
     async fn capture_protection_loss_stops_a_pending_runtime_session() {
-        let port = FakeSidecarPort::default();
+        let port = BlockingStopPort::default();
         let supervisor = SidecarSupervisor::with_port(Arc::new(port.clone()));
         supervisor
             .accept_event(0, fixture_envelope())
@@ -4860,7 +5388,24 @@ mod tests {
             .unwrap();
         assert_eq!(supervisor.current_runtime_session().await, None);
 
-        supervisor.stop_for_capture_protection_loss().await.unwrap();
+        let stop_started = port.stop_started.notified();
+        let stop_written = port.stop_written.notified();
+        let stop_task = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.stop_for_capture_protection_loss().await }
+        });
+        stop_started.await;
+        port.release_stop.notify_waiters();
+        stop_written.await;
+        let stop_command = last_capture_stop(port.writes.as_ref());
+        supervisor
+            .accept_event(
+                0,
+                correlated_runtime_session_event(SESSION_ID, "stopped", &stop_command.id),
+            )
+            .await
+            .unwrap();
+        stop_task.await.unwrap().unwrap();
 
         let stop_commands = port
             .writes
@@ -5022,7 +5567,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn matching_session_stop_is_allowed_while_start_is_pending() {
+    async fn matching_session_stop_retains_pending_start_until_terminal_event() {
         let port = FakeSidecarPort::default();
         let supervisor = SidecarSupervisor::with_port(Arc::new(port));
         supervisor
@@ -5036,6 +5581,20 @@ mod tests {
 
         supervisor
             .send(session_stop_command(SESSION_ID))
+            .await
+            .unwrap();
+        assert_eq!(
+            supervisor
+                .send(session_start_command(
+                    "018f0000-0000-7000-8000-000000000024",
+                ))
+                .await
+                .unwrap_err()
+                .code(),
+            "runtime_session_conflict"
+        );
+        supervisor
+            .accept_event(0, runtime_session_event(SESSION_ID, "stopped"))
             .await
             .unwrap();
         supervisor
@@ -5115,6 +5674,14 @@ mod tests {
         port.set_fail_writes(false);
         supervisor
             .send(session_stop_command(SESSION_ID))
+            .await
+            .unwrap();
+        assert_eq!(
+            supervisor.current_runtime_session().await.as_deref(),
+            Some(SESSION_ID)
+        );
+        supervisor
+            .accept_event(0, runtime_session_event(SESSION_ID, "stopped"))
             .await
             .unwrap();
         assert_eq!(supervisor.current_runtime_session().await, None);

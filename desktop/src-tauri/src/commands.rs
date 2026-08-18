@@ -4,9 +4,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
-use crate::capture_protection::{CaptureProtectionController, CaptureProtectionStatus};
+use crate::capture_protection::{
+    CaptureProtectionController, CaptureProtectionLease, CaptureProtectionStatus,
+};
 use crate::protocol::{
     is_supported_session_mode, validate_command, CommandKind, Envelope, EventKind, ProtocolKind,
     PROTOCOL_VERSION,
@@ -22,6 +24,7 @@ use crate::storage::{
 const MAX_LANGUAGE_TAG_BYTES: usize = 63;
 const MAX_BRIEF_BYTES: usize = 256 * 1024;
 const REPOSITORY_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const CAPTURE_PROTECTION_STATUS_EVENT: &str = "capture-protection://status";
 
 pub type SidecarCommandError = SidecarError;
 
@@ -266,6 +269,7 @@ pub async fn retry_capture_protection(
 
 #[tauri::command]
 pub async fn send_sidecar_command(
+    app: AppHandle,
     state: State<'_, AppState>,
     command: Envelope,
 ) -> Result<(), SidecarCommandError> {
@@ -276,12 +280,14 @@ pub async fn send_sidecar_command(
     let session_operation_gate = state.session_operation_gate.clone();
     let capture_protection = state.capture_protection.clone();
     let protection_command = command.clone();
+    let protection_app = app.clone();
 
     dispatch_with_capture_protection(
         &protection_command,
-        capture_protection.as_ref(),
+        capture_protection,
         &protection_sidecar,
-        move || async move {
+        move |event, status| emit_capture_protection_status(&protection_app, event, status),
+        move |protection_lease| async move {
             let authorization_command = command.clone();
             let authorization = ensure_sidecar_command_authorized(
                 authorization_command,
@@ -307,7 +313,12 @@ pub async fn send_sidecar_command(
                 },
             );
             sidecar
-                .send_with_authorization_and_gate(command, session_operation_gate, authorization)
+                .send_with_authorization_and_gate_with_keepalive(
+                    command,
+                    session_operation_gate,
+                    authorization,
+                    protection_lease,
+                )
                 .await
         },
     )
@@ -324,28 +335,70 @@ fn command_requires_capture_protection(command: &Envelope) -> bool {
     ) && command.payload.get("enabled").and_then(Value::as_bool) == Some(true)
 }
 
-async fn dispatch_with_capture_protection<F, Fut>(
+async fn dispatch_with_capture_protection<F, Fut, E>(
     command: &Envelope,
-    capture_protection: &CaptureProtectionController,
+    capture_protection: Arc<CaptureProtectionController>,
     sidecar: &SidecarSupervisor,
+    emit_status: E,
     dispatch: F,
 ) -> Result<(), SidecarError>
 where
-    F: FnOnce() -> Fut,
+    F: FnOnce(Option<CaptureProtectionLease>) -> Fut,
     Fut: Future<Output = Result<(), SidecarError>>,
+    E: FnOnce(&'static str, &CaptureProtectionStatus) + Send + 'static,
 {
-    let _protection_lease = if command_requires_capture_protection(command) {
+    let protection_lease = if command_requires_capture_protection(command) {
         match capture_protection.acquire_protected_lease().await {
             Ok(lease) => Some(lease),
             Err(error) => {
-                let _ = sidecar.stop_for_capture_protection_loss().await;
+                finalize_capture_protection_loss(capture_protection, sidecar.clone(), emit_status)
+                    .await;
                 return Err(error);
             }
         }
     } else {
         None
     };
-    dispatch().await
+    dispatch(protection_lease).await
+}
+
+async fn finalize_capture_protection_loss<E>(
+    capture_protection: Arc<CaptureProtectionController>,
+    sidecar: SidecarSupervisor,
+    emit_status: E,
+) where
+    E: FnOnce(&'static str, &CaptureProtectionStatus) + Send + 'static,
+{
+    let _ = tauri::async_runtime::spawn(async move {
+        let _ = sidecar.stop_for_capture_protection_loss().await;
+        emit_current_capture_protection_status(capture_protection.as_ref(), emit_status).await;
+    })
+    .await;
+}
+
+pub(crate) async fn emit_current_capture_protection_status<F>(
+    capture_protection: &CaptureProtectionController,
+    emit: F,
+) -> CaptureProtectionStatus
+where
+    F: FnOnce(&'static str, &CaptureProtectionStatus),
+{
+    capture_protection
+        .inspect_status_serialized(|status| {
+            emit(CAPTURE_PROTECTION_STATUS_EVENT, status);
+            status.clone()
+        })
+        .await
+}
+
+fn emit_capture_protection_status(
+    app: &AppHandle,
+    event: &'static str,
+    status: &CaptureProtectionStatus,
+) {
+    if app.emit(event, status).is_err() {
+        eprintln!("capture protection status emit failed");
+    }
 }
 
 pub(crate) async fn reapply_capture_protection_and_stop_on_loss(
@@ -794,13 +847,14 @@ mod tests {
     use std::collections::VecDeque;
     use std::future::Future;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
     use async_trait::async_trait;
     use serde_json::{json, Map, Value};
-    use tokio::sync::{oneshot, Mutex as AsyncMutex};
+    use tokio::sync::{oneshot, Mutex as AsyncMutex, Notify};
 
     use crate::capture_protection::{
         CaptureProtectionController, CaptureProtectionFailure, CaptureProtectionTarget,
@@ -1053,8 +1107,78 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct BlockingStartPort {
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        start_started: Arc<Notify>,
+        release_start: Arc<Notify>,
+        stop_written: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl SidecarPort for BlockingStartPort {
+        async fn write(&self, bytes: Vec<u8>) -> Result<(), SidecarError> {
+            let command = FrameDecoder::new(MAX_FRAME_BYTES)
+                .push(&bytes)
+                .unwrap()
+                .pop()
+                .unwrap();
+            self.writes.lock().unwrap().push(bytes);
+            match command.kind {
+                ProtocolKind::Command(CommandKind::SessionStart) => {
+                    self.start_started.notify_waiters();
+                    self.release_start.notified().await;
+                }
+                ProtocolKind::Command(CommandKind::SessionStop) => {
+                    self.stop_written.notify_waiters();
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+
+        async fn kill(&self) -> Result<(), SidecarError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct ObservedStopPort {
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        stop_written: Arc<Notify>,
+        kills: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SidecarPort for ObservedStopPort {
+        async fn write(&self, bytes: Vec<u8>) -> Result<(), SidecarError> {
+            let command = FrameDecoder::new(MAX_FRAME_BYTES)
+                .push(&bytes)
+                .unwrap()
+                .pop()
+                .unwrap();
+            self.writes.lock().unwrap().push(bytes);
+            if matches!(
+                command.kind,
+                ProtocolKind::Command(CommandKind::SessionStop)
+            ) {
+                self.stop_written.notify_waiters();
+            }
+            Ok(())
+        }
+
+        async fn kill(&self) -> Result<(), SidecarError> {
+            self.kills.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
     async fn active_runtime(port: &RecordingSidecarPort) -> SidecarSupervisor {
-        let supervisor = SidecarSupervisor::with_port(Arc::new(port.clone()));
+        active_runtime_with_port(Arc::new(port.clone())).await
+    }
+
+    async fn active_runtime_with_port(port: Arc<dyn SidecarPort>) -> SidecarSupervisor {
+        let supervisor = SidecarSupervisor::with_port(port);
         supervisor
             .accept_event(
                 0,
@@ -1117,17 +1241,21 @@ mod tests {
 
     #[tokio::test]
     async fn protected_dispatch_loss_stops_the_active_runtime_before_returning() {
-        let controller =
-            CaptureProtectionController::with_target(Arc::new(FailingCaptureProtectionTarget));
+        let controller = Arc::new(CaptureProtectionController::with_target(Arc::new(
+            FailingCaptureProtectionTarget,
+        )));
         let port = RecordingSidecarPort::default();
         let sidecar = active_runtime(&port).await;
 
-        let error =
-            dispatch_with_capture_protection(&query_command(), &controller, &sidecar, || async {
-                panic!("unprotected commands must not reach authorization or dispatch")
-            })
-            .await
-            .unwrap_err();
+        let error = dispatch_with_capture_protection(
+            &query_command(),
+            controller,
+            &sidecar,
+            |_, _| {},
+            |_| async { panic!("unprotected commands must not reach authorization or dispatch") },
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(error.code(), "capture_protection_required");
         assert_eq!(
@@ -1136,6 +1264,100 @@ mod tests {
         );
         assert_eq!(stop_frame_count(&port), 1);
         assert_eq!(sidecar.current_runtime_session().await, None);
+    }
+
+    #[tokio::test]
+    async fn protected_dispatch_loss_emits_authoritative_status_with_redacted_error() {
+        let controller = Arc::new(CaptureProtectionController::with_target(Arc::new(
+            FailingCaptureProtectionTarget,
+        )));
+        let sidecar = SidecarSupervisor::with_port(Arc::new(RecordingSidecarPort::default()));
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let captured = emitted.clone();
+
+        let error = dispatch_with_capture_protection(
+            &session_start_command(),
+            controller,
+            &sidecar,
+            move |event, status| {
+                captured.lock().unwrap().push((event, status.clone()));
+            },
+            |_| async { panic!("unprotected commands must not reach dispatch") },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            emitted.lock().unwrap().as_slice(),
+            &[(
+                "capture-protection://status",
+                crate::capture_protection::CaptureProtectionStatus {
+                    state: crate::capture_protection::CaptureProtectionState::Unavailable,
+                    code: Some("capture_protection_unavailable"),
+                    message: Some("Screen capture protection could not be confirmed."),
+                },
+            )]
+        );
+        assert_eq!(error.code(), "capture_protection_required");
+        let serialized = serde_json::to_string(&error).unwrap();
+        assert!(!serialized.contains(SESSION_ID));
+        assert!(!serialized.contains(REQUEST_ID));
+        assert!(!serialized.contains(TURN_ID));
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_after_protection_loss_still_emits_authoritative_status() {
+        let controller = Arc::new(CaptureProtectionController::with_target(Arc::new(
+            FailingCaptureProtectionTarget,
+        )));
+        let port = ObservedStopPort::default();
+        let sidecar = active_runtime_with_port(Arc::new(port.clone())).await;
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let captured = emitted.clone();
+        let stop_written = port.stop_written.notified();
+
+        let caller = tokio::spawn({
+            let controller = controller.clone();
+            let sidecar = sidecar.clone();
+            async move {
+                dispatch_with_capture_protection(
+                    &session_start_command(),
+                    controller,
+                    &sidecar,
+                    move |event, status| {
+                        captured.lock().unwrap().push((event, status.clone()));
+                    },
+                    |_| async { panic!("unprotected commands must not reach dispatch") },
+                )
+                .await
+            }
+        });
+        stop_written.await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !emitted.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned protection-loss finalization must emit after caller cancellation");
+        assert_eq!(
+            emitted.lock().unwrap().as_slice(),
+            &[(
+                "capture-protection://status",
+                crate::capture_protection::CaptureProtectionStatus {
+                    state: crate::capture_protection::CaptureProtectionState::Unavailable,
+                    code: Some("capture_protection_unavailable"),
+                    message: Some("Screen capture protection could not be confirmed."),
+                },
+            )]
+        );
+        assert_eq!(port.kills.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1173,9 +1395,11 @@ mod tests {
         let dispatch = tokio::spawn(async move {
             dispatch_with_capture_protection(
                 &command,
-                dispatch_controller.as_ref(),
+                dispatch_controller,
                 &dispatch_sidecar,
-                || async {
+                |_, _| {},
+                |protection_lease| async move {
+                    let _protection_lease = protection_lease;
                     dispatch_started_sender
                         .send(())
                         .expect("dispatch start receiver must remain available");
@@ -1225,6 +1449,138 @@ mod tests {
             crate::capture_protection::CaptureProtectionState::Unavailable
         );
         assert_eq!(stop_frame_count(&port), 1);
+        assert_eq!(sidecar.current_runtime_session().await, None);
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_keeps_capture_lease_until_owned_start_dispatch_finishes() {
+        let controller = Arc::new(CaptureProtectionController::with_target(Arc::new(
+            FakeCaptureProtectionTarget::new([
+                Ok(()),
+                Err(CaptureProtectionFailure::VerificationFailed),
+            ]),
+        )));
+        let port = BlockingStartPort::default();
+        let sidecar = SidecarSupervisor::with_port(Arc::new(port.clone()));
+        sidecar
+            .accept_event(
+                0,
+                Envelope {
+                    version: PROTOCOL_VERSION,
+                    id: "018f0000-0000-7000-8000-000000000030".into(),
+                    session_id: None,
+                    sequence: 0,
+                    timestamp_ms: 1,
+                    kind: ProtocolKind::Event(EventKind::SidecarReady),
+                    payload: Map::from_iter([("status".into(), json!("ready"))]),
+                    correlation_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let gate = Arc::new(AsyncMutex::new(()));
+        let start_started = port.start_started.notified();
+        let caller = tokio::spawn({
+            let controller = controller.clone();
+            let sidecar = sidecar.clone();
+            let command = session_start_command();
+            async move {
+                dispatch_with_capture_protection(
+                    &command,
+                    controller,
+                    &sidecar,
+                    |_, _| {},
+                    |protection_lease| {
+                        let sidecar = sidecar.clone();
+                        let gate = gate.clone();
+                        let command = command.clone();
+                        async move {
+                            sidecar
+                                .send_with_authorization_and_gate_with_keepalive(
+                                    command,
+                                    gate,
+                                    async { Ok(()) },
+                                    protection_lease,
+                                )
+                                .await
+                        }
+                    },
+                )
+                .await
+            }
+        });
+        start_started.await;
+
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+
+        let mut reapply = Box::pin({
+            let controller = controller.clone();
+            let sidecar = sidecar.clone();
+            async move {
+                reapply_capture_protection_and_stop_on_loss(controller.as_ref(), &sidecar).await
+            }
+        });
+        let waker: &Waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        assert!(
+            matches!(reapply.as_mut().poll(&mut context), Poll::Pending),
+            "reapply must wait for the lease retained by the owned start dispatch"
+        );
+        assert_eq!(
+            controller.status().state,
+            crate::capture_protection::CaptureProtectionState::Protected
+        );
+
+        let stop_written = port.stop_written.notified();
+        let reapply = tokio::spawn(reapply);
+        port.release_start.notify_waiters();
+        stop_written.await;
+
+        let stop = port
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|bytes| FrameDecoder::new(MAX_FRAME_BYTES).push(bytes).unwrap())
+            .find(|command| {
+                matches!(
+                    command.kind,
+                    ProtocolKind::Command(CommandKind::SessionStop)
+                )
+            })
+            .expect("protection loss must stop the newly pending runtime");
+        assert_eq!(stop.session_id.as_deref(), Some(SESSION_ID));
+        sidecar
+            .accept_event(
+                0,
+                Envelope {
+                    version: PROTOCOL_VERSION,
+                    id: "018f0000-0000-7000-8000-000000000032".into(),
+                    session_id: Some(SESSION_ID.into()),
+                    sequence: 2,
+                    timestamp_ms: 3,
+                    kind: ProtocolKind::Event(EventKind::SessionState),
+                    payload: Map::from_iter([
+                        ("state".into(), json!("stopped")),
+                        ("mode".into(), json!("interview")),
+                        ("input_language".into(), json!("auto")),
+                        ("response_language".into(), json!("en")),
+                        ("review_language".into(), json!("en")),
+                        ("you_source".into(), json!("mic")),
+                        ("listening".into(), json!(false)),
+                        ("system_audio_enabled".into(), json!(false)),
+                    ]),
+                    correlation_id: Some(stop.id),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reapply.await.unwrap().state,
+            crate::capture_protection::CaptureProtectionState::Unavailable
+        );
         assert_eq!(sidecar.current_runtime_session().await, None);
     }
 

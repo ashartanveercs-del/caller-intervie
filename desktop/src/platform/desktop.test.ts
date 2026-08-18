@@ -79,6 +79,34 @@ describe("desktop platform", () => {
     ]);
   });
 
+  it("maps capture protection status events and exposes Tauri listener cleanup", async () => {
+    const unlisten = vi.fn();
+    let callback: ((event: { payload: unknown }) => void) | undefined;
+    listen.mockImplementationOnce(async (_event, handler) => {
+      callback = handler;
+      return unlisten;
+    });
+    const platform = createDesktopPlatform();
+    const received: unknown[] = [];
+
+    const cleanup = await platform.subscribeCaptureProtection((status) => received.push(status));
+    callback?.({ payload: {
+      state: "unavailable",
+      code: "capture_protection_unavailable",
+      message: "Screen capture protection could not be confirmed.",
+      internal_diagnostics: "must-not-leak",
+    } });
+    cleanup();
+
+    expect(listen).toHaveBeenCalledWith("capture-protection://status", expect.any(Function));
+    expect(received).toEqual([{
+      state: "unavailable",
+      code: "capture_protection_unavailable",
+      message: "Screen capture protection could not be confirmed.",
+    }]);
+    expect(unlisten).toHaveBeenCalledTimes(1);
+  });
+
   it("forwards valid sidecar events and exposes Tauri listener cleanup", async () => {
     const unlisten = vi.fn();
     let callback: ((event: { payload: unknown }) => void) | undefined;

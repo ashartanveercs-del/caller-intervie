@@ -102,6 +102,15 @@ impl CaptureProtectionController {
         })
     }
 
+    pub(crate) async fn inspect_status_serialized<R>(
+        &self,
+        inspect: impl FnOnce(&CaptureProtectionStatus) -> R,
+    ) -> R {
+        let _operation = self.operation.lock().await;
+        let status = self.status();
+        inspect(&status)
+    }
+
     fn reapply_and_verify_while_serialized(&self) -> CaptureProtectionStatus {
         let generation = {
             let mut state = self.state.write().expect("capture status lock poisoned");
