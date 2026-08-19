@@ -1,7 +1,8 @@
 # Minimal Live Overlay and Simplified Interview UX Design
 
-**Date:** 2026-08-19  
-**Status:** Approved design, pending written-spec review  
+**Date:** 2026-08-19
+
+**Status:** Approved design, pending written-spec review
 **Scope:** CallerInterview native Interview Mode on Windows and macOS
 
 ## 1. Goal
